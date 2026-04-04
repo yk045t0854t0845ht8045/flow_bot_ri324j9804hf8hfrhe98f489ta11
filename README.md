@@ -29,7 +29,7 @@ npm start
 ```
 
 - `npm start` continua sendo o comando para executar o bot localmente.
-- `npm run bot` publica o bot no GitHub sem incluir `site/` nem `.env`.
+- `npm run bot` publica o bot no GitHub sem incluir `site/`, `tmp/` nem `.env`.
 
 ## 3) Comandos
 
@@ -75,7 +75,7 @@ Para publicar somente o bot da raiz `flowdesk` no repositorio separado:
 npm run bot
 ```
 
-- O script ignora `site/` e `.env` automaticamente.
+- O script ignora `site/`, `tmp/` e `.env` automaticamente.
 - O repositorio remoto padrao do bot e:
   - `https://github.com/yk045t0854t0845ht8045/flow_bot_ri324j9804hf8hfrhe98f489ta11.git`
 - Variaveis opcionais do publish:

@@ -17,7 +17,7 @@ $gitUserEmail = if ($env:BOT_GIT_EMAIL) {
 } else {
   "flowdesk-bot-publisher@users.noreply.github.com"
 }
-$excludedPaths = @("site", ".env")
+$excludedPaths = @("site", "tmp", ".env")
 
 function Invoke-Git {
   param(
@@ -111,7 +111,7 @@ function Remove-ExcludedPathsFromIndex {
   foreach ($target in $excludedPaths) {
     $args = @("rm")
 
-    if ($target -eq "site") {
+    if ($target -in @("site", "tmp")) {
       $args += "-r"
     }
 
