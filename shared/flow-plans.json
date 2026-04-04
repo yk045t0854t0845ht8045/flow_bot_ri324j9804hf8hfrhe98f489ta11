@@ -1,0 +1,110 @@
+{
+  "basic": {
+    "code": "basic",
+    "name": "Flow Basic",
+    "badge": "Gratuitamente",
+    "description": "Plano gratuito para testar a estrutura do bot no servidor antes da assinatura.",
+    "limitedOffer": "Teste por tempo limitado",
+    "price": 0,
+    "comparePrice": 0,
+    "currency": "BRL",
+    "billingCycleDays": 7,
+    "billingLabel": "/7 dias",
+    "checkoutPeriodLabel": "Periodo de 7 dias",
+    "renewalLabel": "Ativacao gratuita por 7 dias. Upgrade quando quiser.",
+    "isTrial": true,
+    "entitlements": {
+      "maxLicensedServers": 1,
+      "maxActiveTickets": 2,
+      "maxAutomations": 0,
+      "maxMonthlyActions": 50
+    },
+    "features": [
+      "1 Servidor licenciado",
+      "2 Tickets ativos",
+      "0 Automacoes liberadas",
+      "50 acoes"
+    ]
+  },
+  "pro": {
+    "code": "pro",
+    "name": "Flow Pro",
+    "badge": "50% de desconto",
+    "description": "Plano principal para operacoes enxutas com automacao inicial e volume consistente.",
+    "limitedOffer": "Oferta por tempo limitado",
+    "price": 9.99,
+    "comparePrice": 19,
+    "currency": "BRL",
+    "billingCycleDays": 30,
+    "billingLabel": "/mes",
+    "checkoutPeriodLabel": "Periodo de 1 mes",
+    "renewalLabel": "Renovacao por R$ 9,99/mes. Cancele quando quiser.",
+    "isTrial": false,
+    "entitlements": {
+      "maxLicensedServers": 1,
+      "maxActiveTickets": 50,
+      "maxAutomations": 2,
+      "maxMonthlyActions": 1000
+    },
+    "features": [
+      "1 Servidor licenciado",
+      "50 Tickets ativos",
+      "2 Automacoes liberadas",
+      "1.000 acoes/mes"
+    ]
+  },
+  "ultra": {
+    "code": "ultra",
+    "name": "Flow Ultra",
+    "badge": "60% de desconto",
+    "description": "Escala multi-servidor com alto volume de tickets e automacoes mais profundas.",
+    "limitedOffer": "Oferta por tempo limitado",
+    "price": 19.9,
+    "comparePrice": 49,
+    "currency": "BRL",
+    "billingCycleDays": 30,
+    "billingLabel": "/mes",
+    "checkoutPeriodLabel": "Periodo de 1 mes",
+    "renewalLabel": "Renovacao por R$ 19,90/mes. Cancele quando quiser.",
+    "isTrial": false,
+    "entitlements": {
+      "maxLicensedServers": 5,
+      "maxActiveTickets": 1000,
+      "maxAutomations": 15,
+      "maxMonthlyActions": 20000
+    },
+    "features": [
+      "5 Servidores licenciados",
+      "1000 Tickets ativos",
+      "15 Automacoes liberadas",
+      "20.000 acoes/mes"
+    ]
+  },
+  "master": {
+    "code": "master",
+    "name": "Flow Master",
+    "badge": "80% de desconto",
+    "description": "Camada maxima para operacoes intensas com liberdade total de escala e automacao.",
+    "limitedOffer": "Oferta por tempo limitado",
+    "price": 29.9,
+    "comparePrice": 144,
+    "currency": "BRL",
+    "billingCycleDays": 30,
+    "billingLabel": "/mes",
+    "checkoutPeriodLabel": "Periodo de 1 mes",
+    "renewalLabel": "Renovacao por R$ 29,90/mes. Cancele quando quiser.",
+    "isTrial": false,
+    "entitlements": {
+      "maxLicensedServers": 10,
+      "maxActiveTickets": 999999,
+      "maxAutomations": 999999,
+      "maxMonthlyActions": 999999
+    },
+    "features": [
+      "10 Servidores licenciados",
+      "Tickets ilimitados",
+      "Automacoes ilimitadas",
+      "Uso ilimitado"
+    ]
+  }
+}

@@ -1,0 +1,1127 @@
+﻿const { MessageFlags, SeparatorSpacingSize } = require("discord.js");
+const { CUSTOM_IDS } = require("../constants/customIds");
+
+const DEFAULT_TICKET_PANEL_TITLE = "Abrir atendimento";
+const DEFAULT_TICKET_PANEL_DESCRIPTION =
+  "Escolha uma opcao abaixo para falar com a equipe responsavel.";
+const DEFAULT_TICKET_PANEL_BUTTON_LABEL = "Abrir ticket";
+
+const DISABLED_TICKET_MESSAGE =
+  "O sistema de tickets esta desligado por falta de pagamento.\nContate a administracao caso ache que isso e um erro e informe a **Flowdesk**.";
+
+const COMPONENT_TYPE = {
+  ACTION_ROW: 1,
+  BUTTON: 2,
+  STRING_SELECT: 3,
+  SECTION: 9,
+  TEXT_DISPLAY: 10,
+  THUMBNAIL: 11,
+  MEDIA_GALLERY: 12,
+  SEPARATOR: 14,
+  CONTAINER: 17,
+};
+
+const BUTTON_STYLE = {
+  PRIMARY: 1,
+  SECONDARY: 2,
+  SUCCESS: 3,
+  DANGER: 4,
+  LINK: 5,
+};
+
+const MESSAGE_FLAG_IS_COMPONENTS_V2 = 32768;
+const WELCOME_TOKEN_REGEX = /\{(user\.id|user\.tag|user\.avatar|user|inviter|server\.id|server|memberCount)\}/g;
+
+function trimText(value, fallback = "") {
+  return typeof value === "string" ? value.trim() : fallback;
+}
+
+function clampText(value, maxLength) {
+  return String(value || "").slice(0, maxLength);
+}
+
+function stripMarkdownDecorators(value) {
+  return String(value || "")
+    .replace(/^\s{0,3}(?:#{1,6}|-#)\s*/, "")
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .trim();
+}
+
+function getCandidateString(candidate, key, fallback, maxLength) {
+  if (typeof candidate?.[key] === "string") {
+    return clampText(candidate[key], maxLength);
+  }
+
+  return clampText(fallback, maxLength);
+}
+
+function sanitizeButtonStyle(value) {
+  if (
+    value === "primary" ||
+    value === "secondary" ||
+    value === "success" ||
+    value === "danger"
+  ) {
+    return value;
+  }
+
+  return "primary";
+}
+
+function sanitizeSeparatorSpacing(value) {
+  if (value === "sm" || value === "md" || value === "lg") {
+    return value;
+  }
+
+  return "md";
+}
+
+function sanitizeAccentColor(value) {
+  const normalized = trimText(value);
+  if (!normalized) return "";
+  return /^#(?:[0-9a-fA-F]{6})$/.test(normalized) ? normalized : "";
+}
+
+function buildMarkdownFromLegacy(legacy) {
+  const title = trimText(legacy?.panelTitle) || DEFAULT_TICKET_PANEL_TITLE;
+  const description =
+    trimText(legacy?.panelDescription) || DEFAULT_TICKET_PANEL_DESCRIPTION;
+
+  return [`## ${title}`, description].filter(Boolean).join("\n");
+}
+
+function createDefaultTicketPanelLayout(legacy) {
+  const buttonLabel =
+    trimText(legacy?.panelButtonLabel) || DEFAULT_TICKET_PANEL_BUTTON_LABEL;
+
+  return [
+    {
+      id: "content_default",
+      type: "content",
+      markdown: buildMarkdownFromLegacy(legacy),
+      accessory: null,
+    },
+    {
+      id: "separator_default",
+      type: "separator",
+      spacing: "md",
+    },
+    {
+      id: "button_default",
+      type: "button",
+      label: buttonLabel,
+      style: "primary",
+      disabled: false,
+    },
+  ];
+}
+
+function normalizeSelectOptions(value) {
+  if (!Array.isArray(value)) return [];
+
+  return value
+    .map((option, index) => {
+      if (!option || typeof option !== "object") return null;
+      return {
+        id: trimText(option.id) || `option_${index + 1}`,
+        label: getCandidateString(option, "label", "", 80),
+        description: getCandidateString(option, "description", "", 160),
+      };
+    })
+    .filter(Boolean);
+}
+
+function normalizeContentAccessory(value) {
+  if (!value || typeof value !== "object") return null;
+
+  if (value.type === "thumbnail") {
+    return {
+      type: "thumbnail",
+      imageUrl: getCandidateString(value, "imageUrl", "", 1000),
+      alt: "",
+    };
+  }
+
+  if (value.type === "link_button") {
+    return {
+      type: "link_button",
+      label: getCandidateString(value, "label", "Abrir link", 80),
+      url: getCandidateString(value, "url", "https://flowdesk.com.br", 1000),
+    };
+  }
+
+  if (value.type === "button") {
+    return {
+      type: "button",
+      label: getCandidateString(value, "label", "Acao", 80),
+      style: sanitizeButtonStyle(value.style),
+      disabled: Boolean(value.disabled),
+    };
+  }
+
+  return null;
+}
+
+function normalizeContentComponent(candidate, legacy) {
+  const markdownFromField = getCandidateString(candidate, "markdown", "", 4000);
+  const contentFromField = getCandidateString(candidate, "content", "", 4000);
+  const title = getCandidateString(candidate, "title", "", 120);
+  const description = getCandidateString(candidate, "description", "", 1200);
+  const fallbackMarkdown = buildMarkdownFromLegacy(legacy);
+
+  const markdown =
+    markdownFromField ||
+    contentFromField ||
+    (title || description
+      ? [title ? `## ${title}` : "", description].filter(Boolean).join("\n")
+      : fallbackMarkdown);
+
+  return {
+    id: trimText(candidate.id) || "content_runtime",
+    type: "content",
+    markdown: clampText(markdown, 4000),
+    accessory: normalizeContentAccessory(candidate.accessory),
+  };
+}
+
+function normalizeNonContainerComponent(value, legacy) {
+  if (!value || typeof value !== "object") return null;
+  const type = value.type;
+
+  switch (type) {
+    case "content":
+      return normalizeContentComponent(value, legacy);
+    case "image":
+      return {
+        id: trimText(value.id) || "image_runtime",
+        type,
+        url: getCandidateString(value, "url", "", 1000),
+        alt: "",
+      };
+    case "file":
+      return {
+        id: trimText(value.id) || "file_runtime",
+        type,
+        name: getCandidateString(value, "name", "Arquivo-flowdesk.pdf", 120),
+        sizeLabel: getCandidateString(value, "sizeLabel", "PDF | 1.2 MB", 60),
+      };
+    case "separator":
+      return {
+        id: trimText(value.id) || "separator_runtime",
+        type,
+        spacing: sanitizeSeparatorSpacing(value.spacing),
+      };
+    case "button":
+      return {
+        id: trimText(value.id) || "button_runtime",
+        type,
+        label: getCandidateString(
+          value,
+          "label",
+          DEFAULT_TICKET_PANEL_BUTTON_LABEL,
+          80,
+        ),
+        style: sanitizeButtonStyle(value.style),
+        disabled: Boolean(value.disabled),
+      };
+    case "link_button":
+      return {
+        id: trimText(value.id) || "link_runtime",
+        type,
+        label: getCandidateString(value, "label", "Abrir link", 80),
+        url: getCandidateString(value, "url", "https://flowdesk.com.br", 1000),
+      };
+    case "select":
+      return {
+        id: trimText(value.id) || "select_runtime",
+        type,
+        placeholder: getCandidateString(
+          value,
+          "placeholder",
+          "Escolha uma opcao",
+          100,
+        ),
+        options: normalizeSelectOptions(value.options),
+      };
+    default:
+      return null;
+  }
+}
+
+function normalizeContainerChildren(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((child) => normalizeNonContainerComponent(child))
+    .filter(Boolean);
+}
+
+function normalizeTicketPanelLayout(value, legacy) {
+  if (!Array.isArray(value) || value.length === 0) {
+    return createDefaultTicketPanelLayout(legacy);
+  }
+
+  const normalized = value
+    .map((component) => {
+      if (!component || typeof component !== "object") return null;
+
+      if (component.type === "container") {
+        let children = normalizeContainerChildren(component.children);
+
+        if (
+          children.length === 0 &&
+          (trimText(component.title) || trimText(component.description))
+        ) {
+          children = [normalizeContentComponent(component, legacy)].filter(Boolean);
+        }
+
+        return {
+          id: trimText(component.id) || "container_runtime",
+          type: "container",
+          accentColor: sanitizeAccentColor(component.accentColor),
+          children,
+        };
+      }
+
+      return normalizeNonContainerComponent(component, legacy);
+    })
+    .filter(Boolean);
+
+  return normalized.length ? normalized : createDefaultTicketPanelLayout(legacy);
+}
+
+function resolveUserTag(user) {
+  if (!user) return "";
+  if (typeof user.tag === "string" && user.tag.trim()) return user.tag.trim();
+  const username = trimText(user.username);
+  const discriminator = trimText(user.discriminator);
+  if (username && discriminator && discriminator !== "0") {
+    return `${username}#${discriminator}`;
+  }
+  return username;
+}
+
+function resolveMemberAvatarUrl(member) {
+  if (!member) return "";
+  if (typeof member.displayAvatarURL === "function") {
+    return member.displayAvatarURL({ size: 256, extension: "png" });
+  }
+  if (member.user && typeof member.user.displayAvatarURL === "function") {
+    return member.user.displayAvatarURL({ size: 256, extension: "png" });
+  }
+  return "";
+}
+
+function buildWelcomeTokenMap({ member, guild, inviter }) {
+  const user = member?.user || member;
+  const userId = trimText(user?.id);
+  const inviterId = trimText(inviter?.id);
+  const username = trimText(user?.username) || trimText(member?.displayName);
+  const userTag = resolveUserTag(user) || username || "usuario";
+  const avatarUrl = resolveMemberAvatarUrl(member);
+  const guildName = trimText(guild?.name) || "servidor";
+  const guildId = trimText(guild?.id);
+  const memberCount =
+    typeof guild?.memberCount === "number" && Number.isFinite(guild.memberCount)
+      ? String(guild.memberCount)
+      : "";
+
+  return {
+    "user": userId ? `<@${userId}>` : "usuario",
+    "user.id": userId || "",
+    "user.tag": userTag,
+    "user.avatar": avatarUrl || "",
+    "inviter": inviterId ? `<@${inviterId}>` : "Convite nao identificado",
+    "server": guildName,
+    "server.id": guildId || "",
+    "memberCount": memberCount,
+  };
+}
+
+function replaceWelcomeTokens(value, tokenMap) {
+  if (typeof value !== "string") return value;
+  return value.replace(WELCOME_TOKEN_REGEX, (match, token) => {
+    if (token && tokenMap[token] !== undefined) {
+      return tokenMap[token];
+    }
+    return match;
+  });
+}
+
+function replaceWelcomeAccessory(accessory, tokenMap, thumbnailOverrideUrl) {
+  if (!accessory || typeof accessory !== "object") return accessory;
+
+  if (accessory.type === "thumbnail") {
+    return {
+      ...accessory,
+      imageUrl: thumbnailOverrideUrl || replaceWelcomeTokens(accessory.imageUrl, tokenMap),
+    };
+  }
+
+  if (accessory.type === "link_button") {
+    return {
+      ...accessory,
+      label: replaceWelcomeTokens(accessory.label, tokenMap),
+      url: replaceWelcomeTokens(accessory.url, tokenMap),
+    };
+  }
+
+  if (accessory.type === "button") {
+    return {
+      ...accessory,
+      label: replaceWelcomeTokens(accessory.label, tokenMap),
+    };
+  }
+
+  return accessory;
+}
+
+function applyWelcomeTokensToLayout(layout, tokenMap, thumbnailOverrideUrl) {
+  return layout.map((component) => {
+    if (!component || typeof component !== "object") return component;
+
+    if (component.type === "container") {
+      return {
+        ...component,
+        children: applyWelcomeTokensToLayout(
+          component.children || [],
+          tokenMap,
+          thumbnailOverrideUrl,
+        ),
+      };
+    }
+
+    if (component.type === "content") {
+      return {
+        ...component,
+        markdown: replaceWelcomeTokens(component.markdown, tokenMap),
+        accessory: replaceWelcomeAccessory(
+          component.accessory,
+          tokenMap,
+          thumbnailOverrideUrl,
+        ),
+      };
+    }
+
+    if (component.type === "image") {
+      return {
+        ...component,
+        url: replaceWelcomeTokens(component.url, tokenMap),
+      };
+    }
+
+    if (component.type === "file") {
+      return {
+        ...component,
+        name: replaceWelcomeTokens(component.name, tokenMap),
+        sizeLabel: replaceWelcomeTokens(component.sizeLabel, tokenMap),
+      };
+    }
+
+    if (component.type === "button" || component.type === "link_button") {
+      return {
+        ...component,
+        label: replaceWelcomeTokens(component.label, tokenMap),
+        url: component.type === "link_button"
+          ? replaceWelcomeTokens(component.url, tokenMap)
+          : component.url,
+      };
+    }
+
+    if (component.type === "select") {
+      return {
+        ...component,
+        placeholder: replaceWelcomeTokens(component.placeholder, tokenMap),
+        options: Array.isArray(component.options)
+          ? component.options.map((option) => ({
+              ...option,
+              label: replaceWelcomeTokens(option.label, tokenMap),
+              description: replaceWelcomeTokens(option.description, tokenMap),
+            }))
+          : component.options,
+      };
+    }
+
+    return component;
+  });
+}
+
+function resolveButtonStyle(style) {
+  switch (style) {
+    case "secondary":
+      return BUTTON_STYLE.SECONDARY;
+    case "success":
+      return BUTTON_STYLE.SUCCESS;
+    case "danger":
+      return BUTTON_STYLE.DANGER;
+    default:
+      return BUTTON_STYLE.PRIMARY;
+  }
+}
+
+function buildTextContent(markdown) {
+  const safeMarkdown = trimText(markdown);
+  return safeMarkdown || `## ${DEFAULT_TICKET_PANEL_TITLE}`;
+}
+
+function buildTextDisplay(content) {
+  return {
+    type: COMPONENT_TYPE.TEXT_DISPLAY,
+    content,
+  };
+}
+
+function buildButton(component, state, options = {}) {
+  const customId = trimText(options.customId) || CUSTOM_IDS.openTicket;
+  const disableNonLink = Boolean(options.disableNonLink);
+
+  if (component.type === "link_button") {
+    return {
+      type: COMPONENT_TYPE.BUTTON,
+      style: BUTTON_STYLE.LINK,
+      label: trimText(component.label) || "Abrir link",
+      url: trimText(component.url) || "https://flowdesk.com.br",
+    };
+  }
+
+  state.hasInteractiveOpenAction = true;
+  return {
+    type: COMPONENT_TYPE.BUTTON,
+    custom_id: customId,
+    style: resolveButtonStyle(component.style),
+    label: trimText(component.label) || DEFAULT_TICKET_PANEL_BUTTON_LABEL,
+    disabled: disableNonLink || Boolean(component.disabled),
+  };
+}
+
+function chunkButtons(buttons) {
+  const rows = [];
+  for (let index = 0; index < buttons.length; index += 5) {
+    rows.push({
+      type: COMPONENT_TYPE.ACTION_ROW,
+      components: buttons.slice(index, index + 5),
+    });
+  }
+  return rows;
+}
+
+function buildSelectRow(component, actionOptions = {}) {
+  const selectOptions = (
+    component.options?.length
+      ? component.options
+      : [{ id: "fallback", label: "Opcao", description: "" }]
+  ).slice(0, 25);
+  const customId = trimText(actionOptions.customId) || "ticket:preview:select";
+  const disabled =
+    typeof actionOptions.disabled === "boolean" ? actionOptions.disabled : true;
+
+  return {
+    type: COMPONENT_TYPE.ACTION_ROW,
+    components: [
+      {
+        type: COMPONENT_TYPE.STRING_SELECT,
+        custom_id: customId,
+        placeholder: trimText(component.placeholder) || "Escolha uma opcao",
+        disabled,
+        options: selectOptions.map((option, index) => ({
+          label: trimText(option.label) || `Opcao ${index + 1}`,
+          description: trimText(option.description) || undefined,
+          value: trimText(option.id) || `option_${index + 1}`,
+        })),
+      },
+    ],
+  };
+}
+
+function addActionsToComponents(target, actions, state, actionOptions = {}) {
+  const bufferedButtons = [];
+
+  const flushButtons = () => {
+    if (!bufferedButtons.length) return;
+    target.push(...chunkButtons(bufferedButtons.splice(0, bufferedButtons.length)));
+  };
+
+  for (const action of actions) {
+    if (action.type === "select") {
+      flushButtons();
+      target.push(buildSelectRow(action, actionOptions));
+      continue;
+    }
+
+    bufferedButtons.push(buildButton(action, state, actionOptions));
+  }
+
+  flushButtons();
+}
+
+function addContentComponent(target, content, state, actionOptions = {}) {
+  const textContent = buildTextContent(content.markdown);
+
+  if (!content.accessory) {
+    target.push(buildTextDisplay(textContent));
+    return;
+  }
+
+  if (content.accessory.type === "thumbnail" && trimText(content.accessory.imageUrl)) {
+    target.push({
+      type: COMPONENT_TYPE.SECTION,
+      components: [buildTextDisplay(textContent)],
+      accessory: {
+        type: COMPONENT_TYPE.THUMBNAIL,
+        media: {
+          url: trimText(content.accessory.imageUrl),
+        },
+      },
+    });
+    return;
+  }
+
+  if (
+    (content.accessory.type === "button" ||
+      content.accessory.type === "link_button") &&
+    (content.accessory.type !== "link_button" || trimText(content.accessory.url))
+  ) {
+    target.push({
+      type: COMPONENT_TYPE.SECTION,
+      components: [buildTextDisplay(textContent)],
+      accessory: buildButton(content.accessory, state, actionOptions),
+    });
+    return;
+  }
+
+  target.push(buildTextDisplay(textContent));
+}
+
+function mapSeparatorSpacing(spacing) {
+  return spacing === "lg" ? 2 : 1;
+}
+
+function addDisplayComponent(target, component, state, actionOptions = {}) {
+  if (component.type === "content") {
+    addContentComponent(target, component, state, actionOptions);
+    return;
+  }
+
+  if (component.type === "image" && trimText(component.url)) {
+    target.push({
+      type: COMPONENT_TYPE.MEDIA_GALLERY,
+      items: [
+        {
+          media: {
+            url: trimText(component.url),
+          },
+        },
+      ],
+    });
+    return;
+  }
+
+  if (component.type === "file") {
+    const fileText = [
+      `### ${trimText(component.name) || "Arquivo"}`,
+      trimText(component.sizeLabel) ? `-# ${trimText(component.sizeLabel)}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    target.push(buildTextDisplay(fileText));
+    return;
+  }
+
+  if (component.type === "separator") {
+    target.push({
+      type: COMPONENT_TYPE.SEPARATOR,
+      divider: true,
+      spacing: mapSeparatorSpacing(component.spacing),
+    });
+  }
+}
+
+function buildComponentList(components, state, actionOptions = {}) {
+  const built = [];
+  let pendingActions = [];
+
+  const flushPendingActions = () => {
+    if (!pendingActions.length) return;
+    addActionsToComponents(built, pendingActions, state, actionOptions);
+    pendingActions = [];
+  };
+
+  for (const component of components) {
+    if (!component) continue;
+
+    if (
+      component.type === "button" ||
+      component.type === "link_button" ||
+      component.type === "select"
+    ) {
+      pendingActions.push(component);
+      continue;
+    }
+
+    flushPendingActions();
+
+    if (component.type === "container") {
+      built.push({
+        type: COMPONENT_TYPE.CONTAINER,
+        accent_color: trimText(component.accentColor)
+          ? Number.parseInt(trimText(component.accentColor).slice(1), 16)
+          : undefined,
+        components: buildComponentList(component.children || [], state, actionOptions),
+      });
+      continue;
+    }
+
+    addDisplayComponent(built, component, state, actionOptions);
+  }
+
+  flushPendingActions();
+  return built;
+}
+
+function deriveLegacyFromLayout(layout, legacy) {
+  let firstContent = null;
+  let firstAction = null;
+
+  const visit = (component) => {
+    if (!component || (firstContent && firstAction)) return;
+
+    if (component.type === "container") {
+      for (const child of component.children || []) {
+        visit(child);
+      }
+      return;
+    }
+
+    if (!firstContent && component.type === "content" && trimText(component.markdown)) {
+      firstContent = component;
+    }
+
+    if (
+      !firstAction &&
+      (component.type === "button" ||
+        component.type === "link_button" ||
+        component.type === "select")
+    ) {
+      firstAction = component;
+    }
+  };
+
+  for (const component of layout) {
+    visit(component);
+  }
+
+  const markdownLines = String(firstContent?.markdown || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const firstMeaningfulLine = markdownLines[0] || "";
+  const titleCandidate = stripMarkdownDecorators(firstMeaningfulLine);
+  const descriptionCandidate = markdownLines
+    .slice(1)
+    .map((line) => stripMarkdownDecorators(line))
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+
+  return {
+    panelTitle: clampText(
+      titleCandidate || legacy?.panelTitle || DEFAULT_TICKET_PANEL_TITLE,
+      80,
+    ),
+    panelDescription: clampText(
+      descriptionCandidate ||
+        legacy?.panelDescription ||
+        DEFAULT_TICKET_PANEL_DESCRIPTION,
+      400,
+    ),
+    panelButtonLabel: clampText(
+      (firstAction && (firstAction.placeholder || firstAction.label)) ||
+        legacy?.panelButtonLabel ||
+        DEFAULT_TICKET_PANEL_BUTTON_LABEL,
+      40,
+    ),
+  };
+}
+
+function buildTicketPanelPayload({ settings, title, description, buttonLabel }) {
+  const legacy = {
+    panelTitle:
+      trimText(settings?.panel_title) ||
+      trimText(title) ||
+      DEFAULT_TICKET_PANEL_TITLE,
+    panelDescription:
+      trimText(settings?.panel_description) ||
+      trimText(description) ||
+      DEFAULT_TICKET_PANEL_DESCRIPTION,
+    panelButtonLabel:
+      trimText(settings?.panel_button_label) ||
+      trimText(buttonLabel) ||
+      DEFAULT_TICKET_PANEL_BUTTON_LABEL,
+  };
+
+  const layout = normalizeTicketPanelLayout(settings?.panel_layout, legacy);
+  const derived = deriveLegacyFromLayout(layout, legacy);
+  const state = { hasInteractiveOpenAction: false };
+  const components = buildComponentList(layout, state);
+
+  if (!state.hasInteractiveOpenAction) {
+    components.push({
+      type: COMPONENT_TYPE.ACTION_ROW,
+      components: [
+        {
+          type: COMPONENT_TYPE.BUTTON,
+          custom_id: CUSTOM_IDS.openTicket,
+          style: BUTTON_STYLE.PRIMARY,
+          label: derived.panelButtonLabel || DEFAULT_TICKET_PANEL_BUTTON_LABEL,
+        },
+      ],
+    });
+  }
+
+  return {
+    flags: MESSAGE_FLAG_IS_COMPONENTS_V2,
+    components,
+    allowedMentions: { parse: [] },
+  };
+}
+
+function buildWelcomeMessagePayload({
+  layout,
+  fallbackMarkdown,
+  member,
+  guild,
+  inviter,
+  thumbnailMode,
+}) {
+  const baseLayout =
+    Array.isArray(layout) && layout.length
+      ? normalizeTicketPanelLayout(layout)
+      : [
+          {
+            id: "welcome_default",
+            type: "content",
+            markdown: trimText(fallbackMarkdown) || "Bem-vindo!",
+            accessory: null,
+          },
+        ];
+
+  const tokenMap = buildWelcomeTokenMap({ member, guild, inviter });
+  const thumbnailOverrideUrl =
+    thumbnailMode === "avatar" ? resolveMemberAvatarUrl(member) : "";
+  const hydratedLayout = applyWelcomeTokensToLayout(
+    baseLayout,
+    tokenMap,
+    thumbnailOverrideUrl,
+  );
+  const state = { hasInteractiveOpenAction: false };
+  const components = buildComponentList(hydratedLayout, state, {
+    customId: "welcome:disabled",
+    disableNonLink: true,
+  });
+
+  const allowedUsers = [];
+  const userId = trimText(member?.user?.id || member?.id);
+  const inviterId = trimText(inviter?.id);
+  if (userId) allowedUsers.push(userId);
+  if (inviterId) allowedUsers.push(inviterId);
+
+  return {
+    flags: MESSAGE_FLAG_IS_COMPONENTS_V2,
+    components,
+    allowedMentions: allowedUsers.length ? { users: allowedUsers } : { parse: [] },
+  };
+}
+
+function buildTicketSystemDisabledPayload() {
+  return buildTicketSimpleMessagePayload({
+    title: "Sistema indisponivel",
+    message: DISABLED_TICKET_MESSAGE,
+    tone: "error",
+  });
+}
+
+function resolveTicketMessageToneColor(tone) {
+  switch (tone) {
+    case "success":
+      return 0x2ecc71;
+    case "warning":
+      return 0xf1c40f;
+    case "error":
+      return 0xe74c3c;
+    default:
+      return 0x2b2d31;
+  }
+}
+
+function buildTicketSimpleMessagePayload(input) {
+  const normalizedInput =
+    typeof input === "string"
+      ? { message: input, title: "", tone: "neutral" }
+      : {
+          message: String(input?.message || "").trim(),
+          title: String(input?.title || "").trim(),
+          tone: input?.tone || "neutral",
+        };
+
+  const description = [
+    normalizedInput.title ? `### ${normalizedInput.title}` : "",
+    normalizedInput.message,
+  ]
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+
+  return {
+    flags: MessageFlags.IsComponentsV2,
+    components: [
+      {
+        type: COMPONENT_TYPE.CONTAINER,
+        accent_color: resolveTicketMessageToneColor(normalizedInput.tone),
+        components: [
+          {
+            type: COMPONENT_TYPE.TEXT_DISPLAY,
+            content: description,
+          },
+        ],
+      },
+    ],
+    allowedMentions: { parse: [] },
+  };
+}
+
+function formatTicketNumber(ticketId) {
+  return `#${String(ticketId || 0).padStart(4, "0")}`;
+}
+
+function sanitizeTicketReasonBlock(reason) {
+  return String(reason || "")
+    .replace(/```/g, "'''")
+    .trim();
+}
+
+function buildTicketIntroPayload({ ticket } = {}) {
+  const ticketNumber = ticket?.id ? formatTicketNumber(ticket.id) : "#0000";
+  const protocol = String(ticket?.protocol || "").trim();
+  const userId = String(ticket?.user_id || "").trim();
+  const openedReason = sanitizeTicketReasonBlock(ticket?.opened_reason);
+  const openedAt = ticket?.opened_at
+    ? new Date(ticket.opened_at).toLocaleString("pt-BR", {
+        timeZone: "America/Sao_Paulo",
+      })
+    : "";
+  const baseLines = [
+    `### Ticket aberto ${ticketNumber}`,
+    "",
+    "Explique o que voce precisa com o maximo de detalhes. Nossa equipe foi notificada e vai responder por aqui.",
+    "",
+    protocol ? `-# Protocolo: \`${protocol}\`` : "",
+    userId ? `-# Solicitante: <@${userId}>` : "",
+    userId ? `-# ID do usuario: \`${userId}\`` : "",
+    openedAt ? `-# Aberto em: \`${openedAt}\`` : "",
+    openedReason ? `> \`\`\`${openedReason}\`\`\`` : "",
+  ].filter(Boolean);
+
+  return {
+    flags: MessageFlags.IsComponentsV2,
+    components: [
+      {
+        type: COMPONENT_TYPE.CONTAINER,
+        accent_color: resolveTicketMessageToneColor("neutral"),
+        components: [
+          {
+            type: COMPONENT_TYPE.TEXT_DISPLAY,
+            content: baseLines.join("\n"),
+          },
+          {
+            type: COMPONENT_TYPE.SEPARATOR,
+            divider: true,
+            spacing: SeparatorSpacingSize.Small,
+          },
+          {
+            type: COMPONENT_TYPE.ACTION_ROW,
+            components: [
+              {
+                type: COMPONENT_TYPE.BUTTON,
+                custom_id: CUSTOM_IDS.ticketAdminPanel,
+                style: BUTTON_STYLE.SECONDARY,
+                label: "Painel Admin",
+              },
+              {
+                type: COMPONENT_TYPE.BUTTON,
+                custom_id: CUSTOM_IDS.ticketStaffPanel,
+                style: BUTTON_STYLE.SECONDARY,
+                label: "Painel Staff",
+              },
+              {
+                type: COMPONENT_TYPE.BUTTON,
+                custom_id: CUSTOM_IDS.ticketMemberPanel,
+                style: BUTTON_STYLE.SECONDARY,
+                label: "Painel do membro",
+              },
+            ],
+          },
+          {
+            type: COMPONENT_TYPE.ACTION_ROW,
+            components: [
+              {
+                type: COMPONENT_TYPE.BUTTON,
+                custom_id: CUSTOM_IDS.closeTicket,
+                style: BUTTON_STYLE.DANGER,
+                label: "Encerrar atendimento",
+              },
+            ],
+          },
+        ],
+      },
+    ],
+    allowedMentions: { parse: [] },
+  };
+}
+
+function buildLogPayload({
+  accentColor,
+  title,
+  lines,
+  linkUrl,
+  linkLabel,
+  actionLabel,
+  actionDisabled = false,
+}) {
+  const containerComponents = [
+    {
+      type: COMPONENT_TYPE.TEXT_DISPLAY,
+      content: [`## ${title.trim()}`, lines.join("\n")].filter(Boolean).join("\n\n"),
+    },
+  ];
+
+  if (trimText(linkUrl)) {
+    containerComponents.push({
+      type: COMPONENT_TYPE.SEPARATOR,
+      divider: true,
+      spacing: SeparatorSpacingSize.Small,
+    });
+    containerComponents.push({
+      type: COMPONENT_TYPE.ACTION_ROW,
+      components: [
+        {
+          type: COMPONENT_TYPE.BUTTON,
+          style: BUTTON_STYLE.LINK,
+          label: trimText(linkLabel) || "Abrir transcript",
+          url: trimText(linkUrl),
+        },
+      ],
+    });
+  } else if (trimText(actionLabel)) {
+    containerComponents.push({
+      type: COMPONENT_TYPE.SEPARATOR,
+      divider: true,
+      spacing: SeparatorSpacingSize.Small,
+    });
+    containerComponents.push({
+      type: COMPONENT_TYPE.ACTION_ROW,
+      components: [
+        {
+          type: COMPONENT_TYPE.BUTTON,
+          style: BUTTON_STYLE.SECONDARY,
+          label: trimText(actionLabel),
+          custom_id: "flowdesk:transcript:unavailable",
+          disabled: Boolean(actionDisabled),
+        },
+      ],
+    });
+  }
+
+  return {
+    flags: MessageFlags.IsComponentsV2,
+    components: [
+      {
+        type: COMPONENT_TYPE.CONTAINER,
+        accent_color:
+          Number.isFinite(accentColor) && accentColor > 0
+            ? accentColor
+            : resolveTicketMessageToneColor("neutral"),
+        components: containerComponents,
+      },
+    ],
+    allowedMentions: { parse: [] },
+  };
+}
+
+function buildTicketClosureDmPayload({
+  ticket,
+  transcriptUrl,
+  accessCode,
+  closedBy,
+  transcriptAvailable = false,
+}) {
+  const lines = [
+    `### Ticket fechado ${formatTicketNumber(ticket?.id)}`,
+    "",
+    ticket?.protocol ? `-# Protocolo: \`${ticket.protocol}\`` : "",
+    ticket?.user_id ? `-# Solicitante: <@${ticket.user_id}>` : "",
+    closedBy ? `-# Fechado por: <@${closedBy}>` : "",
+    transcriptAvailable
+      ? "O transcript deste atendimento esta protegido por senha."
+      : "O transcript deste atendimento ficou indisponivel por falta de mensagens suficientes.",
+    transcriptAvailable && trimText(accessCode)
+      ? `-# Codigo de acesso: \`${String(accessCode || "").trim()}\``
+      : "",
+    transcriptAvailable
+      ? "-# Depois de validar o codigo, a sessao fica liberada por 10 minutos."
+      : "",
+  ].filter(Boolean);
+
+  return {
+    flags: MessageFlags.IsComponentsV2,
+    components: [
+      {
+        type: COMPONENT_TYPE.CONTAINER,
+        accent_color: resolveTicketMessageToneColor(
+          transcriptAvailable ? "warning" : "neutral",
+        ),
+        components: [
+          {
+            type: COMPONENT_TYPE.TEXT_DISPLAY,
+            content: lines.join("\n"),
+          },
+          {
+            type: COMPONENT_TYPE.SEPARATOR,
+            divider: true,
+            spacing: SeparatorSpacingSize.Small,
+          },
+          {
+            type: COMPONENT_TYPE.ACTION_ROW,
+            components: [
+              trimText(transcriptUrl) && transcriptAvailable
+                ? {
+                    type: COMPONENT_TYPE.BUTTON,
+                    style: BUTTON_STYLE.LINK,
+                    label: "Abrir transcript",
+                    url: trimText(transcriptUrl),
+                  }
+                : {
+                    type: COMPONENT_TYPE.BUTTON,
+                    style: BUTTON_STYLE.SECONDARY,
+                    label: "Transcript indisponivel",
+                    custom_id: "flowdesk:transcript:unavailable",
+                    disabled: true,
+                  },
+            ],
+          },
+        ],
+      },
+    ],
+    allowedMentions: { parse: [] },
+  };
+}
+
+module.exports = {
+  buildTicketPanelPayload,
+  buildWelcomeMessagePayload,
+  buildTicketSimpleMessagePayload,
+  buildTicketSystemDisabledPayload,
+  buildTicketIntroPayload,
+  buildLogPayload,
+  buildTicketClosureDmPayload,
+};
+
