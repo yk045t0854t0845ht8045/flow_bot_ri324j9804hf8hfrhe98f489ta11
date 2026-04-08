@@ -5,6 +5,7 @@ const {
 } = require("../services/ticketService");
 const { startDirectMessageQueueWorker } = require("../services/directMessageQueueService");
 const { primeInviteCacheForClient } = require("../utils/inviteTracker");
+const { syncSlashCommandsForClient } = require("../services/slashCommandSyncService");
 const { env } = require("../config/env");
 
 module.exports = {
@@ -15,6 +16,24 @@ module.exports = {
     console.log(
       `[ai-mention] ${env.openaiApiKey ? "ativo" : "desativado"} | modelo principal: ${env.openaiModel}`,
     );
+    if (env.autoDeployCommands) {
+      try {
+        const slashSync = await syncSlashCommandsForClient(client);
+        if (slashSync.deployed) {
+          console.log(
+            `[slash-commands] synced ${slashSync.count} command(s) (${slashSync.scope})`,
+          );
+        } else {
+          console.log(
+            `[slash-commands] sincronizacao ignorada (${slashSync.reason})`,
+          );
+        }
+      } catch (error) {
+        console.error("[slash-commands]", error);
+      }
+    } else {
+      console.log("[slash-commands] sincronizacao automatica desativada no .env");
+    }
 
     try {
       const panelResult = await ensureOfficialLinkPanel(client);

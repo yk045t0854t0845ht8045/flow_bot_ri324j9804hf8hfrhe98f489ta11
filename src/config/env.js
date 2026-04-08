@@ -77,6 +77,14 @@ function parseAccentColor(value) {
   return Number.parseInt(value, 10);
 }
 
+function parseBoolean(value, fallback) {
+  if (typeof value !== "string") return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
 for (const key of REQUIRED_KEYS) {
   requireEnv(key);
 }
@@ -98,6 +106,7 @@ const env = {
     process.env.OFFICIAL_TERMS_URL || `${DEFAULT_PUBLIC_APP_URL}/terms`,
   officialPrivacyUrl:
     process.env.OFFICIAL_PRIVACY_URL || `${DEFAULT_PUBLIC_APP_URL}/privacy`,
+  autoDeployCommands: parseBoolean(process.env.DISCORD_AUTO_DEPLOY_COMMANDS, true),
   appUrl:
     process.env.NEXT_PUBLIC_APP_URL ||
     process.env.APP_URL ||
