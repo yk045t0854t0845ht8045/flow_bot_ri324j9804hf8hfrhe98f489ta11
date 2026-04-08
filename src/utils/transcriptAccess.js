@@ -1,6 +1,6 @@
 const crypto = require("node:crypto");
 
-const DEFAULT_PUBLIC_APP_ORIGIN = "https://flowdeskbot.vercel.app";
+const DEFAULT_PUBLIC_APP_ORIGIN = "https://flwdesk.com";
 
 function getTranscriptAccessSecret() {
   const secret =

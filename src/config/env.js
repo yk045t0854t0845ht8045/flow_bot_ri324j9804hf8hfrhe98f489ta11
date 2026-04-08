@@ -1,10 +1,22 @@
+const { existsSync } = require("node:fs");
 const path = require("node:path");
 const dotenv = require("dotenv");
 
-dotenv.config({ path: path.resolve(process.cwd(), "site", ".env"), quiet: true });
-dotenv.config({ path: path.resolve(process.cwd(), ".env"), quiet: true });
+const projectRoot = path.resolve(__dirname, "..", "..");
+const envCandidates = [
+  path.resolve(projectRoot, ".env"),
+  path.resolve(projectRoot, "site", ".env"),
+  path.resolve(process.cwd(), ".env"),
+  path.resolve(process.cwd(), "site", ".env"),
+];
 
-const DEFAULT_PUBLIC_APP_URL = "https://flowdeskbot.vercel.app";
+for (const envPath of [...new Set(envCandidates)]) {
+  if (existsSync(envPath)) {
+    dotenv.config({ path: envPath, quiet: true });
+  }
+}
+
+const DEFAULT_PUBLIC_APP_URL = "https://flwdesk.com";
 
 const REQUIRED_KEYS = [
   "DISCORD_CLIENT_ID",

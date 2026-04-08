@@ -1,5 +1,6 @@
 const { createClient } = require("@supabase/supabase-js");
 const { env } = require("../config/env");
+const flowPlansCatalog = require("../../shared/flow-plans.json");
 
 const TICKETS_TABLE = "tickets";
 const EVENTS_TABLE = "ticket_events";
@@ -42,11 +43,27 @@ function resolveLicenseBaseTimestamp(order) {
 }
 
 function resolveLicenseValidityMs(order) {
-  const cycleDays =
+  const explicitCycleDays =
     typeof order?.plan_billing_cycle_days === "number" &&
     Number.isFinite(order.plan_billing_cycle_days) &&
     order.plan_billing_cycle_days > 0
       ? order.plan_billing_cycle_days
+      : null;
+
+  if (explicitCycleDays) {
+    return explicitCycleDays * 24 * 60 * 60 * 1000;
+  }
+
+  const normalizedPlanCode =
+    typeof order?.plan_code === "string"
+      ? order.plan_code.trim().toLowerCase()
+      : "";
+  const catalogCycleDays = Number(
+    flowPlansCatalog?.[normalizedPlanCode]?.billingCycleDays,
+  );
+  const cycleDays =
+    Number.isInteger(catalogCycleDays) && catalogCycleDays > 0
+      ? catalogCycleDays
       : DEFAULT_LICENSE_VALIDITY_DAYS;
 
   return cycleDays * 24 * 60 * 60 * 1000;
@@ -112,6 +129,39 @@ function resolveLatestLicenseStatusFromApprovedOrders(orders, nowMs = Date.now()
       latestCoverage?.status === "paid" || latestCoverage?.status === "expired",
     latestCoverage,
   };
+}
+
+function normalizePlanCode(value, fallback = "pro") {
+  if (typeof value !== "string") return fallback;
+  const normalized = value.trim().toLowerCase();
+  return flowPlansCatalog?.[normalized] ? normalized : fallback;
+}
+
+function resolvePlanNameFromOrder(order) {
+  const fromOrder = typeof order?.plan_name === "string" ? order.plan_name.trim() : "";
+  if (fromOrder) return fromOrder;
+
+  const normalizedPlanCode = normalizePlanCode(order?.plan_code, "pro");
+  const fromCatalog = flowPlansCatalog?.[normalizedPlanCode]?.name;
+  return typeof fromCatalog === "string" && fromCatalog.trim()
+    ? fromCatalog.trim()
+    : "Flow Pro";
+}
+
+function resolveExpiresAtIsoFromOrderOrCoverage(order, coverage) {
+  if (
+    coverage &&
+    Number.isFinite(coverage.licenseExpiresAtMs) &&
+    coverage.licenseExpiresAtMs > 0
+  ) {
+    return new Date(coverage.licenseExpiresAtMs).toISOString();
+  }
+
+  const expiresAtFromOrder =
+    typeof order?.expires_at === "string" ? order.expires_at.trim() : "";
+  if (expiresAtFromOrder) return expiresAtFromOrder;
+
+  return null;
 }
 
 async function getOpenTicketCount(guildId, userId) {
@@ -521,13 +571,100 @@ async function getGuildWelcomeSettings(guildId) {
 async function getApprovedPaymentOrdersForGuild(guildId) {
   const result = await supabase
     .from(PAYMENT_ORDERS_TABLE)
-    .select("id, guild_id, paid_at, created_at, plan_billing_cycle_days")
+    .select("id, guild_id, plan_code, paid_at, created_at, plan_billing_cycle_days")
     .eq("guild_id", guildId)
     .eq("status", "approved")
     .order("paid_at", { ascending: false, nullsFirst: false })
     .order("created_at", { ascending: false });
 
   return unwrap(result, "getApprovedPaymentOrdersForGuild") || [];
+}
+
+async function getUserPlanSnapshotByDiscordUserId(discordUserId) {
+  const normalizedDiscordUserId =
+    typeof discordUserId === "string" ? discordUserId.trim() : "";
+  if (!normalizedDiscordUserId) {
+    return {
+      hasPlan: false,
+      hasPurchaseHistory: false,
+      userId: null,
+    };
+  }
+
+  const authUserResult = await supabase
+    .from("auth_users")
+    .select("id, discord_user_id")
+    .eq("discord_user_id", normalizedDiscordUserId)
+    .maybeSingle();
+
+  const authUser = unwrap(authUserResult, "getUserPlanSnapshotByDiscordUserId.authUser");
+  if (!authUser?.id) {
+    return {
+      hasPlan: false,
+      hasPurchaseHistory: false,
+      userId: null,
+    };
+  }
+
+  const approvedOrdersResult = await supabase
+    .from(PAYMENT_ORDERS_TABLE)
+    .select(
+      "id, user_id, plan_code, plan_name, paid_at, created_at, expires_at, amount, currency, plan_billing_cycle_days",
+    )
+    .eq("user_id", authUser.id)
+    .eq("status", "approved")
+    .order("paid_at", { ascending: false, nullsFirst: false })
+    .order("created_at", { ascending: false });
+
+  const approvedOrders =
+    unwrap(
+      approvedOrdersResult,
+      "getUserPlanSnapshotByDiscordUserId.approvedOrders",
+    ) || [];
+
+  if (!approvedOrders.length) {
+    return {
+      hasPlan: false,
+      hasPurchaseHistory: false,
+      userId: authUser.id,
+    };
+  }
+
+  const license = resolveLatestLicenseStatusFromApprovedOrders(approvedOrders);
+  const latestCoverage = license.latestCoverage;
+  const latestOrder = latestCoverage?.order || approvedOrders[0];
+  const normalizedPlanCode = normalizePlanCode(latestOrder?.plan_code, "pro");
+  const resolvedPlanName = resolvePlanNameFromOrder(latestOrder);
+  const expiresAtIso = resolveExpiresAtIsoFromOrderOrCoverage(
+    latestOrder,
+    latestCoverage,
+  );
+  const purchasedAtIso = latestOrder?.paid_at || latestOrder?.created_at || null;
+
+  return {
+    hasPlan: true,
+    hasPurchaseHistory: true,
+    userId: authUser.id,
+    planCode: normalizedPlanCode,
+    planName: resolvedPlanName,
+    status: license.status === "paid" ? "active" : "expired",
+    rawStatus: license.status,
+    expiresAt: expiresAtIso,
+    purchasedAt: purchasedAtIso,
+    amount:
+      typeof latestOrder?.amount === "number" && Number.isFinite(latestOrder.amount)
+        ? latestOrder.amount
+        : null,
+    currency:
+      typeof latestOrder?.currency === "string" && latestOrder.currency.trim()
+        ? latestOrder.currency.trim()
+        : "BRL",
+    billingCycleDays:
+      typeof latestOrder?.plan_billing_cycle_days === "number" &&
+      Number.isFinite(latestOrder.plan_billing_cycle_days)
+        ? latestOrder.plan_billing_cycle_days
+        : null,
+  };
 }
 
 async function getApprovedPaymentOrdersForGuildIds(guildIds) {
@@ -538,7 +675,7 @@ async function getApprovedPaymentOrdersForGuildIds(guildIds) {
 
   const result = await supabase
     .from(PAYMENT_ORDERS_TABLE)
-    .select("id, guild_id, paid_at, created_at, plan_billing_cycle_days")
+    .select("id, guild_id, plan_code, paid_at, created_at, plan_billing_cycle_days")
     .in("guild_id", uniqueGuildIds)
     .eq("status", "approved")
     .order("paid_at", { ascending: false, nullsFirst: false })
@@ -676,4 +813,5 @@ module.exports = {
   upsertTicketAiSession,
   upsertTicketTranscript,
   updateGuildTicketPanelMessageId,
+  getUserPlanSnapshotByDiscordUserId,
 };
