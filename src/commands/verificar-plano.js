@@ -133,6 +133,7 @@ function buildPlanPayloads(snapshot) {
       title: "Plano da sua conta",
       description:
         "Dados sincronizados com sua conta no Flowdesk. Para gerenciar servidores e assinatura, abra o dashboard.",
+      detailsMarkdown,
       buttonLabel: "Verificar meu plano",
       buttonUrl: dashboardUrl,
       buttonHint: "-# Abra o dashboard para ver limites, renovacao e upgrades.",
