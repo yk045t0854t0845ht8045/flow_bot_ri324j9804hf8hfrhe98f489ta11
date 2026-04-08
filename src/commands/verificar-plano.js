@@ -4,6 +4,7 @@ const {
   ButtonStyle,
   ContainerBuilder,
   MessageFlags,
+  SectionBuilder,
   SeparatorBuilder,
   SeparatorSpacingSize,
   SlashCommandBuilder,
@@ -11,6 +12,8 @@ const {
 } = require("discord.js");
 const { env } = require("../config/env");
 const { getUserPlanSnapshotByDiscordUserId } = require("../services/supabaseService");
+
+const STATUS_PAGE_URL = "https://status.flwdesk.com";
 
 function normalizeBaseAppUrl() {
   const candidate =
@@ -41,35 +44,75 @@ function formatMoney(amount, currency = "BRL") {
   }).format(Math.round(amount * 100) / 100);
 }
 
-function buildPlainContainer(contentLines) {
-  const sections = contentLines.filter(Boolean).join("\n");
-  return new ContainerBuilder()
-    .addTextDisplayComponents(new TextDisplayBuilder().setContent(sections));
+function buildLinkButtonRow(label, url) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel(label).setURL(url),
+  );
 }
 
-function buildNoPlanResponse() {
+function buildComponentsV2Card(input) {
+  const container = new ContainerBuilder().addTextDisplayComponents(
+    new TextDisplayBuilder().setContent(`## ${input.title}\n-# ${input.description}`),
+  );
+
+  if (input.detailsMarkdown) {
+    container
+      .addSeparatorComponents(
+        new SeparatorBuilder()
+          .setSpacing(SeparatorSpacingSize.Small)
+          .setDivider(true),
+      )
+      .addTextDisplayComponents(
+        new TextDisplayBuilder().setContent(input.detailsMarkdown),
+      );
+  }
+
+  container
+    .addSeparatorComponents(
+      new SeparatorBuilder()
+        .setSpacing(SeparatorSpacingSize.Small)
+        .setDivider(true),
+    )
+    .addSectionComponents(
+      new SectionBuilder()
+        .setButtonAccessory(
+          new ButtonBuilder()
+            .setStyle(ButtonStyle.Link)
+            .setLabel(input.buttonLabel)
+            .setURL(input.buttonUrl),
+        )
+        .addTextDisplayComponents(
+          new TextDisplayBuilder().setContent(
+            input.buttonHint ||
+              "-# Acesse o link para abrir o painel e continuar a gestao da conta.",
+          ),
+        ),
+    );
+
+  return { components: [container] };
+}
+
+function buildNoPlanPayloads() {
   const baseAppUrl = normalizeBaseAppUrl();
 
-  const components = [
-    buildPlainContainer([
-      "## Nenhum plano encontrado",
-      "-# Nao encontramos compras vinculadas a sua conta Discord. Escolha um plano para liberar os recursos no Flowdesk.",
-    ]),
-    new SeparatorBuilder()
-      .setSpacing(SeparatorSpacingSize.Small)
-      .setDivider(true),
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setStyle(ButtonStyle.Link)
-        .setLabel("Adquirir um plano")
-        .setURL(baseAppUrl),
-    ),
-  ];
-
-  return { components };
+  return {
+    v2: buildComponentsV2Card({
+      title: "Nenhum plano encontrado",
+      description:
+        "Nao encontramos compras vinculadas a sua conta Discord. Escolha um plano para liberar os recursos no Flowdesk.",
+      buttonLabel: "Adquirir um plano",
+      buttonUrl: baseAppUrl,
+      buttonHint: "-# Clique para conhecer os planos e iniciar sua assinatura.",
+    }),
+    fallback: {
+      content:
+        "Nenhum plano encontrado para sua conta.\nUse o botao abaixo para adquirir um plano no Flowdesk.",
+      components: [buildLinkButtonRow("Adquirir um plano", baseAppUrl)],
+    },
+  };
 }
 
-function buildPlanResponse(snapshot) {
+function buildPlanPayloads(snapshot) {
   const baseAppUrl = normalizeBaseAppUrl();
   const dashboardUrl = `${baseAppUrl}/servers`;
   const statusLabel =
@@ -77,37 +120,84 @@ function buildPlanResponse(snapshot) {
       ? "Licenca valida"
       : "Licenca expirada (historico de compra encontrado)";
 
-  const components = [
-    buildPlainContainer([
-      "## Plano da sua conta",
-      "-# Dados sincronizados com sua conta no Flowdesk. Para gerenciar servidores e assinatura, abra o dashboard.",
-    ]),
-    new SeparatorBuilder()
-      .setSpacing(SeparatorSpacingSize.Small)
-      .setDivider(true),
-    buildPlainContainer([
-      `**Plano**\n${snapshot.planName || "Nao informado"}`,
-      "",
-      `**Status**\n${statusLabel}`,
-      "",
-      `**Vence em**\n${toDiscordTimestamp(snapshot.expiresAt)}`,
-      "",
-      `**Ultima compra**\n${toDiscordTimestamp(snapshot.purchasedAt)}`,
-      "",
-      `**Ultimo valor pago**\n${formatMoney(snapshot.amount, snapshot.currency)}`,
-    ]),
-    new SeparatorBuilder()
-      .setSpacing(SeparatorSpacingSize.Small)
-      .setDivider(true),
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setStyle(ButtonStyle.Link)
-        .setLabel("Verificar meu plano")
-        .setURL(dashboardUrl),
-    ),
-  ];
+  const detailsMarkdown = [
+    `**Plano**\n${snapshot.planName || "Nao informado"}`,
+    `**Status**\n${statusLabel}`,
+    `**Vence em**\n${toDiscordTimestamp(snapshot.expiresAt)}`,
+    `**Ultima compra**\n${toDiscordTimestamp(snapshot.purchasedAt)}`,
+    `**Ultimo valor pago**\n${formatMoney(snapshot.amount, snapshot.currency)}`,
+  ].join("\n\n");
 
-  return { components };
+  return {
+    v2: buildComponentsV2Card({
+      title: "Plano da sua conta",
+      description:
+        "Dados sincronizados com sua conta no Flowdesk. Para gerenciar servidores e assinatura, abra o dashboard.",
+      detailsMarkdown,
+      buttonLabel: "Verificar meu plano",
+      buttonUrl: dashboardUrl,
+      buttonHint: "-# Abra o dashboard para ver limites, renovacao e upgrades.",
+    }),
+    fallback: {
+      content:
+        "Plano da sua conta:\n" +
+        `Plano: ${snapshot.planName || "Nao informado"}\n` +
+        `Status: ${statusLabel}\n` +
+        `Vence em: ${toDiscordTimestamp(snapshot.expiresAt)}\n` +
+        `Ultima compra: ${toDiscordTimestamp(snapshot.purchasedAt)}\n` +
+        `Ultimo valor pago: ${formatMoney(snapshot.amount, snapshot.currency)}`,
+      components: [buildLinkButtonRow("Verificar meu plano", dashboardUrl)],
+    },
+  };
+}
+
+function buildErrorPayloads() {
+  return {
+    v2: buildComponentsV2Card({
+      title: "Nao foi possivel consultar seu plano",
+      description:
+        "Tivemos uma falha temporaria ao sincronizar os dados da sua conta. Tente novamente em alguns segundos.",
+      buttonLabel: "Verificar status",
+      buttonUrl: STATUS_PAGE_URL,
+      buttonHint:
+        "-# Se o problema continuar, acompanhe o status da plataforma e tente novamente.",
+    }),
+    fallback: {
+      content:
+        "Nao foi possivel consultar seu plano agora.\n" +
+        "Tente novamente em alguns segundos ou acompanhe o status da plataforma.",
+      components: [buildLinkButtonRow("Verificar status", STATUS_PAGE_URL)],
+    },
+  };
+}
+
+async function sendPayloadsWithV2Fallback(interaction, payloads) {
+  const v2Payload = {
+    ...payloads.v2,
+    flags: MessageFlags.Ephemeral | MessageFlags.IsComponentsV2,
+  };
+
+  try {
+    await interaction.deleteReply().catch(() => null);
+    await interaction.followUp(v2Payload);
+    return;
+  } catch (error) {
+    console.warn(
+      "[verificar-plano] Components V2 indisponivel para esta resposta, aplicando fallback:",
+      error?.message || error,
+    );
+  }
+
+  const fallbackPayload = {
+    ...payloads.fallback,
+    flags: MessageFlags.Ephemeral,
+  };
+
+  try {
+    await interaction.followUp(fallbackPayload);
+  } catch {
+    await interaction.editReply(payloads.fallback).catch(() => null);
+  }
 }
 
 module.exports = {
@@ -117,27 +207,19 @@ module.exports = {
 
   async execute(interaction) {
     await interaction.deferReply({
-      flags: MessageFlags.Ephemeral | MessageFlags.IsComponentsV2,
+      flags: MessageFlags.Ephemeral,
     });
 
     try {
       const snapshot = await getUserPlanSnapshotByDiscordUserId(interaction.user.id);
-      if (!snapshot?.hasPlan) {
-        await interaction.editReply(buildNoPlanResponse());
-        return;
-      }
+      const payloads = snapshot?.hasPlan
+        ? buildPlanPayloads(snapshot)
+        : buildNoPlanPayloads();
 
-      await interaction.editReply(buildPlanResponse(snapshot));
+      await sendPayloadsWithV2Fallback(interaction, payloads);
     } catch (error) {
       console.error("[verificar-plano] Falha ao consultar plano da conta:", error);
-      await interaction.editReply({
-        components: [
-          buildPlainContainer([
-            "## Nao foi possivel consultar seu plano",
-            "-# Ocorreu um erro ao sincronizar os dados da sua conta. Tente novamente em alguns segundos.",
-          ]),
-        ],
-      });
+      await sendPayloadsWithV2Fallback(interaction, buildErrorPayloads());
     }
   },
 };
