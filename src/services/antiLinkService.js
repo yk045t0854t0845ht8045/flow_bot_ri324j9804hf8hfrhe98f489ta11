@@ -14,13 +14,97 @@ const runtimeCache = new Map();
 const HTTP_LINK_REGEX = /\b(?:https?:\/\/|www\.)[^\s<>()]+/i;
 const DISCORD_INVITE_REGEX =
   /\b(?:discord(?:app)?\.com\/invite\/|discord\.gg\/)[a-z0-9-]{2,}\b/i;
-const GENERIC_DOMAIN_REGEX =
-  /\b[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\.(?:[a-z]{2,24}|xn--[a-z0-9-]{2,59})\b/i;
-const PLAIN_DOMAIN_REGEX =
-  /\b[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\s*[\.\u2024\u3002\uFF0E]\s*|\s+dot\s+)(?:[a-z]{2,24}|xn--[a-z0-9-]{2,59})\b/i;
 const MARKDOWN_HIDDEN_LINK_REGEX = /\[[^\]]{1,180}\]\(([^)]+)\)/i;
 const OBFUSCATED_HTTP_REGEX =
   /h\s*[tx]\s*[tx]\s*p\s*s?\s*(?:[:\]\)]|\scolon\s)?\s*(?:\/|\sslash\s)\s*(?:\/|\sslash\s)/i;
+const DOMAIN_CANDIDATE_REGEX =
+  /\b[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+\b/gi;
+const KNOWN_TLD_SET = new Set([
+  "com",
+  "net",
+  "org",
+  "io",
+  "gg",
+  "co",
+  "app",
+  "dev",
+  "br",
+  "xyz",
+  "live",
+  "store",
+  "site",
+  "online",
+  "etc",
+  "me",
+  "link",
+  "tv",
+  "pro",
+  "cloud",
+  "info",
+  "biz",
+  "shop",
+  "top",
+  "vip",
+  "tech",
+  "blog",
+  "ai",
+  "edu",
+  "gov",
+  "mil",
+  "us",
+  "uk",
+  "de",
+  "fr",
+  "es",
+  "it",
+  "ca",
+  "au",
+  "pt",
+  "jp",
+  "kr",
+  "cn",
+  "in",
+  "ru",
+  "ar",
+  "mx",
+  "cl",
+  "pe",
+  "uy",
+  "py",
+  "bo",
+  "ec",
+  "ve",
+  "nl",
+  "be",
+  "ch",
+  "se",
+  "no",
+  "fi",
+  "dk",
+  "pl",
+  "tr",
+  "cz",
+  "at",
+  "ro",
+  "hu",
+  "gr",
+  "il",
+  "ie",
+  "nz",
+  "za",
+  "id",
+  "sg",
+  "hk",
+  "tw",
+  "th",
+  "ph",
+  "my",
+  "com.br",
+  "net.br",
+  "org.br",
+  "gov.br",
+  "edu.br",
+]);
 
 function normalizeText(value) {
   if (typeof value !== "string") return "";
@@ -62,6 +146,27 @@ function normalizeTimeoutMinutes(value) {
   return Math.min(10080, Math.max(1, parsed));
 }
 
+function hasLikelyDomainWithKnownTld(value) {
+  if (typeof value !== "string" || !value.trim()) return false;
+  const candidates = value.match(DOMAIN_CANDIDATE_REGEX);
+  if (!Array.isArray(candidates) || !candidates.length) return false;
+
+  for (const candidate of candidates) {
+    const domain = String(candidate || "").toLowerCase();
+    const parts = domain.split(".").filter(Boolean);
+    if (parts.length < 2) continue;
+
+    const topLevel = parts[parts.length - 1];
+    const topLevelPair = `${parts[parts.length - 2]}.${topLevel}`;
+
+    if (KNOWN_TLD_SET.has(topLevel) || KNOWN_TLD_SET.has(topLevelPair)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function detectViolation(content, settings) {
   const normalized = normalizeText(content);
   if (!normalized) return null;
@@ -97,8 +202,7 @@ function detectViolation(content, settings) {
   if (
     settings.block_external_links !== false &&
     (HTTP_LINK_REGEX.test(normalized) ||
-      GENERIC_DOMAIN_REGEX.test(normalized) ||
-      PLAIN_DOMAIN_REGEX.test(normalized))
+      hasLikelyDomainWithKnownTld(normalized))
   ) {
     return {
       rule: "external_link",
@@ -111,9 +215,9 @@ function detectViolation(content, settings) {
     (OBFUSCATED_HTTP_REGEX.test(normalized) ||
       deobfuscated.includes("http://") ||
       deobfuscated.includes("https://") ||
-      (deobfuscated.includes("www.") && GENERIC_DOMAIN_REGEX.test(deobfuscated)) ||
-      PLAIN_DOMAIN_REGEX.test(deobfuscated) ||
-      GENERIC_DOMAIN_REGEX.test(deobfuscated))
+      (deobfuscated.includes("www.") &&
+        hasLikelyDomainWithKnownTld(deobfuscated)) ||
+      hasLikelyDomainWithKnownTld(deobfuscated))
   ) {
     return {
       rule: "obfuscated_link",
