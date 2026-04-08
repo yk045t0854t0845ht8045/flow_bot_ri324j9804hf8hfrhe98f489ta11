@@ -1,6 +1,7 @@
 const crypto = require("node:crypto");
 
 const DEFAULT_PUBLIC_APP_ORIGIN = "https://flwdesk.com";
+const LEGACY_PUBLIC_APP_HOSTS = new Set(["flowdeskbot.vercel.app"]);
 
 function getTranscriptAccessSecret() {
   const secret =
@@ -16,7 +17,24 @@ function getTranscriptAccessSecret() {
 }
 
 function normalizeBaseOrigin(value) {
-  return String(value || "").trim().replace(/\/+$/, "");
+  const normalizedValue = String(value || "").trim().replace(/\/+$/, "");
+  if (!normalizedValue) {
+    return "";
+  }
+
+  try {
+    const parsed = new URL(normalizedValue);
+    if (LEGACY_PUBLIC_APP_HOSTS.has(parsed.hostname.toLowerCase())) {
+      return DEFAULT_PUBLIC_APP_ORIGIN;
+    }
+    return parsed.origin.replace(/\/+$/, "");
+  } catch {
+    const legacyHostPattern = /^https?:\/\/flowdeskbot\.vercel\.app(?:\/.*)?$/i;
+    if (legacyHostPattern.test(normalizedValue)) {
+      return DEFAULT_PUBLIC_APP_ORIGIN;
+    }
+    return normalizedValue;
+  }
 }
 
 function resolveAppOrigin() {

@@ -202,7 +202,31 @@ function renderReference(message, messagesById) {
   return `<blockquote class="fd-reference"><strong>${author}</strong>${content ? `<div>${content}</div>` : ""}</blockquote>`;
 }
 
-function renderMessage(message, messagesById) {
+function resolveMessageSenderKey(message) {
+  const authorId = String(message?.author?.id || "").trim();
+  if (authorId) {
+    return `author:${authorId}`;
+  }
+
+  const webhookId = String(message?.webhookId || "").trim();
+  if (webhookId) {
+    return `webhook:${webhookId}`;
+  }
+
+  const fallbackName = String(
+    message?.author?.username || message?.member?.displayName || "",
+  )
+    .trim()
+    .toLowerCase();
+  if (fallbackName) {
+    return `name:${fallbackName}`;
+  }
+
+  return "";
+}
+
+function renderMessage(message, messagesById, options = {}) {
+  const { isContinuation = false } = options;
   const authorName = escapeHtml(
     message?.member?.displayName || message?.author?.globalName || message?.author?.username || "Usuario",
   );
@@ -212,6 +236,14 @@ function renderMessage(message, messagesById) {
       : message?.author?.username || "",
   );
   const avatarUrl = escapeHtml(resolveAuthorAvatarUrl(message));
+  const fallbackInitial = escapeHtml(
+    String(
+      message?.member?.displayName || message?.author?.globalName || message?.author?.username || "U",
+    )
+      .trim()
+      .charAt(0)
+      .toUpperCase() || "U",
+  );
   const messageId = escapeHtml(message?.id || "");
   const timestamp = formatDateTime(message?.createdAt || null);
   const editedLabel = message?.editedTimestamp ? " (editado)" : "";
@@ -224,16 +256,25 @@ function renderMessage(message, messagesById) {
   const reactions = renderReactions(message);
   const stickers = renderStickers(message);
   const referenceHtml = renderReference(message, messagesById);
+  const avatarNode = isContinuation
+    ? `<span class="fd-avatar-spacer" aria-hidden="true"></span>`
+    : avatarUrl
+      ? `<img class="fd-avatar" src="${avatarUrl}" alt="${authorName}" loading="lazy" />`
+      : `<span class="fd-avatar fd-avatar-fallback" aria-hidden="true">${fallbackInitial}</span>`;
 
   return `
-    <article class="fd-message" id="message-${messageId}">
-      <img class="fd-avatar" src="${avatarUrl}" alt="${authorName}" loading="lazy" />
+    <article class="fd-message${isContinuation ? " fd-message-continuation" : ""}" id="message-${messageId}">
+      ${avatarNode}
       <div class="fd-bubble">
-        <header class="fd-meta">
+        ${
+          isContinuation
+            ? ""
+            : `<header class="fd-meta">
           <span class="fd-author">${authorName}</span>
           ${authorTag ? `<span class="fd-tag">${authorTag}</span>` : ""}
           <time datetime="${escapeHtml(message?.createdAt?.toISOString?.() || "")}">${escapeHtml(timestamp)}${editedLabel}</time>
-        </header>
+        </header>`
+        }
         ${referenceHtml}
         ${contentHtml ? `<div class="fd-content">${contentHtml}</div>` : ""}
         ${attachments}
@@ -279,82 +320,105 @@ function buildTranscriptHtmlDocument({ guildName, channelName, generatedAt, mess
     * { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; }
     body {
-      background: #0b0d10;
-      color: #d9dce2;
-      font: 500 14px/1.55 "Inter", "Segoe UI", Roboto, Arial, sans-serif;
+      background: #070707;
+      color: #dcddde;
+      font: 500 14px/1.55 "gg sans", "Inter", "Segoe UI", Roboto, Arial, sans-serif;
     }
-    a { color: #8eb8ff; text-decoration: none; }
+    a { color: #c6d3ff; text-decoration: none; }
     a:hover { text-decoration: underline; }
     .fd-shell {
-      max-width: 1080px;
-      margin: 0 auto;
-      padding: 26px 20px 56px;
+      width: 100%;
+      margin: 0;
+      padding: 14px 18px 44px;
     }
     .fd-head {
       position: sticky;
       top: 0;
       z-index: 5;
-      background: linear-gradient(180deg, rgba(11,13,16,0.98), rgba(11,13,16,0.82));
-      backdrop-filter: blur(8px);
-      border: 1px solid #1b1f26;
-      border-radius: 16px;
-      padding: 14px 16px;
-      margin-bottom: 16px;
+      margin: 0 0 8px;
+      padding: 10px 0 12px;
+      background: linear-gradient(180deg, rgba(7,7,7,0.97), rgba(7,7,7,0.84));
+      backdrop-filter: blur(6px);
+      border-bottom: 1px solid #1a1a1a;
     }
-    .fd-head h1 { margin: 0; font-size: 16px; font-weight: 700; color: #eef1f6; }
-    .fd-head p { margin: 6px 0 0; color: #aeb5c2; font-size: 12px; }
+    .fd-head h1 {
+      margin: 0;
+      font-size: 13px;
+      font-weight: 600;
+      color: #f2f3f5;
+      letter-spacing: 0.01em;
+    }
+    .fd-head p { margin: 4px 0 0; color: #9fa1a6; font-size: 12px; }
     .fd-stream {
       display: flex;
       flex-direction: column;
-      gap: 12px;
+      gap: 0;
     }
     .fd-message {
       display: grid;
       grid-template-columns: 40px minmax(0, 1fr);
-      gap: 10px;
+      gap: 12px;
       align-items: flex-start;
-      padding: 10px;
-      border: 1px solid #1a1f27;
-      border-radius: 14px;
-      background: #11151b;
+      padding: 4px 12px 10px;
+      border: none;
+      border-radius: 8px;
+      background: transparent;
+      transition: background 0.14s ease;
     }
+    .fd-message:hover { background: rgba(255,255,255,0.03); }
+    .fd-message-continuation { padding-top: 0; }
     .fd-avatar {
       width: 40px;
       height: 40px;
       border-radius: 999px;
       object-fit: cover;
-      border: 1px solid #232a36;
-      background: #090c10;
+      border: none;
+      background: #111111;
     }
-    .fd-bubble { min-width: 0; }
+    .fd-avatar-fallback {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 13px;
+      font-weight: 700;
+      color: #d5d7dc;
+    }
+    .fd-avatar-spacer {
+      width: 40px;
+      display: block;
+    }
+    .fd-bubble { min-width: 0; padding-top: 1px; }
+    .fd-message-continuation .fd-bubble { padding-top: 0; }
     .fd-meta {
       display: flex;
       align-items: center;
       gap: 8px;
       flex-wrap: wrap;
-      margin-bottom: 6px;
+      margin-bottom: 2px;
     }
-    .fd-author { font-size: 14px; font-weight: 700; color: #f0f3f8; }
-    .fd-tag { font-size: 12px; color: #8f99aa; }
-    .fd-meta time { font-size: 12px; color: #8f99aa; }
-    .fd-content { color: #d8dee8; word-break: break-word; }
+    .fd-author { font-size: 15px; font-weight: 600; color: #ffffff; }
+    .fd-tag { font-size: 12px; color: #9fa1a6; }
+    .fd-meta time { font-size: 12px; color: #949ba4; }
+    .fd-content { color: #dbdde1; word-break: break-word; }
     .fd-reference {
-      margin: 0 0 8px;
+      margin: 4px 0 8px;
       padding: 8px 10px;
-      border-left: 3px solid #2f3948;
-      background: #0f1319;
-      border-radius: 0 10px 10px 0;
-      color: #a8b1bf;
+      border-left: 2px solid #4a4a4a;
+      background: rgba(255,255,255,0.04);
+      border-radius: 0 8px 8px 0;
+      color: #adb0b6;
       font-size: 12px;
     }
-    .fd-reference strong { display: block; color: #d6dce7; margin-bottom: 4px; }
+    .fd-reference strong { display: block; color: #e4e6ea; margin-bottom: 4px; }
     .fd-attachment {
       margin: 8px 0 0;
       padding: 8px;
-      border: 1px solid #1f2530;
-      background: #0d1117;
+      border: 1px solid #1e1e1e;
+      background: #0c0c0c;
       border-radius: 12px;
       overflow: hidden;
+      width: fit-content;
+      max-width: min(100%, 560px);
     }
     .fd-attachment img,
     .fd-attachment video {
@@ -366,32 +430,35 @@ function buildTranscriptHtmlDocument({ guildName, channelName, generatedAt, mess
     .fd-attachment figcaption {
       margin-top: 8px;
       font-size: 12px;
-      color: #a9b2c0;
+      color: #a5a8ad;
     }
     .fd-attachment-meta {
       margin-left: 8px;
-      color: #7f8796;
+      color: #8f9297;
     }
     .fd-file {
       margin-top: 8px;
       padding: 8px 10px;
-      border: 1px solid #222a35;
+      border: 1px solid #242424;
       border-radius: 10px;
-      background: #0e131a;
+      background: #0c0c0c;
       font-size: 13px;
+      width: fit-content;
+      max-width: 100%;
     }
     .fd-file a { font-weight: 700; }
     .fd-embed {
       margin-top: 8px;
-      border: 1px solid #293344;
-      border-left: 4px solid #4f6b9b;
+      border: 1px solid #2a2a2a;
+      border-left: 4px solid #4b4b4b;
       border-radius: 10px;
       padding: 10px 12px;
-      background: #111722;
+      background: #0f0f0f;
+      max-width: min(100%, 620px);
     }
-    .fd-embed-author { color: #aeb9cb; font-size: 12px; margin-bottom: 4px; }
-    .fd-embed-title { font-weight: 700; color: #e3e9f5; margin-bottom: 6px; }
-    .fd-embed-description { color: #c6cedd; font-size: 13px; }
+    .fd-embed-author { color: #adb0b6; font-size: 12px; margin-bottom: 4px; }
+    .fd-embed-title { font-weight: 700; color: #eceef2; margin-bottom: 6px; }
+    .fd-embed-description { color: #cfd1d5; font-size: 13px; }
     .fd-embed-fields {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -400,31 +467,31 @@ function buildTranscriptHtmlDocument({ guildName, channelName, generatedAt, mess
     }
     .fd-embed-field {
       padding: 8px;
-      border: 1px solid #2a3341;
+      border: 1px solid #2b2b2b;
       border-radius: 8px;
-      background: #0f141d;
+      background: #0b0b0b;
       display: flex;
       flex-direction: column;
       gap: 6px;
       min-width: 0;
     }
-    .fd-embed-field strong { font-size: 12px; color: #dce4f1; }
-    .fd-embed-field span { font-size: 12px; color: #aab3c1; word-break: break-word; }
+    .fd-embed-field strong { font-size: 12px; color: #e0e1e4; }
+    .fd-embed-field span { font-size: 12px; color: #b2b4b9; word-break: break-word; }
     .fd-embed-thumb {
       width: 90px;
       height: 90px;
       object-fit: cover;
       border-radius: 8px;
       margin-top: 8px;
-      border: 1px solid #313b4f;
+      border: 1px solid #323232;
     }
     .fd-embed-image {
       max-width: 100%;
       margin-top: 8px;
       border-radius: 8px;
-      border: 1px solid #313b4f;
+      border: 1px solid #323232;
     }
-    .fd-embed-footer { margin-top: 8px; font-size: 11px; color: #8f99ab; }
+    .fd-embed-footer { margin-top: 8px; font-size: 11px; color: #9b9da3; }
     .fd-reactions {
       display: flex;
       flex-wrap: wrap;
@@ -435,12 +502,12 @@ function buildTranscriptHtmlDocument({ guildName, channelName, generatedAt, mess
       display: inline-flex;
       align-items: center;
       gap: 6px;
-      border: 1px solid #2a3444;
-      background: #111723;
+      border: 1px solid #2a2a2a;
+      background: #121212;
       border-radius: 999px;
       padding: 4px 8px;
       font-size: 12px;
-      color: #c7d0de;
+      color: #d3d4d6;
     }
     .fd-reaction img {
       width: 16px;
@@ -457,11 +524,11 @@ function buildTranscriptHtmlDocument({ guildName, channelName, generatedAt, mess
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      border: 1px solid #253143;
+      border: 1px solid #252525;
       border-radius: 10px;
       padding: 6px 8px;
-      background: #0f151f;
-      color: #cdd5e4;
+      background: #101010;
+      color: #d0d2d6;
       font-size: 12px;
     }
     .fd-sticker img {
@@ -469,15 +536,26 @@ function buildTranscriptHtmlDocument({ guildName, channelName, generatedAt, mess
       height: 42px;
       object-fit: contain;
       border-radius: 8px;
-      background: #0b0f15;
+      background: #080808;
     }
     .fd-empty {
-      border: 1px dashed #283241;
+      border: 1px dashed #2d2d2d;
       border-radius: 14px;
       padding: 16px;
       text-align: center;
-      color: #9da7b7;
-      background: #10161f;
+      color: #9a9a9a;
+      background: #0e0e0e;
+    }
+    @media (max-width: 640px) {
+      .fd-shell { padding: 12px 10px 28px; }
+      .fd-head h1 { font-size: 12px; }
+      .fd-message {
+        grid-template-columns: 36px minmax(0, 1fr);
+        gap: 10px;
+        padding: 4px 6px 10px;
+      }
+      .fd-avatar { width: 36px; height: 36px; }
+      .fd-avatar-spacer { width: 36px; }
     }
   </style>
 </head>
@@ -504,7 +582,13 @@ async function generateTranscriptHtml(channel) {
   const channelName = channel?.name || "ticket";
   const messages = await fetchAllMessages(channel);
   const messagesById = new Map(messages.map((message) => [message.id, message]));
-  const renderedMessages = messages.map((message) => renderMessage(message, messagesById));
+  let previousSenderKey = "";
+  const renderedMessages = messages.map((message) => {
+    const senderKey = resolveMessageSenderKey(message);
+    const isContinuation = Boolean(senderKey) && senderKey === previousSenderKey;
+    previousSenderKey = senderKey;
+    return renderMessage(message, messagesById, { isContinuation });
+  });
 
   return buildTranscriptHtmlDocument({
     guildName,
