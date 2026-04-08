@@ -2,6 +2,7 @@ const {
   handleAiMention,
   observePotentialCommunityQuestion,
 } = require("../services/aiMentionService");
+const { handleAntiLinkMessage } = require("../services/antiLinkService");
 const { handleAdminAssistantMessage } = require("../services/adminAssistantService");
 const { handleTicketAiMessage } = require("../services/ticketAiService");
 
@@ -9,6 +10,11 @@ module.exports = {
   name: "messageCreate",
   async execute(message, client) {
     try {
+      const antiLinkHandled = await handleAntiLinkMessage(message);
+      if (antiLinkHandled) {
+        return;
+      }
+
       const adminHandled = await handleAdminAssistantMessage(message, client);
       if (adminHandled) {
         return;

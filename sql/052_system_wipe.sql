@@ -16,6 +16,7 @@ truncate table
   public.auth_user_plan_guilds,
   public.auth_user_plan_state,
   public.guild_plan_settings,
+  public.guild_antilink_settings,
   public.guild_welcome_settings,
   public.guild_ticket_staff_settings,
   public.guild_ticket_settings,

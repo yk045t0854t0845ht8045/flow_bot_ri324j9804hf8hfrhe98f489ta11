@@ -7,6 +7,7 @@ const EVENTS_TABLE = "ticket_events";
 const TICKET_SETTINGS_TABLE = "guild_ticket_settings";
 const TICKET_STAFF_SETTINGS_TABLE = "guild_ticket_staff_settings";
 const WELCOME_SETTINGS_TABLE = "guild_welcome_settings";
+const ANTILINK_SETTINGS_TABLE = "guild_antilink_settings";
 const PAYMENT_ORDERS_TABLE = "payment_orders";
 const TICKET_TRANSCRIPTS_TABLE = "ticket_transcripts";
 const TICKET_DM_QUEUE_TABLE = "ticket_dm_queue";
@@ -568,6 +569,18 @@ async function getGuildWelcomeSettings(guildId) {
   return unwrap(result, "getGuildWelcomeSettings");
 }
 
+async function getGuildAntiLinkSettings(guildId) {
+  const result = await supabase
+    .from(ANTILINK_SETTINGS_TABLE)
+    .select(
+      "guild_id, enabled, log_channel_id, enforcement_action, timeout_minutes, ignored_role_ids, block_external_links, block_discord_invites, block_obfuscated_links, updated_at",
+    )
+    .eq("guild_id", guildId)
+    .maybeSingle();
+
+  return unwrap(result, "getGuildAntiLinkSettings");
+}
+
 async function getApprovedPaymentOrdersForGuild(guildId) {
   const result = await supabase
     .from(PAYMENT_ORDERS_TABLE)
@@ -733,6 +746,24 @@ async function getGuildWelcomeRuntime(guildId) {
   };
 }
 
+async function getGuildAntiLinkRuntime(guildId) {
+  const [settings, approvedOrders] = await Promise.all([
+    getGuildAntiLinkSettings(guildId),
+    getApprovedPaymentOrdersForGuild(guildId),
+  ]);
+
+  const license = resolveLatestLicenseStatusFromApprovedOrders(approvedOrders);
+
+  return {
+    guildId,
+    settings: settings || null,
+    licenseStatus: license.status,
+    licenseUsable: license.usable,
+    latestCoverage: license.latestCoverage,
+    isConfigured: Boolean(settings),
+  };
+}
+
 async function getConfiguredTicketGuildRuntimes() {
   const [settingsResult, staffResult] = await Promise.all([
     supabase
@@ -792,6 +823,8 @@ module.exports = {
   createTicket,
   getDueTicketDirectMessages,
   getConfiguredTicketGuildRuntimes,
+  getGuildAntiLinkRuntime,
+  getGuildAntiLinkSettings,
   createTicketAiMessage,
   getGuildTicketRuntime,
   getTicketAiSession,
