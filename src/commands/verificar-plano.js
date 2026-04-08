@@ -2,9 +2,12 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  EmbedBuilder,
+  ContainerBuilder,
   MessageFlags,
+  SeparatorBuilder,
+  SeparatorSpacingSize,
   SlashCommandBuilder,
+  TextDisplayBuilder,
 } = require("discord.js");
 const { env } = require("../config/env");
 const { getUserPlanSnapshotByDiscordUserId } = require("../services/supabaseService");
@@ -38,16 +41,23 @@ function formatMoney(amount, currency = "BRL") {
   }).format(Math.round(amount * 100) / 100);
 }
 
+function buildPlainContainer(contentLines) {
+  const sections = contentLines.filter(Boolean).join("\n");
+  return new ContainerBuilder()
+    .addTextDisplayComponents(new TextDisplayBuilder().setContent(sections));
+}
+
 function buildNoPlanResponse() {
   const baseAppUrl = normalizeBaseAppUrl();
-  const embed = new EmbedBuilder()
-    .setColor(0x3a3a3a)
-    .setTitle("Nenhum plano encontrado")
-    .setDescription(
-      "Nao encontramos compras vinculadas a sua conta Discord. Escolha um plano para liberar os recursos no Flowdesk.",
-    );
 
   const components = [
+    buildPlainContainer([
+      "## Nenhum plano encontrado",
+      "-# Nao encontramos compras vinculadas a sua conta Discord. Escolha um plano para liberar os recursos no Flowdesk.",
+    ]),
+    new SeparatorBuilder()
+      .setSpacing(SeparatorSpacingSize.Small)
+      .setDivider(true),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setStyle(ButtonStyle.Link)
@@ -56,7 +66,7 @@ function buildNoPlanResponse() {
     ),
   ];
 
-  return { embeds: [embed], components };
+  return { components };
 }
 
 function buildPlanResponse(snapshot) {
@@ -67,41 +77,28 @@ function buildPlanResponse(snapshot) {
       ? "Licenca valida"
       : "Licenca expirada (historico de compra encontrado)";
 
-  const embed = new EmbedBuilder()
-    .setColor(0x2d7ff9)
-    .setTitle("Plano da sua conta")
-    .setDescription(
-      "Dados sincronizados com sua conta no Flowdesk. Para gerenciar servidores e assinatura, abra o dashboard.",
-    )
-    .addFields(
-      {
-        name: "Plano",
-        value: snapshot.planName || "Nao informado",
-        inline: true,
-      },
-      {
-        name: "Status",
-        value: statusLabel,
-        inline: true,
-      },
-      {
-        name: "Vence em",
-        value: toDiscordTimestamp(snapshot.expiresAt),
-        inline: false,
-      },
-      {
-        name: "Ultima compra",
-        value: toDiscordTimestamp(snapshot.purchasedAt),
-        inline: false,
-      },
-      {
-        name: "Ultimo valor pago",
-        value: formatMoney(snapshot.amount, snapshot.currency),
-        inline: true,
-      },
-    );
-
   const components = [
+    buildPlainContainer([
+      "## Plano da sua conta",
+      "-# Dados sincronizados com sua conta no Flowdesk. Para gerenciar servidores e assinatura, abra o dashboard.",
+    ]),
+    new SeparatorBuilder()
+      .setSpacing(SeparatorSpacingSize.Small)
+      .setDivider(true),
+    buildPlainContainer([
+      `**Plano**\n${snapshot.planName || "Nao informado"}`,
+      "",
+      `**Status**\n${statusLabel}`,
+      "",
+      `**Vence em**\n${toDiscordTimestamp(snapshot.expiresAt)}`,
+      "",
+      `**Ultima compra**\n${toDiscordTimestamp(snapshot.purchasedAt)}`,
+      "",
+      `**Ultimo valor pago**\n${formatMoney(snapshot.amount, snapshot.currency)}`,
+    ]),
+    new SeparatorBuilder()
+      .setSpacing(SeparatorSpacingSize.Small)
+      .setDivider(true),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setStyle(ButtonStyle.Link)
@@ -110,7 +107,7 @@ function buildPlanResponse(snapshot) {
     ),
   ];
 
-  return { embeds: [embed], components };
+  return { components };
 }
 
 module.exports = {
@@ -120,7 +117,7 @@ module.exports = {
 
   async execute(interaction) {
     await interaction.deferReply({
-      flags: MessageFlags.Ephemeral,
+      flags: MessageFlags.Ephemeral | MessageFlags.IsComponentsV2,
     });
 
     try {
@@ -134,13 +131,11 @@ module.exports = {
     } catch (error) {
       console.error("[verificar-plano] Falha ao consultar plano da conta:", error);
       await interaction.editReply({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0xbf3131)
-            .setTitle("Nao foi possivel consultar seu plano")
-            .setDescription(
-              "Ocorreu um erro ao sincronizar os dados da sua conta. Tente novamente em alguns segundos.",
-            ),
+        components: [
+          buildPlainContainer([
+            "## Nao foi possivel consultar seu plano",
+            "-# Ocorreu um erro ao sincronizar os dados da sua conta. Tente novamente em alguns segundos.",
+          ]),
         ],
       });
     }
