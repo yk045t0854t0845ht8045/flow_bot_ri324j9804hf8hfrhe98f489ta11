@@ -175,13 +175,12 @@ function detectViolation(content, settings) {
   const deobfuscated = normalizeDeobfuscated(content);
 
   if (
-    settings.block_discord_invites !== false &&
-    (DISCORD_INVITE_REGEX.test(normalized) ||
-      /discord\s*[\.\u2024\u3002\uFF0E]?\s*gg\b/.test(normalized) ||
-      compact.includes("discordgg") ||
-      compact.includes("discordcominvite") ||
-      deobfuscated.includes("discord.gg/") ||
-      deobfuscated.includes("discord.com/invite/"))
+    DISCORD_INVITE_REGEX.test(normalized) ||
+    /discord\s*[\.\u2024\u3002\uFF0E]?\s*gg\b/.test(normalized) ||
+    compact.includes("discordgg") ||
+    compact.includes("discordcominvite") ||
+    deobfuscated.includes("discord.gg/") ||
+    deobfuscated.includes("discord.com/invite/")
   ) {
     return {
       rule: "discord_invite",
@@ -189,10 +188,7 @@ function detectViolation(content, settings) {
     };
   }
 
-  if (
-    settings.block_external_links !== false &&
-    MARKDOWN_HIDDEN_LINK_REGEX.test(normalized)
-  ) {
+  if (MARKDOWN_HIDDEN_LINK_REGEX.test(normalized)) {
     return {
       rule: "markdown_hidden_link",
       reason: "link escondido em texto markdown",
@@ -200,9 +196,8 @@ function detectViolation(content, settings) {
   }
 
   if (
-    settings.block_external_links !== false &&
-    (HTTP_LINK_REGEX.test(normalized) ||
-      hasLikelyDomainWithKnownTld(normalized))
+    HTTP_LINK_REGEX.test(normalized) ||
+    hasLikelyDomainWithKnownTld(normalized)
   ) {
     return {
       rule: "external_link",
@@ -211,13 +206,12 @@ function detectViolation(content, settings) {
   }
 
   if (
-    settings.block_obfuscated_links !== false &&
-    (OBFUSCATED_HTTP_REGEX.test(normalized) ||
-      deobfuscated.includes("http://") ||
-      deobfuscated.includes("https://") ||
-      (deobfuscated.includes("www.") &&
-        hasLikelyDomainWithKnownTld(deobfuscated)) ||
-      hasLikelyDomainWithKnownTld(deobfuscated))
+    OBFUSCATED_HTTP_REGEX.test(normalized) ||
+    deobfuscated.includes("http://") ||
+    deobfuscated.includes("https://") ||
+    (deobfuscated.includes("www.") &&
+      hasLikelyDomainWithKnownTld(deobfuscated)) ||
+    hasLikelyDomainWithKnownTld(deobfuscated)
   ) {
     return {
       rule: "obfuscated_link",

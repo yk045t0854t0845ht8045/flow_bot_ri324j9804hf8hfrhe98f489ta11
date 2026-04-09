@@ -16,7 +16,7 @@ for (const envPath of [...new Set(envCandidates)]) {
   }
 }
 
-const DEFAULT_PUBLIC_APP_URL = "https://flwdesk.com";
+const DEFAULT_PUBLIC_APP_URL = "https://www.flwdesk.com";
 
 const REQUIRED_KEYS = [
   "DISCORD_CLIENT_ID",

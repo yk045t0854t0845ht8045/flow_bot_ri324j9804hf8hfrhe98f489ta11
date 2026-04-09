@@ -8,6 +8,7 @@ const TICKET_SETTINGS_TABLE = "guild_ticket_settings";
 const TICKET_STAFF_SETTINGS_TABLE = "guild_ticket_staff_settings";
 const WELCOME_SETTINGS_TABLE = "guild_welcome_settings";
 const ANTILINK_SETTINGS_TABLE = "guild_antilink_settings";
+const SECURITY_LOGS_SETTINGS_TABLE = "guild_security_logs_settings";
 const PAYMENT_ORDERS_TABLE = "payment_orders";
 const TICKET_TRANSCRIPTS_TABLE = "ticket_transcripts";
 const TICKET_DM_QUEUE_TABLE = "ticket_dm_queue";
@@ -581,6 +582,18 @@ async function getGuildAntiLinkSettings(guildId) {
   return unwrap(result, "getGuildAntiLinkSettings");
 }
 
+async function getGuildSecurityLogsSettings(guildId) {
+  const result = await supabase
+    .from(SECURITY_LOGS_SETTINGS_TABLE)
+    .select(
+      "guild_id, nickname_change_enabled, nickname_change_channel_id, avatar_change_enabled, avatar_change_channel_id, voice_join_enabled, voice_join_channel_id, voice_leave_enabled, voice_leave_channel_id, message_delete_enabled, message_delete_channel_id, message_edit_enabled, message_edit_channel_id, member_ban_enabled, member_ban_channel_id, member_unban_enabled, member_unban_channel_id, member_kick_enabled, member_kick_channel_id, member_timeout_enabled, member_timeout_channel_id, voice_move_enabled, voice_move_channel_id, updated_at",
+    )
+    .eq("guild_id", guildId)
+    .maybeSingle();
+
+  return unwrap(result, "getGuildSecurityLogsSettings");
+}
+
 async function getApprovedPaymentOrdersForGuild(guildId) {
   const result = await supabase
     .from(PAYMENT_ORDERS_TABLE)
@@ -764,6 +777,24 @@ async function getGuildAntiLinkRuntime(guildId) {
   };
 }
 
+async function getGuildSecurityLogsRuntime(guildId) {
+  const [settings, approvedOrders] = await Promise.all([
+    getGuildSecurityLogsSettings(guildId),
+    getApprovedPaymentOrdersForGuild(guildId),
+  ]);
+
+  const license = resolveLatestLicenseStatusFromApprovedOrders(approvedOrders);
+
+  return {
+    guildId,
+    settings: settings || null,
+    licenseStatus: license.status,
+    licenseUsable: license.usable,
+    latestCoverage: license.latestCoverage,
+    isConfigured: Boolean(settings),
+  };
+}
+
 async function getConfiguredTicketGuildRuntimes() {
   const [settingsResult, staffResult] = await Promise.all([
     supabase
@@ -825,6 +856,8 @@ module.exports = {
   getConfiguredTicketGuildRuntimes,
   getGuildAntiLinkRuntime,
   getGuildAntiLinkSettings,
+  getGuildSecurityLogsRuntime,
+  getGuildSecurityLogsSettings,
   createTicketAiMessage,
   getGuildTicketRuntime,
   getTicketAiSession,

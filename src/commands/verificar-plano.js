@@ -20,7 +20,7 @@ function normalizeBaseAppUrl() {
   const candidate =
     typeof env.appUrl === "string" && env.appUrl.trim()
       ? env.appUrl.trim()
-      : "https://flwdesk.com";
+      : "https://www.flwdesk.com";
   return candidate.replace(/\/+$/, "");
 }
 
