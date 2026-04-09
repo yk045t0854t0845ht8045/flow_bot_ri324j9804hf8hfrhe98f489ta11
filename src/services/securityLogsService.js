@@ -1,7 +1,14 @@
 const {
   AttachmentBuilder,
   AuditLogEvent,
+  ContainerBuilder,
   EmbedBuilder,
+  MediaGalleryBuilder,
+  MediaGalleryItemBuilder,
+  MessageFlags,
+  SeparatorBuilder,
+  SeparatorSpacingSize,
+  TextDisplayBuilder,
 } = require("discord.js");
 const { getGuildSecurityLogsRuntime } = require("./supabaseService");
 
@@ -98,10 +105,57 @@ function toCodeBlock(value, maxLength = 800) {
 }
 
 function toFieldValue(value, maxLength = 1024) {
-  const normalized = String(value || "").replace(/`/g, "'").trim();
+  const normalized = String(value || "").trim();
   if (!normalized) return "-";
   if (normalized.length <= maxLength) return normalized;
   return `${normalized.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function normalizeSecurityLogFields(fields = []) {
+  return fields
+    .filter((field) => field && typeof field.name === "string")
+    .slice(0, 24)
+    .map((field) => ({
+      name: toSnippet(field.name, 256),
+      value: toFieldValue(field.value, 1024),
+      inline: Boolean(field.inline),
+    }));
+}
+
+function chunkTextBlocks(blocks, maxLength = 3500, maxChunks = 6) {
+  const normalizedBlocks = blocks
+    .map((block) => String(block || "").trim())
+    .filter(Boolean);
+
+  if (!normalizedBlocks.length) return [];
+
+  const chunks = [];
+  let currentChunk = "";
+
+  for (const block of normalizedBlocks) {
+    if (!currentChunk) {
+      currentChunk = block;
+      continue;
+    }
+
+    if (currentChunk.length + 2 + block.length <= maxLength) {
+      currentChunk += `\n\n${block}`;
+      continue;
+    }
+
+    chunks.push(currentChunk);
+    if (chunks.length >= maxChunks) {
+      return chunks;
+    }
+
+    currentChunk = block;
+  }
+
+  if (currentChunk && chunks.length < maxChunks) {
+    chunks.push(currentChunk);
+  }
+
+  return chunks;
 }
 
 function formatDateTime(timestampMs) {
@@ -208,26 +262,80 @@ async function sendSecurityLog({
   const channel = await resolveTextChannel(guild, config.channelId);
   if (!channel) return false;
 
+  const safeFields = normalizeSecurityLogFields(fields);
+  const timestampUnix = Math.floor(Date.now() / 1000);
+  const headerTitle = toSnippet(title || config.label, 180);
+  const headerLines = [`## ${headerTitle}`];
+  const metaLines = [];
+  const normalizedDescription = String(description || "").trim();
+
+  if (normalizedDescription) {
+    metaLines.push(`-# ${normalizedDescription}`);
+  }
+  metaLines.push(`-# Registrado em <t:${timestampUnix}:F>`);
+
+  headerLines.push(metaLines.join("\n"));
+
+  const fieldChunks = chunkTextBlocks(
+    safeFields.map((field) => `### ${field.name}\n${field.value}`),
+  );
+
+  const container = new ContainerBuilder()
+    .setAccentColor(color)
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(headerLines.join("\n\n")),
+    );
+
+  if (fieldChunks.length) {
+    container.addSeparatorComponents(
+      new SeparatorBuilder()
+        .setSpacing(SeparatorSpacingSize.Small)
+        .setDivider(true),
+    );
+
+    for (const chunk of fieldChunks) {
+      container.addTextDisplayComponents(
+        new TextDisplayBuilder().setContent(chunk),
+      );
+    }
+  }
+
+  const payload = {
+    flags: MessageFlags.IsComponentsV2,
+    allowedMentions: { parse: [] },
+    components: [container],
+  };
+
+  if (imageBuffer) {
+    container
+      .addSeparatorComponents(
+        new SeparatorBuilder()
+          .setSpacing(SeparatorSpacingSize.Small)
+          .setDivider(true),
+      )
+      .addMediaGalleryComponents(
+        new MediaGalleryBuilder().addItems(
+          new MediaGalleryItemBuilder().setURL(`attachment://${imageName}`),
+        ),
+      );
+
+    payload.files = [new AttachmentBuilder(imageBuffer, { name: imageName })];
+  }
+
+  const sent = await channel.send(payload).catch(() => null);
+  if (sent) return true;
+
   const embed = new EmbedBuilder()
     .setColor(color)
     .setTitle(title || config.label)
     .setDescription(description || "")
     .setTimestamp(new Date());
 
-  const safeFields = (fields || [])
-    .filter((field) => field && typeof field.name === "string")
-    .slice(0, 24)
-    .map((field) => ({
-      name: toSnippet(field.name, 256),
-      value: toFieldValue(field.value, 1024),
-      inline: Boolean(field.inline),
-    }));
-
   if (safeFields.length) {
     embed.addFields(safeFields);
   }
 
-  const payload = {
+  const fallbackPayload = {
     embeds: [embed],
     allowedMentions: { parse: [] },
   };
@@ -235,10 +343,10 @@ async function sendSecurityLog({
   if (imageBuffer) {
     const attachment = new AttachmentBuilder(imageBuffer, { name: imageName });
     embed.setImage(`attachment://${imageName}`);
-    payload.files = [attachment];
+    fallbackPayload.files = [attachment];
   }
 
-  await channel.send(payload).catch((error) => {
+  const fallbackSent = await channel.send(fallbackPayload).catch((error) => {
     const detail = error instanceof Error ? error.message : "falha ao enviar log";
     console.warn(
       `[security-logs] falha ao enviar log ${eventKey} em guild ${guild.id} canal ${config.channelId}: ${detail}`,
@@ -246,7 +354,7 @@ async function sendSecurityLog({
     return null;
   });
 
-  return true;
+  return Boolean(fallbackSent);
 }
 
 async function buildAvatarComparisonImage(oldAvatarUrl, newAvatarUrl) {

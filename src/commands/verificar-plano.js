@@ -3,7 +3,6 @@ const {
   ButtonBuilder,
   ButtonStyle,
   ContainerBuilder,
-  EmbedBuilder,
   MessageFlags,
   SectionBuilder,
   SeparatorBuilder,
@@ -121,45 +120,33 @@ function buildPlanPayloads(snapshot) {
       ? "Licenca valida"
       : "Licenca expirada (historico de compra encontrado)";
 
-  const embed = new EmbedBuilder()
-    .setTitle("Plano da sua conta")
-    .setDescription(
-      "Dados sincronizados com sua conta no Flowdesk. Para gerenciar servidores e assinatura, abra o dashboard.",
-    )
-    .addFields(
-      {
-        name: "Plano",
-        value: snapshot.planName || "Nao informado",
-        inline: true,
-      },
-      {
-        name: "Status",
-        value: statusLabel,
-        inline: true,
-      },
-      {
-        name: "Ultimo valor pago",
-        value: formatMoney(snapshot.amount, snapshot.currency),
-        inline: true,
-      },
-      {
-        name: "Vence em",
-        value: toDiscordTimestamp(snapshot.expiresAt),
-        inline: false,
-      },
-      {
-        name: "Ultima compra",
-        value: toDiscordTimestamp(snapshot.purchasedAt),
-        inline: false,
-      },
-    );
-
   return {
-    preferLegacy: true,
-    v2: null,
+    v2: buildComponentsV2Card({
+      title: "Plano da sua conta",
+      description:
+        "Dados sincronizados com sua conta no Flowdesk. Para gerenciar servidores e assinatura, abra o dashboard.",
+      detailsMarkdown: [
+        "### Resumo da assinatura",
+        `-# Plano: ${snapshot.planName || "Nao informado"}`,
+        `-# Status: ${statusLabel}`,
+        `-# Ultimo valor pago: ${formatMoney(snapshot.amount, snapshot.currency)}`,
+        `-# Vence em: ${toDiscordTimestamp(snapshot.expiresAt)}`,
+        `-# Ultima compra: ${toDiscordTimestamp(snapshot.purchasedAt)}`,
+      ].join("\n"),
+      buttonLabel: "Abrir dashboard",
+      buttonUrl: dashboardUrl,
+      buttonHint:
+        "-# Abra o painel para gerenciar servidores, assinatura e pagamentos vinculados a sua conta.",
+    }),
     fallback: {
-      embeds: [embed],
-      components: [buildLinkButtonRow("Verificar meu plano", dashboardUrl)],
+      content:
+        "Plano encontrado para sua conta.\n" +
+        `Plano: ${snapshot.planName || "Nao informado"}\n` +
+        `Status: ${statusLabel}\n` +
+        `Ultimo valor pago: ${formatMoney(snapshot.amount, snapshot.currency)}\n` +
+        `Vence em: ${toDiscordTimestamp(snapshot.expiresAt)}\n` +
+        `Ultima compra: ${toDiscordTimestamp(snapshot.purchasedAt)}`,
+      components: [buildLinkButtonRow("Abrir dashboard", dashboardUrl)],
     },
   };
 }
@@ -185,11 +172,6 @@ function buildErrorPayloads() {
 }
 
 async function sendPayloadsWithV2Fallback(interaction, payloads) {
-  if (payloads.preferLegacy) {
-    await interaction.editReply(payloads.fallback).catch(() => null);
-    return;
-  }
-
   const v2Payload = {
     ...payloads.v2,
     flags: MessageFlags.Ephemeral | MessageFlags.IsComponentsV2,
