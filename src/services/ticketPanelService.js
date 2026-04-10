@@ -14,9 +14,6 @@ const ticketPanelSyncState = new Map();
 
 function buildTicketPanelSyncFingerprint(runtime) {
   return JSON.stringify({
-    licenseUsable: Boolean(runtime?.licenseUsable),
-    licenseStatus: runtime?.licenseStatus || "unknown",
-    enabled: Boolean(runtime?.settings?.enabled),
     menuChannelId: runtime?.settings?.menu_channel_id || "",
     panelTitle: runtime?.settings?.panel_title || "",
     panelDescription: runtime?.settings?.panel_description || "",
@@ -145,18 +142,9 @@ async function syncTicketPanelForRuntime(client, runtime) {
     return { status: "skipped", reason: "channel_unavailable" };
   }
 
-  const payload =
-    runtime.settings.enabled === true && runtime.licenseUsable
-      ? buildTicketPanelPayload({
-          settings: runtime.settings,
-        })
-      : buildTicketSystemDisabledPayload({
-          reason:
-            runtime.settings.enabled !== true
-              ? "module_disabled"
-              : "license_unavailable",
-          accentColor: env.accentColor,
-        });
+  const payload = buildTicketPanelPayload({
+    settings: runtime.settings,
+  });
 
   const existingMessage = await fetchExistingTicketPanelMessage(
     channel,
