@@ -14,6 +14,11 @@ const { getGuildSecurityLogsRuntime } = require("./supabaseService");
 
 const RUNTIME_CACHE_TTL_MS = 10_000;
 const runtimeCache = new Map();
+const recentEventCache = new Map();
+
+const DEFAULT_AUDIT_RETRY_DELAYS_MS = [0, 1_200, 1_400, 1_600];
+const KICK_AUDIT_RETRY_DELAYS_MS = [0, 1_500, 1_800, 2_200, 2_600];
+const RECENT_EVENT_TTL_MS = 20_000;
 
 let canvasModuleResolved = false;
 let canvasModule = null;
@@ -218,37 +223,116 @@ async function resolveRuntime(guildId) {
   return runtime;
 }
 
-async function resolveAuditExecutor(guild, input) {
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function registerRecentEvent(cacheKey, ttlMs = RECENT_EVENT_TTL_MS) {
+  const key = trimText(cacheKey);
+  if (!key) return false;
+
+  const now = Date.now();
+  const expiresAt = recentEventCache.get(key) || 0;
+  if (expiresAt > now) {
+    return true;
+  }
+
+  recentEventCache.set(key, now + ttlMs);
+  for (const [entryKey, entryExpiresAt] of recentEventCache.entries()) {
+    if (entryExpiresAt <= now) {
+      recentEventCache.delete(entryKey);
+    }
+  }
+
+  return false;
+}
+
+function resolveAuditEntryTargetId(entry) {
+  if (entry?.target?.id) return entry.target.id;
+  if (entry?.extra?.id) return entry.extra.id;
+  return null;
+}
+
+async function resolveAuditEntry(guild, input) {
   const {
     type,
     targetId = null,
-    maxAgeMs = 16_000,
+    maxAgeMs = 30_000,
     predicate = null,
+    retryDelaysMs = DEFAULT_AUDIT_RETRY_DELAYS_MS,
+    limit = 12,
   } = input;
 
   if (!guild) return null;
 
-  const logs = await guild.fetchAuditLogs({ type, limit: 8 }).catch(() => null);
-  if (!logs) return null;
+  for (const retryDelayMs of retryDelaysMs) {
+    if (retryDelayMs > 0) {
+      await sleep(retryDelayMs);
+    }
 
-  const now = Date.now();
-  for (const entry of logs.entries.values()) {
-    if (!entry?.executor?.id) continue;
-    if (typeof entry.createdTimestamp !== "number") continue;
-    if (now - entry.createdTimestamp > maxAgeMs) continue;
-
-    if (targetId && entry.target?.id && entry.target.id !== targetId) {
+    const logs = await guild.fetchAuditLogs({ type, limit }).catch(() => null);
+    if (!logs) {
       continue;
     }
 
-    if (typeof predicate === "function" && !predicate(entry)) {
-      continue;
-    }
+    const now = Date.now();
+    for (const entry of logs.entries.values()) {
+      if (!entry?.executor?.id) continue;
+      if (typeof entry.createdTimestamp !== "number") continue;
+      if (now - entry.createdTimestamp > maxAgeMs) continue;
 
-    return entry.executor;
+      const entryTargetId = resolveAuditEntryTargetId(entry);
+      if (targetId && entryTargetId !== targetId) {
+        continue;
+      }
+
+      if (typeof predicate === "function" && !predicate(entry)) {
+        continue;
+      }
+
+      return entry;
+    }
   }
 
   return null;
+}
+
+function resolveStaticUserAvatarUrl(user) {
+  if (!user || typeof user.displayAvatarURL !== "function") return null;
+  return user.displayAvatarURL({
+    extension: "png",
+    forceStatic: true,
+    size: 512,
+  });
+}
+
+function resolveStaticMemberAvatarUrl(member) {
+  if (!member || typeof member.displayAvatarURL !== "function") return null;
+  return member.displayAvatarURL({
+    extension: "png",
+    forceStatic: true,
+    size: 512,
+  });
+}
+
+function formatDurationMs(durationMs) {
+  if (!Number.isFinite(durationMs) || durationMs <= 0) {
+    return "Menos de 1 minuto";
+  }
+
+  const totalMinutes = Math.max(1, Math.round(durationMs / 60_000));
+  const days = Math.floor(totalMinutes / 1_440);
+  const hours = Math.floor((totalMinutes % 1_440) / 60);
+  const minutes = totalMinutes % 60;
+  const parts = [];
+
+  if (days > 0) parts.push(`${days}d`);
+  if (hours > 0) parts.push(`${hours}h`);
+  if (minutes > 0) parts.push(`${minutes}min`);
+
+  return parts.join(" ") || "Menos de 1 minuto";
 }
 
 async function sendSecurityLog({
@@ -363,6 +447,34 @@ async function sendSecurityLog({
   return Boolean(fallbackSent);
 }
 
+function drawRoundedRect(context, x, y, width, height, radius) {
+  const safeRadius = Math.max(
+    0,
+    Math.min(radius, width / 2, height / 2),
+  );
+
+  context.beginPath();
+  context.moveTo(x + safeRadius, y);
+  context.lineTo(x + width - safeRadius, y);
+  context.quadraticCurveTo(x + width, y, x + width, y + safeRadius);
+  context.lineTo(x + width, y + height - safeRadius);
+  context.quadraticCurveTo(x + width, y + height, x + width - safeRadius, y + height);
+  context.lineTo(x + safeRadius, y + height);
+  context.quadraticCurveTo(x, y + height, x, y + height - safeRadius);
+  context.lineTo(x, y + safeRadius);
+  context.quadraticCurveTo(x, y, x + safeRadius, y);
+  context.closePath();
+}
+
+function drawCoverImage(context, image, x, y, width, height) {
+  const scale = Math.max(width / image.width, height / image.height);
+  const drawWidth = image.width * scale;
+  const drawHeight = image.height * scale;
+  const offsetX = x + (width - drawWidth) / 2;
+  const offsetY = y + (height - drawHeight) / 2;
+  context.drawImage(image, offsetX, offsetY, drawWidth, drawHeight);
+}
+
 async function buildAvatarComparisonImage(oldAvatarUrl, newAvatarUrl) {
   const oldUrl = trimText(oldAvatarUrl);
   const newUrl = trimText(newAvatarUrl);
@@ -374,8 +486,8 @@ async function buildAvatarComparisonImage(oldAvatarUrl, newAvatarUrl) {
   }
 
   const { createCanvas, loadImage } = canvasApi;
-  const width = 1200;
-  const height = 600;
+  const width = 1400;
+  const height = 760;
   const canvas = createCanvas(width, height);
   const context = canvas.getContext("2d");
 
@@ -386,34 +498,86 @@ async function buildAvatarComparisonImage(oldAvatarUrl, newAvatarUrl) {
 
   if (!oldImage || !newImage) return null;
 
-  context.fillStyle = "#0b0b0b";
+  context.fillStyle = "#06080d";
   context.fillRect(0, 0, width, height);
 
-  context.save();
-  context.beginPath();
-  context.rect(0, 0, width / 2, height);
-  context.clip();
-  context.drawImage(oldImage, 0, 0, width / 2, height);
-  context.restore();
+  context.fillStyle = "#0d1320";
+  context.fillRect(0, 0, width / 2, height);
+  context.fillStyle = "#111a2b";
+  context.fillRect(width / 2, 0, width / 2, height);
 
-  context.save();
-  context.beginPath();
-  context.rect(width / 2, 0, width / 2, height);
-  context.clip();
-  context.drawImage(newImage, width / 2, 0, width / 2, height);
-  context.restore();
+  context.fillStyle = "rgba(255,255,255,0.08)";
+  context.fillRect(width / 2 - 2, 0, 4, height);
 
-  context.fillStyle = "rgba(0,0,0,0.35)";
-  context.fillRect(0, height - 64, width / 2, 64);
-  context.fillRect(width / 2, height - 64, width / 2, 64);
+  const panelPadding = 58;
+  const avatarSize = 470;
+  const avatarY = 170;
+  const leftAvatarX = width / 4 - avatarSize / 2;
+  const rightAvatarX = (width * 3) / 4 - avatarSize / 2;
 
-  context.fillStyle = "#f1f1f1";
-  context.font = "bold 28px Sans";
-  context.fillText("Avatar antigo", 26, height - 24);
-  context.fillText("Avatar novo", width / 2 + 26, height - 24);
+  const panelShadow = "rgba(0, 0, 0, 0.32)";
+  for (const avatarX of [leftAvatarX, rightAvatarX]) {
+    context.fillStyle = panelShadow;
+    drawRoundedRect(context, avatarX + 10, avatarY + 14, avatarSize, avatarSize, 42);
+    context.fill();
+  }
 
-  context.fillStyle = "rgba(255,255,255,0.88)";
-  context.fillRect(width / 2 - 1, 0, 2, height);
+  const avatarPanels = [
+    {
+      title: "Avatar antigo",
+      subtitle: "Antes da alteracao",
+      image: oldImage,
+      x: leftAvatarX,
+      baseColor: "#182235",
+      accentColor: "#8ea7ff",
+      labelX: panelPadding,
+    },
+    {
+      title: "Avatar novo",
+      subtitle: "Depois da alteracao",
+      image: newImage,
+      x: rightAvatarX,
+      baseColor: "#16263a",
+      accentColor: "#62d0a2",
+      labelX: width / 2 + panelPadding,
+    },
+  ];
+
+  for (const panel of avatarPanels) {
+    context.fillStyle = panel.baseColor;
+    drawRoundedRect(context, panel.x, avatarY, avatarSize, avatarSize, 42);
+    context.fill();
+
+    context.save();
+    drawRoundedRect(context, panel.x, avatarY, avatarSize, avatarSize, 42);
+    context.clip();
+    drawCoverImage(context, panel.image, panel.x, avatarY, avatarSize, avatarSize);
+    context.restore();
+
+    context.strokeStyle = "rgba(255,255,255,0.14)";
+    context.lineWidth = 3;
+    drawRoundedRect(context, panel.x, avatarY, avatarSize, avatarSize, 42);
+    context.stroke();
+
+    context.fillStyle = panel.accentColor;
+    context.fillRect(panel.labelX, 76, 74, 6);
+    context.fillStyle = "#f6f8ff";
+    context.font = "bold 40px Sans";
+    context.fillText(panel.title, panel.labelX, 132);
+    context.fillStyle = "rgba(235,241,255,0.72)";
+    context.font = "26px Sans";
+    context.fillText(panel.subtitle, panel.labelX, 165);
+  }
+
+  context.fillStyle = "rgba(255,255,255,0.06)";
+  context.fillRect(panelPadding, height - 92, width - panelPadding * 2, 2);
+  context.fillStyle = "rgba(235,241,255,0.78)";
+  context.font = "24px Sans";
+  context.fillText(
+    "Comparativo lado a lado do avatar anterior e do novo avatar.",
+    panelPadding,
+    height - 42,
+  );
 
   return canvas.toBuffer("image/png");
 }
@@ -428,8 +592,8 @@ async function handleNicknameOrAvatarUpdate(oldMember, newMember) {
   const settings = runtime.settings;
   const beforeNick = trimText(oldMember?.nickname || oldMember?.user?.username || "");
   const afterNick = trimText(newMember.nickname || newMember.user?.username || "");
-  const beforeAvatar = oldMember?.user?.avatar || null;
-  const afterAvatar = newMember.user?.avatar || null;
+  const beforeMemberAvatar = oldMember?.avatar || null;
+  const afterMemberAvatar = newMember?.avatar || null;
   let handled = false;
 
   if (beforeNick !== afterNick) {
@@ -457,46 +621,54 @@ async function handleNicknameOrAvatarUpdate(oldMember, newMember) {
     }
   }
 
-  if (beforeAvatar !== afterAvatar) {
+  if (beforeMemberAvatar !== afterMemberAvatar) {
     const config = resolveEventConfig(settings, "avatarChange");
     if (config.enabled) {
-      handled = true;
+      const oldAvatarUrl = resolveStaticMemberAvatarUrl(oldMember);
+      const newAvatarUrl = resolveStaticMemberAvatarUrl(newMember);
+      const dedupeKey = [
+        "avatar",
+        "guild",
+        newMember.guild.id,
+        newMember.id,
+        beforeMemberAvatar || "none",
+        afterMemberAvatar || "none",
+      ].join(":");
 
-      const oldAvatarUrl = oldMember?.user?.displayAvatarURL({
-        extension: "png",
-        forceStatic: true,
-        size: 512,
-      });
-      const newAvatarUrl = newMember.user?.displayAvatarURL({
-        extension: "png",
-        forceStatic: true,
-        size: 512,
-      });
-      const comparisonImage = await buildAvatarComparisonImage(
-        oldAvatarUrl,
-        newAvatarUrl,
-      );
+      if (!registerRecentEvent(dedupeKey)) {
+        handled = true;
 
-      await sendSecurityLog({
-        guild: newMember.guild,
-        settings,
-        eventKey: "avatarChange",
-        color: 0x7b9cff,
-        title: "Avatar alterado",
-        description: `Usuario: ${formatMemberLabel(newMember)}`,
-        fields: [
-          {
-            name: "Avatar antigo",
-            value: oldAvatarUrl || "(indisponivel)",
-          },
-          {
-            name: "Avatar novo",
-            value: newAvatarUrl || "(indisponivel)",
-          },
-        ],
-        imageBuffer: comparisonImage,
-        imageName: `avatar-compare-${newMember.id}.png`,
-      });
+        const comparisonImage = await buildAvatarComparisonImage(
+          oldAvatarUrl,
+          newAvatarUrl,
+        );
+
+        await sendSecurityLog({
+          guild: newMember.guild,
+          settings,
+          eventKey: "avatarChange",
+          color: 0x7b9cff,
+          title: "Avatar do servidor alterado",
+          description: `Usuario: ${formatMemberLabel(newMember)}`,
+          fields: [
+            {
+              name: "Escopo",
+              value: "Avatar especifico deste servidor",
+              inline: true,
+            },
+            {
+              name: "Avatar antigo",
+              value: oldAvatarUrl || "(indisponivel)",
+            },
+            {
+              name: "Avatar novo",
+              value: newAvatarUrl || "(indisponivel)",
+            },
+          ],
+          imageBuffer: comparisonImage,
+          imageName: `avatar-guild-compare-${newMember.id}.png`,
+        });
+      }
     }
   }
 
@@ -510,39 +682,147 @@ async function handleNicknameOrAvatarUpdate(oldMember, newMember) {
   if (timeoutWasApplied) {
     const config = resolveEventConfig(settings, "memberTimeout");
     if (config.enabled) {
-      handled = true;
+      const timeoutAuditEntry =
+        (await resolveAuditEntry(newMember.guild, {
+          type: AuditLogEvent.MemberUpdate,
+          targetId: newMember.id,
+          maxAgeMs: 45_000,
+          retryDelaysMs: [0, 900, 1_400, 2_000],
+          predicate: (entry) =>
+            Array.isArray(entry.changes) &&
+            entry.changes.some(
+              (change) =>
+                String(change?.key || "").toLowerCase() ===
+                "communication_disabled_until",
+            ),
+        })) ||
+        (await resolveAuditEntry(newMember.guild, {
+          type: AuditLogEvent.AutoModerationUserCommunicationDisabled,
+          targetId: newMember.id,
+          maxAgeMs: 45_000,
+          retryDelaysMs: [0, 900, 1_500],
+        }));
+      const executor = timeoutAuditEntry?.executor || null;
+      const reason = trimText(timeoutAuditEntry?.reason || "");
+      const dedupeKey = ["timeout", newMember.guild.id, newMember.id, afterTimeout].join(":");
 
-      const executor = await resolveAuditExecutor(newMember.guild, {
-        type: AuditLogEvent.MemberUpdate,
-        targetId: newMember.id,
-        predicate: (entry) =>
-          Array.isArray(entry.changes) &&
-          entry.changes.some(
-            (change) =>
-              String(change?.key || "").toLowerCase() ===
-              "communication_disabled_until",
-          ),
-      });
+      if (!registerRecentEvent(dedupeKey)) {
+        handled = true;
 
-      await sendSecurityLog({
-        guild: newMember.guild,
-        settings,
-        eventKey: "memberTimeout",
-        color: 0xffab4a,
-        title: "Membro silenciado",
-        description: `Usuario: ${formatMemberLabel(newMember)}`,
-        fields: [
-          {
-            name: "Silenciado ate",
-            value: formatDateTime(afterTimeout),
-          },
-          {
-            name: "Executado por",
-            value: executor ? formatUserLabel(executor) : "Nao identificado",
-          },
-        ],
-      });
+        await sendSecurityLog({
+          guild: newMember.guild,
+          settings,
+          eventKey: "memberTimeout",
+          color: 0xffab4a,
+          title: "Membro silenciado",
+          description: `Usuario: ${formatMemberLabel(newMember)}`,
+          fields: [
+            {
+              name: "Silenciado ate",
+              value: formatDateTime(afterTimeout),
+            },
+            {
+              name: "Duracao aproximada",
+              value: formatDurationMs(afterTimeout - Date.now()),
+              inline: true,
+            },
+            {
+              name: "Executado por",
+              value: executor ? formatUserLabel(executor) : "Nao identificado",
+              inline: true,
+            },
+            {
+              name: "Motivo",
+              value: reason || "Nao informado",
+            },
+          ],
+        });
+      }
     }
+  }
+
+  return handled;
+}
+
+async function resolveMemberFromGuild(guild, userId) {
+  if (!guild || !userId) return null;
+  return (
+    guild.members.cache.get(userId) ||
+    (await guild.members.fetch(userId).catch(() => null))
+  );
+}
+
+async function handleUserAvatarUpdate(oldUser, newUser, client) {
+  if (!client?.guilds?.cache || !newUser?.id) return false;
+  if (newUser.bot) return false;
+
+  const beforeAvatar = oldUser?.avatar || null;
+  const afterAvatar = newUser?.avatar || null;
+  if (beforeAvatar === afterAvatar) return false;
+
+  const oldAvatarUrl = resolveStaticUserAvatarUrl(oldUser);
+  const newAvatarUrl = resolveStaticUserAvatarUrl(newUser);
+  const comparisonImage = await buildAvatarComparisonImage(
+    oldAvatarUrl,
+    newAvatarUrl,
+  );
+
+  let handled = false;
+  for (const guild of client.guilds.cache.values()) {
+    const member = await resolveMemberFromGuild(guild, newUser.id);
+    if (!member || member.user?.bot) {
+      continue;
+    }
+
+    const runtime = await resolveRuntime(guild.id);
+    if (!runtime?.settings) {
+      continue;
+    }
+
+    const config = resolveEventConfig(runtime.settings, "avatarChange");
+    if (!config.enabled) {
+      continue;
+    }
+
+    const dedupeKey = [
+      "avatar",
+      "global",
+      guild.id,
+      newUser.id,
+      beforeAvatar || "none",
+      afterAvatar || "none",
+    ].join(":");
+
+    if (registerRecentEvent(dedupeKey)) {
+      continue;
+    }
+
+    await sendSecurityLog({
+      guild,
+      settings: runtime.settings,
+      eventKey: "avatarChange",
+      color: 0x7b9cff,
+      title: "Avatar global alterado",
+      description: `Usuario: ${formatMemberLabel(member)}`,
+      fields: [
+        {
+          name: "Escopo",
+          value: "Avatar global da conta do usuario",
+          inline: true,
+        },
+        {
+          name: "Avatar antigo",
+          value: oldAvatarUrl || "(indisponivel)",
+        },
+        {
+          name: "Avatar novo",
+          value: newAvatarUrl || "(indisponivel)",
+        },
+      ],
+      imageBuffer: comparisonImage,
+      imageName: `avatar-global-compare-${newUser.id}.png`,
+    });
+    handled = true;
   }
 
   return handled;
@@ -567,7 +847,7 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
       eventKey: "voiceJoin",
       color: 0x53c46f,
       title: "Entrou em canal de voz",
-      description: `Usuario: <@${newState.id}>`,
+      description: `Usuario: ${formatMemberLabel(newState.member || { id: newState.id })}`,
       fields: [
         { name: "Canal", value: `<#${newChannel.id}>` },
       ],
@@ -582,7 +862,7 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
       eventKey: "voiceLeave",
       color: 0xff9b6a,
       title: "Saiu de canal de voz",
-      description: `Usuario: <@${newState.id}>`,
+      description: `Usuario: ${formatMemberLabel(oldState.member || { id: newState.id })}`,
       fields: [
         { name: "Canal anterior", value: `<#${oldChannel.id}>` },
       ],
@@ -591,21 +871,35 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
   }
 
   if (oldChannel && newChannel && oldChannel.id !== newChannel.id) {
-    let executor = await resolveAuditExecutor(guild, {
-      type: AuditLogEvent.MemberMove,
-      targetId: newState.id,
-    });
-    if (!executor) {
-      await new Promise((resolve) => {
-        setTimeout(resolve, 900);
-      });
-      executor = await resolveAuditExecutor(guild, {
-        type: AuditLogEvent.MemberMove,
-        targetId: newState.id,
-      });
+    const moveConfig = resolveEventConfig(settings, "voiceMove");
+    if (!moveConfig.enabled) {
+      return false;
     }
 
-    if (!executor || executor.id === newState.id) {
+    const moveAuditEntry = await resolveAuditEntry(guild, {
+      type: AuditLogEvent.MemberMove,
+      targetId: newState.id,
+      maxAgeMs: 35_000,
+      retryDelaysMs: [0, 850, 1_300, 1_900],
+      predicate: (entry) => {
+        const movedToChannelId = entry?.extra?.channel?.id;
+        return !movedToChannelId || movedToChannelId === newChannel.id;
+      },
+    });
+    const executor = moveAuditEntry?.executor || null;
+    const reason = trimText(moveAuditEntry?.reason || "");
+    const movedByModerator =
+      executor?.id && executor.id !== newState.id;
+    const dedupeKey = [
+      "voice-move",
+      guild.id,
+      newState.id,
+      oldChannel.id,
+      newChannel.id,
+      executor?.id || "self",
+    ].join(":");
+
+    if (registerRecentEvent(dedupeKey)) {
       return false;
     }
 
@@ -613,15 +907,23 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
       guild,
       settings,
       eventKey: "voiceMove",
-      color: 0x79a6ff,
-      title: "Membro movido de call",
-      description: `Usuario: <@${newState.id}>`,
+      color: movedByModerator ? 0x79a6ff : 0x6cb8ff,
+      title: movedByModerator
+        ? "Membro movido de call"
+        : "Membro trocou de canal de voz",
+      description: `Usuario: ${formatMemberLabel(newState.member || { id: newState.id })}`,
       fields: [
         { name: "Canal antigo", value: `<#${oldChannel.id}>`, inline: true },
         { name: "Canal novo", value: `<#${newChannel.id}>`, inline: true },
         {
-          name: "Executado por",
-          value: executor ? formatUserLabel(executor) : "Nao identificado",
+          name: movedByModerator ? "Executado por" : "Origem do movimento",
+          value: movedByModerator
+            ? formatUserLabel(executor)
+            : "Mudanca direta do usuario ou auditoria indisponivel",
+        },
+        {
+          name: "Motivo",
+          value: reason || "Nao informado",
         },
       ],
     });
@@ -719,10 +1021,13 @@ async function handleGuildBanAddSecurityLog(ban) {
   const runtime = await resolveRuntime(guild.id);
   if (!runtime?.settings) return false;
 
-  const executor = await resolveAuditExecutor(guild, {
+  const auditEntry = await resolveAuditEntry(guild, {
     type: AuditLogEvent.MemberBanAdd,
     targetId: user.id,
+    maxAgeMs: 35_000,
   });
+  const executor = auditEntry?.executor || null;
+  const reason = trimText(auditEntry?.reason || "");
 
   await sendSecurityLog({
     guild,
@@ -735,6 +1040,10 @@ async function handleGuildBanAddSecurityLog(ban) {
       {
         name: "Executado por",
         value: executor ? formatUserLabel(executor) : "Nao identificado",
+      },
+      {
+        name: "Motivo",
+        value: reason || "Nao informado",
       },
     ],
   });
@@ -750,10 +1059,13 @@ async function handleGuildBanRemoveSecurityLog(ban) {
   const runtime = await resolveRuntime(guild.id);
   if (!runtime?.settings) return false;
 
-  const executor = await resolveAuditExecutor(guild, {
+  const auditEntry = await resolveAuditEntry(guild, {
     type: AuditLogEvent.MemberBanRemove,
     targetId: user.id,
+    maxAgeMs: 35_000,
   });
+  const executor = auditEntry?.executor || null;
+  const reason = trimText(auditEntry?.reason || "");
 
   await sendSecurityLog({
     guild,
@@ -766,6 +1078,10 @@ async function handleGuildBanRemoveSecurityLog(ban) {
       {
         name: "Executado por",
         value: executor ? formatUserLabel(executor) : "Nao identificado",
+      },
+      {
+        name: "Motivo",
+        value: reason || "Nao informado",
       },
     ],
   });
@@ -783,12 +1099,19 @@ async function handleMemberRemoveSecurityLog(member) {
   const config = resolveEventConfig(runtime.settings, "memberKick");
   if (!config.enabled) return false;
 
-  const kickExecutor = await resolveAuditExecutor(member.guild, {
+  const kickAuditEntry = await resolveAuditEntry(member.guild, {
     type: AuditLogEvent.MemberKick,
     targetId: member.id,
+    maxAgeMs: 45_000,
+    retryDelaysMs: KICK_AUDIT_RETRY_DELAYS_MS,
   });
 
-  if (!kickExecutor) return false;
+  if (!kickAuditEntry?.executor) return false;
+
+  const dedupeKey = ["kick", member.guild.id, member.id, kickAuditEntry.id].join(":");
+  if (registerRecentEvent(dedupeKey, 30_000)) {
+    return false;
+  }
 
   await sendSecurityLog({
     guild: member.guild,
@@ -800,7 +1123,11 @@ async function handleMemberRemoveSecurityLog(member) {
     fields: [
       {
         name: "Executado por",
-        value: formatUserLabel(kickExecutor),
+        value: formatUserLabel(kickAuditEntry.executor),
+      },
+      {
+        name: "Motivo",
+        value: trimText(kickAuditEntry.reason || "") || "Nao informado",
       },
     ],
   });
@@ -815,5 +1142,6 @@ module.exports = {
   handleMessageDeleteSecurityLog,
   handleMessageEditSecurityLog,
   handleNicknameOrAvatarUpdate,
+  handleUserAvatarUpdate,
   handleVoiceStateSecurityLog,
 };
