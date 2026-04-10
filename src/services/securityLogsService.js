@@ -10,11 +10,14 @@ const {
   SeparatorSpacingSize,
   TextDisplayBuilder,
 } = require("discord.js");
+const { calculateUserDefaultAvatarIndex } = require("@discordjs/rest");
 const { getGuildSecurityLogsRuntime } = require("./supabaseService");
 
 const RUNTIME_CACHE_TTL_MS = 10_000;
 const runtimeCache = new Map();
 const recentEventCache = new Map();
+const globalAvatarSnapshotCache = new Map();
+const guildAvatarSnapshotCache = new Map();
 
 const DEFAULT_AUDIT_RETRY_DELAYS_MS = [0, 1_200, 1_400, 1_600];
 const KICK_AUDIT_RETRY_DELAYS_MS = [0, 1_500, 1_800, 2_200, 2_600];
@@ -317,6 +320,94 @@ function resolveStaticMemberAvatarUrl(member) {
   });
 }
 
+function resolveDefaultAvatarUrl(client, userId) {
+  if (!client?.rest?.cdn || !userId) return null;
+  const index = calculateUserDefaultAvatarIndex(userId);
+  return client.rest.cdn.defaultAvatar(index);
+}
+
+function resolveUserAvatarUrlFromHash(client, userId, avatarHash, fallbackUser = null) {
+  const normalizedHash = trimText(avatarHash);
+  if (normalizedHash) {
+    return client.rest.cdn.avatar(userId, normalizedHash, {
+      extension: "png",
+      forceStatic: true,
+      size: 512,
+    });
+  }
+
+  return resolveStaticUserAvatarUrl(fallbackUser) || resolveDefaultAvatarUrl(client, userId);
+}
+
+function resolveMemberAvatarUrlFromHash(
+  client,
+  guildId,
+  userId,
+  avatarHash,
+  fallbackMember = null,
+  fallbackUser = null,
+) {
+  const normalizedHash = trimText(avatarHash);
+  if (normalizedHash) {
+    return client.rest.cdn.guildMemberAvatar(guildId, userId, normalizedHash, {
+      extension: "png",
+      forceStatic: true,
+      size: 512,
+    });
+  }
+
+  return (
+    resolveStaticMemberAvatarUrl(fallbackMember) ||
+    resolveUserAvatarUrlFromHash(client, userId, null, fallbackUser)
+  );
+}
+
+function resolveGuildAvatarSnapshotKey(guildId, userId) {
+  return `${guildId}:${userId}`;
+}
+
+function getKnownGlobalAvatarHash(client, userId) {
+  if (globalAvatarSnapshotCache.has(userId)) {
+    return globalAvatarSnapshotCache.get(userId);
+  }
+
+  const cachedUser = client?.users?.cache?.get(userId);
+  if (cachedUser) {
+    return cachedUser.avatar || null;
+  }
+
+  return undefined;
+}
+
+function rememberGlobalAvatarHash(userId, avatarHash) {
+  if (!userId) return;
+  globalAvatarSnapshotCache.set(userId, avatarHash || null);
+}
+
+function getKnownGuildAvatarHash(guild, userId) {
+  if (!guild?.id || !userId) return undefined;
+
+  const snapshotKey = resolveGuildAvatarSnapshotKey(guild.id, userId);
+  if (guildAvatarSnapshotCache.has(snapshotKey)) {
+    return guildAvatarSnapshotCache.get(snapshotKey);
+  }
+
+  const cachedMember = guild.members?.cache?.get(userId);
+  if (cachedMember) {
+    return cachedMember.avatar || null;
+  }
+
+  return undefined;
+}
+
+function rememberGuildAvatarHash(guildId, userId, avatarHash) {
+  if (!guildId || !userId) return;
+  guildAvatarSnapshotCache.set(
+    resolveGuildAvatarSnapshotKey(guildId, userId),
+    avatarHash || null,
+  );
+}
+
 function formatDurationMs(durationMs) {
   if (!Number.isFinite(durationMs) || durationMs <= 0) {
     return "Menos de 1 minuto";
@@ -486,8 +577,8 @@ async function buildAvatarComparisonImage(oldAvatarUrl, newAvatarUrl) {
   }
 
   const { createCanvas, loadImage } = canvasApi;
-  const width = 1400;
-  const height = 760;
+  const width = 1200;
+  const height = 620;
   const canvas = createCanvas(width, height);
   const context = canvas.getContext("2d");
 
@@ -498,88 +589,236 @@ async function buildAvatarComparisonImage(oldAvatarUrl, newAvatarUrl) {
 
   if (!oldImage || !newImage) return null;
 
-  context.fillStyle = "#06080d";
+  context.fillStyle = "#0a0d14";
   context.fillRect(0, 0, width, height);
 
-  context.fillStyle = "#0d1320";
-  context.fillRect(0, 0, width / 2, height);
-  context.fillStyle = "#111a2b";
-  context.fillRect(width / 2, 0, width / 2, height);
+  const framePadding = 22;
+  const frameX = framePadding;
+  const frameY = framePadding;
+  const frameWidth = width - framePadding * 2;
+  const frameHeight = height - framePadding * 2;
+  const splitX = frameX + frameWidth / 2;
 
-  context.fillStyle = "rgba(255,255,255,0.08)";
-  context.fillRect(width / 2 - 2, 0, 4, height);
+  context.fillStyle = "rgba(0, 0, 0, 0.32)";
+  drawRoundedRect(context, frameX + 10, frameY + 14, frameWidth, frameHeight, 28);
+  context.fill();
 
-  const panelPadding = 58;
-  const avatarSize = 470;
-  const avatarY = 170;
-  const leftAvatarX = width / 4 - avatarSize / 2;
-  const rightAvatarX = (width * 3) / 4 - avatarSize / 2;
+  context.save();
+  drawRoundedRect(context, frameX, frameY, frameWidth, frameHeight, 28);
+  context.clip();
 
-  const panelShadow = "rgba(0, 0, 0, 0.32)";
-  for (const avatarX of [leftAvatarX, rightAvatarX]) {
-    context.fillStyle = panelShadow;
-    drawRoundedRect(context, avatarX + 10, avatarY + 14, avatarSize, avatarSize, 42);
-    context.fill();
-  }
+  drawCoverImage(context, oldImage, frameX, frameY, frameWidth / 2, frameHeight);
+  drawCoverImage(context, newImage, splitX, frameY, frameWidth / 2, frameHeight);
 
-  const avatarPanels = [
-    {
-      title: "Avatar antigo",
-      subtitle: "Antes da alteracao",
-      image: oldImage,
-      x: leftAvatarX,
-      baseColor: "#182235",
-      accentColor: "#8ea7ff",
-      labelX: panelPadding,
-    },
-    {
-      title: "Avatar novo",
-      subtitle: "Depois da alteracao",
-      image: newImage,
-      x: rightAvatarX,
-      baseColor: "#16263a",
-      accentColor: "#62d0a2",
-      labelX: width / 2 + panelPadding,
-    },
-  ];
+  const topFade = context.createLinearGradient(0, frameY, 0, frameY + 150);
+  topFade.addColorStop(0, "rgba(0,0,0,0.28)");
+  topFade.addColorStop(1, "rgba(0,0,0,0)");
+  context.fillStyle = topFade;
+  context.fillRect(frameX, frameY, frameWidth, 150);
 
-  for (const panel of avatarPanels) {
-    context.fillStyle = panel.baseColor;
-    drawRoundedRect(context, panel.x, avatarY, avatarSize, avatarSize, 42);
-    context.fill();
+  const bottomFade = context.createLinearGradient(0, frameY + frameHeight - 150, 0, frameY + frameHeight);
+  bottomFade.addColorStop(0, "rgba(0,0,0,0)");
+  bottomFade.addColorStop(1, "rgba(0,0,0,0.32)");
+  context.fillStyle = bottomFade;
+  context.fillRect(frameX, frameY + frameHeight - 150, frameWidth, 150);
 
-    context.save();
-    drawRoundedRect(context, panel.x, avatarY, avatarSize, avatarSize, 42);
-    context.clip();
-    drawCoverImage(context, panel.image, panel.x, avatarY, avatarSize, avatarSize);
-    context.restore();
+  context.fillStyle = "rgba(255,255,255,0.12)";
+  context.fillRect(splitX - 1.5, frameY, 3, frameHeight);
 
-    context.strokeStyle = "rgba(255,255,255,0.14)";
-    context.lineWidth = 3;
-    drawRoundedRect(context, panel.x, avatarY, avatarSize, avatarSize, 42);
-    context.stroke();
+  context.restore();
 
-    context.fillStyle = panel.accentColor;
-    context.fillRect(panel.labelX, 76, 74, 6);
-    context.fillStyle = "#f6f8ff";
-    context.font = "bold 40px Sans";
-    context.fillText(panel.title, panel.labelX, 132);
-    context.fillStyle = "rgba(235,241,255,0.72)";
-    context.font = "26px Sans";
-    context.fillText(panel.subtitle, panel.labelX, 165);
-  }
-
-  context.fillStyle = "rgba(255,255,255,0.06)";
-  context.fillRect(panelPadding, height - 92, width - panelPadding * 2, 2);
-  context.fillStyle = "rgba(235,241,255,0.78)";
-  context.font = "24px Sans";
-  context.fillText(
-    "Comparativo lado a lado do avatar anterior e do novo avatar.",
-    panelPadding,
-    height - 42,
-  );
+  context.strokeStyle = "rgba(255,255,255,0.1)";
+  context.lineWidth = 2;
+  drawRoundedRect(context, frameX, frameY, frameWidth, frameHeight, 28);
+  context.stroke();
 
   return canvas.toBuffer("image/png");
+}
+
+async function dispatchGuildMemberAvatarChange({
+  guild,
+  userId,
+  beforeMemberAvatarHash,
+  afterMemberAvatarHash,
+  oldMember = null,
+  newMember = null,
+  fallbackUser = null,
+}) {
+  if (!guild?.id || !userId) return false;
+  if (beforeMemberAvatarHash === afterMemberAvatarHash) {
+    rememberGuildAvatarHash(guild.id, userId, afterMemberAvatarHash);
+    return false;
+  }
+
+  const runtime = await resolveRuntime(guild.id);
+  if (!runtime?.settings) {
+    rememberGuildAvatarHash(guild.id, userId, afterMemberAvatarHash);
+    return false;
+  }
+
+  const config = resolveEventConfig(runtime.settings, "avatarChange");
+  if (!config.enabled) {
+    rememberGuildAvatarHash(guild.id, userId, afterMemberAvatarHash);
+    return false;
+  }
+
+  const oldAvatarUrl = resolveMemberAvatarUrlFromHash(
+    guild.client,
+    guild.id,
+    userId,
+    beforeMemberAvatarHash,
+    oldMember,
+    fallbackUser,
+  );
+  const newAvatarUrl = resolveMemberAvatarUrlFromHash(
+    guild.client,
+    guild.id,
+    userId,
+    afterMemberAvatarHash,
+    newMember,
+    fallbackUser,
+  );
+  const dedupeKey = [
+    "avatar",
+    "guild",
+    guild.id,
+    userId,
+    beforeMemberAvatarHash || "none",
+    afterMemberAvatarHash || "none",
+  ].join(":");
+
+  rememberGuildAvatarHash(guild.id, userId, afterMemberAvatarHash);
+
+  if (registerRecentEvent(dedupeKey)) {
+    return false;
+  }
+
+  const comparisonImage = await buildAvatarComparisonImage(
+    oldAvatarUrl,
+    newAvatarUrl,
+  );
+
+  await sendSecurityLog({
+    guild,
+    settings: runtime.settings,
+    eventKey: "avatarChange",
+    color: 0x7b9cff,
+    title: "Avatar do servidor alterado",
+    description: `Usuario: ${formatMemberLabel(newMember || oldMember || { id: userId })}`,
+    fields: [
+      {
+        name: "Escopo",
+        value: "Avatar especifico deste servidor",
+        inline: true,
+      },
+      {
+        name: "Avatar antigo",
+        value: oldAvatarUrl || "(indisponivel)",
+      },
+      {
+        name: "Avatar novo",
+        value: newAvatarUrl || "(indisponivel)",
+      },
+    ],
+    imageBuffer: comparisonImage,
+    imageName: `avatar-guild-compare-${userId}.png`,
+  });
+
+  return true;
+}
+
+async function dispatchGlobalAvatarChange({
+  client,
+  userId,
+  beforeAvatarHash,
+  afterAvatarHash,
+  oldUser = null,
+  newUser = null,
+}) {
+  if (!client?.guilds?.cache || !userId) return false;
+  if (beforeAvatarHash === afterAvatarHash) {
+    rememberGlobalAvatarHash(userId, afterAvatarHash);
+    return false;
+  }
+
+  const oldAvatarUrl = resolveUserAvatarUrlFromHash(
+    client,
+    userId,
+    beforeAvatarHash,
+    oldUser,
+  );
+  const newAvatarUrl = resolveUserAvatarUrlFromHash(
+    client,
+    userId,
+    afterAvatarHash,
+    newUser,
+  );
+  const comparisonImage = await buildAvatarComparisonImage(
+    oldAvatarUrl,
+    newAvatarUrl,
+  );
+
+  rememberGlobalAvatarHash(userId, afterAvatarHash);
+
+  let handled = false;
+  for (const guild of client.guilds.cache.values()) {
+    const member = await resolveMemberFromGuild(guild, userId);
+    if (!member || member.user?.bot) {
+      continue;
+    }
+
+    const runtime = await resolveRuntime(guild.id);
+    if (!runtime?.settings) {
+      continue;
+    }
+
+    const config = resolveEventConfig(runtime.settings, "avatarChange");
+    if (!config.enabled) {
+      continue;
+    }
+
+    const dedupeKey = [
+      "avatar",
+      "global",
+      guild.id,
+      userId,
+      beforeAvatarHash || "none",
+      afterAvatarHash || "none",
+    ].join(":");
+
+    if (registerRecentEvent(dedupeKey)) {
+      continue;
+    }
+
+    await sendSecurityLog({
+      guild,
+      settings: runtime.settings,
+      eventKey: "avatarChange",
+      color: 0x7b9cff,
+      title: "Avatar global alterado",
+      description: `Usuario: ${formatMemberLabel(member)}`,
+      fields: [
+        {
+          name: "Escopo",
+          value: "Avatar global da conta do usuario",
+          inline: true,
+        },
+        {
+          name: "Avatar antigo",
+          value: oldAvatarUrl || "(indisponivel)",
+        },
+        {
+          name: "Avatar novo",
+          value: newAvatarUrl || "(indisponivel)",
+        },
+      ],
+      imageBuffer: comparisonImage,
+      imageName: `avatar-global-compare-${userId}.png`,
+    });
+    handled = true;
+  }
+
+  return handled;
 }
 
 async function handleNicknameOrAvatarUpdate(oldMember, newMember) {
@@ -595,6 +834,9 @@ async function handleNicknameOrAvatarUpdate(oldMember, newMember) {
   const beforeMemberAvatar = oldMember?.avatar || null;
   const afterMemberAvatar = newMember?.avatar || null;
   let handled = false;
+
+  rememberGlobalAvatarHash(newMember.id, newMember.user?.avatar || null);
+  rememberGuildAvatarHash(newMember.guild.id, newMember.id, afterMemberAvatar);
 
   if (beforeNick !== afterNick) {
     const config = resolveEventConfig(settings, "nicknameChange");
@@ -622,54 +864,16 @@ async function handleNicknameOrAvatarUpdate(oldMember, newMember) {
   }
 
   if (beforeMemberAvatar !== afterMemberAvatar) {
-    const config = resolveEventConfig(settings, "avatarChange");
-    if (config.enabled) {
-      const oldAvatarUrl = resolveStaticMemberAvatarUrl(oldMember);
-      const newAvatarUrl = resolveStaticMemberAvatarUrl(newMember);
-      const dedupeKey = [
-        "avatar",
-        "guild",
-        newMember.guild.id,
-        newMember.id,
-        beforeMemberAvatar || "none",
-        afterMemberAvatar || "none",
-      ].join(":");
-
-      if (!registerRecentEvent(dedupeKey)) {
-        handled = true;
-
-        const comparisonImage = await buildAvatarComparisonImage(
-          oldAvatarUrl,
-          newAvatarUrl,
-        );
-
-        await sendSecurityLog({
-          guild: newMember.guild,
-          settings,
-          eventKey: "avatarChange",
-          color: 0x7b9cff,
-          title: "Avatar do servidor alterado",
-          description: `Usuario: ${formatMemberLabel(newMember)}`,
-          fields: [
-            {
-              name: "Escopo",
-              value: "Avatar especifico deste servidor",
-              inline: true,
-            },
-            {
-              name: "Avatar antigo",
-              value: oldAvatarUrl || "(indisponivel)",
-            },
-            {
-              name: "Avatar novo",
-              value: newAvatarUrl || "(indisponivel)",
-            },
-          ],
-          imageBuffer: comparisonImage,
-          imageName: `avatar-guild-compare-${newMember.id}.png`,
-        });
-      }
-    }
+    handled =
+      (await dispatchGuildMemberAvatarChange({
+        guild: newMember.guild,
+        userId: newMember.id,
+        beforeMemberAvatarHash: beforeMemberAvatar,
+        afterMemberAvatarHash: afterMemberAvatar,
+        oldMember,
+        newMember,
+        fallbackUser: newMember.user || oldMember?.user || null,
+      })) || handled;
   }
 
   const beforeTimeout = oldMember?.communicationDisabledUntilTimestamp || null;
@@ -758,74 +962,98 @@ async function handleUserAvatarUpdate(oldUser, newUser, client) {
 
   const beforeAvatar = oldUser?.avatar || null;
   const afterAvatar = newUser?.avatar || null;
-  if (beforeAvatar === afterAvatar) return false;
+  return dispatchGlobalAvatarChange({
+    client,
+    userId: newUser.id,
+    beforeAvatarHash: beforeAvatar,
+    afterAvatarHash: afterAvatar,
+    oldUser,
+    newUser,
+  });
+}
 
-  const oldAvatarUrl = resolveStaticUserAvatarUrl(oldUser);
-  const newAvatarUrl = resolveStaticUserAvatarUrl(newUser);
-  const comparisonImage = await buildAvatarComparisonImage(
-    oldAvatarUrl,
-    newAvatarUrl,
-  );
+async function handleRawSecurityPacket(packet, client) {
+  if (!packet?.t || !client) return false;
 
-  let handled = false;
-  for (const guild of client.guilds.cache.values()) {
-    const member = await resolveMemberFromGuild(guild, newUser.id);
-    if (!member || member.user?.bot) {
-      continue;
+  if (packet.t === "USER_UPDATE") {
+    const userId = trimText(packet.d?.id);
+    if (!userId || packet.d?.bot === true) return false;
+    if (!Object.prototype.hasOwnProperty.call(packet.d || {}, "avatar")) return false;
+
+    const beforeAvatarHash = getKnownGlobalAvatarHash(client, userId);
+    const afterAvatarHash = packet.d.avatar || null;
+    const cachedUser = client.users?.cache?.get(userId) || null;
+
+    if (beforeAvatarHash === undefined) {
+      rememberGlobalAvatarHash(userId, afterAvatarHash);
+      return false;
     }
 
-    const runtime = await resolveRuntime(guild.id);
-    if (!runtime?.settings) {
-      continue;
-    }
-
-    const config = resolveEventConfig(runtime.settings, "avatarChange");
-    if (!config.enabled) {
-      continue;
-    }
-
-    const dedupeKey = [
-      "avatar",
-      "global",
-      guild.id,
-      newUser.id,
-      beforeAvatar || "none",
-      afterAvatar || "none",
-    ].join(":");
-
-    if (registerRecentEvent(dedupeKey)) {
-      continue;
-    }
-
-    await sendSecurityLog({
-      guild,
-      settings: runtime.settings,
-      eventKey: "avatarChange",
-      color: 0x7b9cff,
-      title: "Avatar global alterado",
-      description: `Usuario: ${formatMemberLabel(member)}`,
-      fields: [
-        {
-          name: "Escopo",
-          value: "Avatar global da conta do usuario",
-          inline: true,
-        },
-        {
-          name: "Avatar antigo",
-          value: oldAvatarUrl || "(indisponivel)",
-        },
-        {
-          name: "Avatar novo",
-          value: newAvatarUrl || "(indisponivel)",
-        },
-      ],
-      imageBuffer: comparisonImage,
-      imageName: `avatar-global-compare-${newUser.id}.png`,
+    return dispatchGlobalAvatarChange({
+      client,
+      userId,
+      beforeAvatarHash,
+      afterAvatarHash,
+      oldUser: cachedUser,
+      newUser: cachedUser,
     });
-    handled = true;
   }
 
-  return handled;
+  if (packet.t === "GUILD_MEMBER_UPDATE") {
+    const guildId = trimText(packet.d?.guild_id);
+    const userId = trimText(packet.d?.user?.id);
+    if (!guildId || !userId || packet.d?.user?.bot === true) return false;
+
+    const guild = client.guilds?.cache?.get(guildId);
+    if (!guild) return false;
+
+    const cachedUser = client.users?.cache?.get(userId) || null;
+    const cachedMember = guild.members?.cache?.get(userId) || null;
+    let handled = false;
+
+    if (Object.prototype.hasOwnProperty.call(packet.d || {}, "avatar")) {
+      const beforeMemberAvatarHash = getKnownGuildAvatarHash(guild, userId);
+      const afterMemberAvatarHash = packet.d.avatar || null;
+
+      if (beforeMemberAvatarHash === undefined) {
+        rememberGuildAvatarHash(guild.id, userId, afterMemberAvatarHash);
+      } else {
+        handled =
+          (await dispatchGuildMemberAvatarChange({
+            guild,
+            userId,
+            beforeMemberAvatarHash,
+            afterMemberAvatarHash,
+            oldMember: cachedMember,
+            newMember: cachedMember,
+            fallbackUser: cachedUser,
+          })) || handled;
+      }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(packet.d?.user || {}, "avatar")) {
+      const beforeAvatarHash = getKnownGlobalAvatarHash(client, userId);
+      const afterAvatarHash = packet.d.user.avatar || null;
+
+      if (beforeAvatarHash === undefined) {
+        rememberGlobalAvatarHash(userId, afterAvatarHash);
+      } else {
+        handled =
+          (await dispatchGlobalAvatarChange({
+            client,
+            userId,
+            beforeAvatarHash,
+            afterAvatarHash,
+            oldUser: cachedUser,
+            newUser: cachedUser,
+          })) || handled;
+      }
+    }
+
+    return handled;
+  }
+
+  return false;
 }
 
 async function handleVoiceStateSecurityLog(oldState, newState) {
@@ -1142,6 +1370,7 @@ module.exports = {
   handleMessageDeleteSecurityLog,
   handleMessageEditSecurityLog,
   handleNicknameOrAvatarUpdate,
+  handleRawSecurityPacket,
   handleUserAvatarUpdate,
   handleVoiceStateSecurityLog,
 };
