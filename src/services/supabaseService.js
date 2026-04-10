@@ -235,6 +235,19 @@ async function createTicket({ protocol, guildId, channelId, userId, openedReason
   return unwrap(result, "createTicket");
 }
 
+async function updateTicketIntroMessageId(ticketId, introMessageId) {
+  const result = await supabase
+    .from(TICKETS_TABLE)
+    .update({
+      intro_message_id: introMessageId || null,
+    })
+    .eq("id", ticketId)
+    .select("id, intro_message_id")
+    .single();
+
+  return unwrap(result, "updateTicketIntroMessageId");
+}
+
 async function getOpenTicketByChannel(guildId, channelId) {
   const result = await supabase
     .from(TICKETS_TABLE)
@@ -879,5 +892,6 @@ module.exports = {
   upsertTicketAiSession,
   upsertTicketTranscript,
   updateGuildTicketPanelMessageId,
+  updateTicketIntroMessageId,
   getUserPlanSnapshotByDiscordUserId,
 };

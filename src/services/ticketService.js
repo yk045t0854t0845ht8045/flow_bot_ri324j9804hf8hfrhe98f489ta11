@@ -20,6 +20,7 @@ const {
   getOpenTicketsForUser,
   registerEvent,
   upsertTicketTranscript,
+  updateTicketIntroMessageId,
 } = require("./supabaseService");
 const { CUSTOM_IDS } = require("../constants/customIds");
 const {
@@ -63,6 +64,7 @@ const {
 const OPEN_TICKET_LOCK_TTL_MS = 15 * 1000;
 const MINIMUM_MESSAGES_FOR_TRANSCRIPT = 6;
 const openTicketLocks = new Map();
+let warnedAboutMissingIntroMessageColumn = false;
 
 function buildOpenTicketLockKey(guildId, userId) {
   return `${guildId}:${userId}`;
@@ -126,6 +128,36 @@ function logTicketFlowFailure(stage, error, metadata = {}) {
     message: error instanceof Error ? error.message : String(error),
     ...metadata,
   });
+}
+
+function isMissingTicketIntroMessageIdColumnError(error) {
+  const normalized = String(error?.message || "").toLowerCase();
+  return normalized.includes("intro_message_id");
+}
+
+async function persistTicketIntroMessageId(ticket, introMessageId, metadata = {}) {
+  const normalizedIntroMessageId = String(introMessageId || "").trim();
+  if (!ticket?.id || !normalizedIntroMessageId) return null;
+
+  try {
+    const updatedTicket = await updateTicketIntroMessageId(
+      ticket.id,
+      normalizedIntroMessageId,
+    );
+    ticket.intro_message_id = updatedTicket?.intro_message_id || normalizedIntroMessageId;
+    return updatedTicket;
+  } catch (error) {
+    if (isMissingTicketIntroMessageIdColumnError(error)) {
+      if (!warnedAboutMissingIntroMessageColumn) {
+        warnedAboutMissingIntroMessageColumn = true;
+        logTicketFlowFailure("persist-ticket-intro-message-id-migration-missing", error, metadata);
+      }
+      return null;
+    }
+
+    logTicketFlowFailure("persist-ticket-intro-message-id", error, metadata);
+    return null;
+  }
 }
 
 function resolveTicketClosureDmStatus(queueResults, notificationKey) {
@@ -195,12 +227,20 @@ function messageLooksLikeTicketIntroMessage(message) {
   return foundIntroControl;
 }
 
-async function fetchExistingTicketIntroMessage(channel) {
-  const recentMessages = await channel.messages.fetch({ limit: 20 });
-  return (
-    recentMessages.find((message) => messageLooksLikeTicketIntroMessage(message)) ||
-    null
-  );
+async function fetchExistingTicketIntroMessage(channel, storedMessageId = null) {
+  const normalizedStoredMessageId = String(storedMessageId || "").trim();
+  if (normalizedStoredMessageId) {
+    const storedMessage = await channel.messages
+      .fetch(normalizedStoredMessageId)
+      .catch(() => null);
+
+    if (storedMessage && messageLooksLikeTicketIntroMessage(storedMessage)) {
+      return storedMessage;
+    }
+  }
+
+  const recentMessages = await channel.messages.fetch({ limit: 100 });
+  return recentMessages.find((message) => messageLooksLikeTicketIntroMessage(message)) || null;
 }
 
 async function shouldGenerateTranscript(channel) {
@@ -326,16 +366,35 @@ async function syncOpenTicketControlMessages(client) {
       }
 
       const payload = buildTicketIntroPayload({ ticket });
-      const existingMessage = await fetchExistingTicketIntroMessage(channel);
-      const syncedMessage = existingMessage
-        ? await existingMessage.edit(payload)
-        : await channel.send(payload);
+      const existingMessage = await fetchExistingTicketIntroMessage(
+        channel,
+        ticket.intro_message_id || null,
+      );
+
+      if (!existingMessage) {
+        skipped.push({
+          guildId: ticket.guild_id,
+          channelId: ticket.channel_id,
+          reason: "intro_message_missing",
+        });
+        continue;
+      }
+
+      const syncedMessage = await existingMessage.edit(payload);
+
+      if (ticket.intro_message_id !== syncedMessage.id) {
+        await persistTicketIntroMessageId(ticket, syncedMessage.id, {
+          guildId: ticket.guild_id,
+          channelId: ticket.channel_id,
+          protocol: ticket.protocol,
+        });
+      }
 
       applied.push({
         guildId: ticket.guild_id,
         channelId: ticket.channel_id,
         messageId: syncedMessage.id,
-        mode: existingMessage ? "updated" : "created",
+        mode: "updated",
       });
     } catch (error) {
       skipped.push({
@@ -716,7 +775,13 @@ async function openTicketFromInteraction(interaction, openedReason = "") {
     }
 
     try {
-      await channel.send(buildTicketIntroPayload({ ticket }));
+      const introMessage = await channel.send(buildTicketIntroPayload({ ticket }));
+      await persistTicketIntroMessageId(ticket, introMessage.id, {
+        guildId: guild.id,
+        channelId: channel.id,
+        protocol: ticket.protocol,
+        userId: user.id,
+      });
     } catch (error) {
       logTicketFlowFailure("send-ticket-intro", error, {
         guildId: guild.id,

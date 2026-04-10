@@ -11,6 +11,7 @@ create table if not exists public.tickets (
   claimed_at timestamptz,
   closed_by text,
   closed_at timestamptz,
+  intro_message_id text,
   transcript_file text,
   opened_at timestamptz not null default timezone('utc', now()),
   created_at timestamptz not null default timezone('utc', now()),

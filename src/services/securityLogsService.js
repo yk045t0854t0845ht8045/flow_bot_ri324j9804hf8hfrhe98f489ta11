@@ -4,8 +4,15 @@ const {
   AuditLogEvent,
   ButtonBuilder,
   ButtonStyle,
-  EmbedBuilder,
+  ContainerBuilder,
+  MediaGalleryBuilder,
+  MediaGalleryItemBuilder,
   MessageFlags,
+  SectionBuilder,
+  SeparatorBuilder,
+  SeparatorSpacingSize,
+  TextDisplayBuilder,
+  ThumbnailBuilder,
 } = require("discord.js");
 const { calculateUserDefaultAvatarIndex } = require("@discordjs/rest");
 const { getGuildSecurityLogsRuntime } = require("./supabaseService");
@@ -598,6 +605,16 @@ function formatChannelReference(channelId) {
   return channelId ? `<#${channelId}> (\`${channelId}\`)` : "Nao identificado";
 }
 
+function buildActionRowsFromButtons(buttons = []) {
+  const rows = [];
+  for (let index = 0; index < buttons.length; index += 5) {
+    rows.push(
+      new ActionRowBuilder().addComponents(buttons.slice(index, index + 5)),
+    );
+  }
+  return rows;
+}
+
 function buildSecurityLogActionRows(guildId, eventKey, context = {}) {
   const buttons = [];
   const detailCustomId = buildSecurityLogDetailsCustomId(eventKey, context);
@@ -646,8 +663,141 @@ function buildSecurityLogActionRows(guildId, eventKey, context = {}) {
     }
   }
 
-  if (!buttons.length) return [];
-  return [new ActionRowBuilder().addComponents(buttons.slice(0, 5))];
+  return buildActionRowsFromButtons(buttons);
+}
+
+function createSecurityLogSeparator({
+  divider = true,
+  spacing = SeparatorSpacingSize.Small,
+} = {}) {
+  return new SeparatorBuilder().setDivider(divider).setSpacing(spacing);
+}
+
+function buildSecurityLogFieldTextBlocks(fields = []) {
+  const safeFields = normalizeSecurityLogFields(fields);
+  if (!safeFields.length) return [];
+
+  const lines = safeFields.map((field) => {
+    const label = toSnippet(field.name, 120);
+    const normalizedValue = trimText(field.value || "-") || "-";
+    const compactValue = normalizedValue.replace(/\s*\n\s*/g, " ").trim();
+    const shouldUseBlock =
+      normalizedValue.includes("\n") ||
+      normalizedValue.includes("```") ||
+      compactValue.length > 180;
+
+    return shouldUseBlock
+      ? `**${label}**\n${normalizedValue}`
+      : `**${label}:** ${compactValue}`;
+  });
+
+  return chunkTextBlocks(lines, 2_400, 10);
+}
+
+function buildSecurityLogPayload({
+  color = 0x5ca9ff,
+  title,
+  description,
+  fields = [],
+  imageBuffer = null,
+  imageName = "security-log.png",
+  thumbnailUrl = null,
+  buttonRows = [],
+  flags = MessageFlags.IsComponentsV2,
+}) {
+  const container = new ContainerBuilder().setAccentColor(color);
+  const normalizedTitle = toSnippet(title || "Flowdesk Security Logs", 180);
+  const normalizedDescription = trimText(description || "");
+  const descriptionBlocks = normalizedDescription
+    ? chunkTextBlocks([normalizedDescription], 3_500, 4)
+    : [];
+  const fieldBlocks = buildSecurityLogFieldTextBlocks(fields);
+  const safeButtonRows = Array.isArray(buttonRows)
+    ? buttonRows.filter(Boolean)
+    : [];
+
+  if (thumbnailUrl) {
+    const headerSection = new SectionBuilder()
+      .addTextDisplayComponents(
+        new TextDisplayBuilder().setContent(`## ${normalizedTitle}`),
+      )
+      .setThumbnailAccessory(
+        new ThumbnailBuilder()
+          .setURL(thumbnailUrl)
+          .setDescription(normalizedTitle),
+      );
+
+    if (descriptionBlocks[0]) {
+      headerSection.addTextDisplayComponents(
+        new TextDisplayBuilder().setContent(descriptionBlocks[0]),
+      );
+    }
+
+    container.addSectionComponents(headerSection);
+  } else {
+    container.addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(`## ${normalizedTitle}`),
+    );
+
+    if (descriptionBlocks[0]) {
+      container.addTextDisplayComponents(
+        new TextDisplayBuilder().setContent(descriptionBlocks[0]),
+      );
+    }
+  }
+
+  for (const block of descriptionBlocks.slice(1)) {
+    container.addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(block),
+    );
+  }
+
+  if (fieldBlocks.length) {
+    container.addSeparatorComponents(createSecurityLogSeparator());
+    for (const block of fieldBlocks) {
+      container.addTextDisplayComponents(
+        new TextDisplayBuilder().setContent(block),
+      );
+    }
+  }
+
+  if (imageBuffer) {
+    container.addSeparatorComponents(createSecurityLogSeparator());
+    container.addMediaGalleryComponents(
+      new MediaGalleryBuilder().addItems(
+        new MediaGalleryItemBuilder()
+          .setURL(`attachment://${imageName}`)
+          .setDescription(normalizedTitle),
+      ),
+    );
+  }
+
+  if (safeButtonRows.length) {
+    container.addSeparatorComponents(createSecurityLogSeparator());
+    container.addActionRowComponents(...safeButtonRows);
+  }
+
+  container.addSeparatorComponents(
+    createSecurityLogSeparator({
+      divider: false,
+      spacing: SeparatorSpacingSize.Small,
+    }),
+  );
+  container.addTextDisplayComponents(
+    new TextDisplayBuilder().setContent("-# Flowdesk Security Logs"),
+  );
+
+  const payload = {
+    components: [container],
+    flags,
+    allowedMentions: { parse: [] },
+  };
+
+  if (imageBuffer) {
+    payload.files = [new AttachmentBuilder(imageBuffer, { name: imageName })];
+  }
+
+  return payload;
 }
 
 function formatDurationMs(durationMs) {
@@ -687,40 +837,16 @@ async function sendSecurityLog({
   const channel = await resolveTextChannel(guild, config.channelId);
   if (!channel) return false;
 
-  const safeFields = normalizeSecurityLogFields(fields);
-  const embed = new EmbedBuilder()
-    .setColor(color)
-    .setTitle(toSnippet(title || config.label, 180))
-    .setTimestamp(new Date());
-  const normalizedDescription = trimText(description || "");
-
-  if (normalizedDescription) {
-    embed.setDescription(normalizedDescription);
-  }
-
-  if (safeFields.length) {
-    embed.addFields(safeFields);
-  }
-
-  if (thumbnailUrl) {
-    embed.setThumbnail(thumbnailUrl);
-  }
-
-  embed.setFooter({
-    text: "Flowdesk Security Logs",
+  const payload = buildSecurityLogPayload({
+    color,
+    title: title || config.label,
+    description,
+    fields,
+    imageBuffer,
+    imageName,
+    thumbnailUrl,
+    buttonRows: buildSecurityLogActionRows(guild.id, eventKey, buttonContext),
   });
-
-  const payload = {
-    embeds: [embed],
-    allowedMentions: { parse: [] },
-    components: buildSecurityLogActionRows(guild.id, eventKey, buttonContext),
-  };
-
-  if (imageBuffer) {
-    const attachment = new AttachmentBuilder(imageBuffer, { name: imageName });
-    embed.setImage(`attachment://${imageName}`);
-    payload.files = [attachment];
-  }
 
   const sent = await channel.send(payload).catch((error) => {
     const detail = error instanceof Error ? error.message : "falha ao enviar log";
@@ -858,58 +984,40 @@ async function handleSecurityLogButtonInteraction(interaction) {
       : null;
   const primaryChannelId =
     parsed.newChannelId || parsed.channelId || parsed.oldChannelId || null;
-  const embed = new EmbedBuilder()
-    .setColor(0x7b9cff)
-    .setTitle(buildSecurityLogDetailsTitle(parsed))
-    .setDescription(
-      logUrl
-        ? `[Abrir mensagem da log](${logUrl})`
-        : "Informacoes adicionais desta log de seguranca.",
-    )
-    .setTimestamp(
-      interaction?.message?.createdTimestamp
-        ? new Date(interaction.message.createdTimestamp)
-        : new Date(),
+  const buttons = [];
+
+  if (logUrl) {
+    buttons.push(
+      new ButtonBuilder()
+        .setStyle(ButtonStyle.Link)
+        .setLabel("Abrir log")
+        .setURL(logUrl),
     );
-
-  const fields = normalizeSecurityLogFields(buildSecurityLogDetailsFields(parsed));
-  if (fields.length) {
-    embed.addFields(fields);
   }
 
-  const components = [];
-  if (logUrl || (interaction?.guildId && primaryChannelId)) {
-    const row = new ActionRowBuilder();
-
-    if (logUrl) {
-      row.addComponents(
-        new ButtonBuilder()
-          .setStyle(ButtonStyle.Link)
-          .setLabel("Abrir log")
-          .setURL(logUrl),
-      );
-    }
-
-    if (interaction?.guildId && primaryChannelId) {
-      row.addComponents(
-        new ButtonBuilder()
-          .setStyle(ButtonStyle.Link)
-          .setLabel(parsed.code === "vm" ? "Abrir destino" : "Abrir canal")
-          .setURL(
-            `https://discord.com/channels/${interaction.guildId}/${primaryChannelId}`,
-          ),
-      );
-    }
-
-    components.push(row);
+  if (interaction?.guildId && primaryChannelId) {
+    buttons.push(
+      new ButtonBuilder()
+        .setStyle(ButtonStyle.Link)
+        .setLabel(parsed.code === "vm" ? "Abrir destino" : "Abrir canal")
+        .setURL(
+          `https://discord.com/channels/${interaction.guildId}/${primaryChannelId}`,
+        ),
+    );
   }
 
-  await interaction.reply({
-    embeds: [embed],
-    components,
-    flags: MessageFlags.Ephemeral,
-    allowedMentions: { parse: [] },
-  });
+  await interaction.reply(
+    buildSecurityLogPayload({
+      color: 0x7b9cff,
+      title: buildSecurityLogDetailsTitle(parsed),
+      description: logUrl
+        ? "Abrir a mensagem original ou navegar direto para o canal relacionado."
+        : "Informacoes adicionais desta log de seguranca.",
+      fields: buildSecurityLogDetailsFields(parsed),
+      buttonRows: buildActionRowsFromButtons(buttons),
+      flags: MessageFlags.Ephemeral | MessageFlags.IsComponentsV2,
+    }),
+  );
 
   return true;
 }
