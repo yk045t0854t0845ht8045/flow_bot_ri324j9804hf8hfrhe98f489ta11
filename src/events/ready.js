@@ -6,6 +6,7 @@ const {
 const { startDirectMessageQueueWorker } = require("../services/directMessageQueueService");
 const { primeInviteCacheForClient } = require("../utils/inviteTracker");
 const { syncSlashCommandsForClient } = require("../services/slashCommandSyncService");
+const { startVoicePresence } = require("../services/voicePresenceService");
 const { env } = require("../config/env");
 
 module.exports = {
@@ -70,6 +71,12 @@ module.exports = {
       await primeInviteCacheForClient(client);
     } catch (error) {
       console.error("[invite-cache]", error);
+    }
+
+    try {
+      startVoicePresence(client);
+    } catch (error) {
+      console.error("[voice-presence]", error);
     }
 
     setInterval(async () => {

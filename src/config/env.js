@@ -131,6 +131,10 @@ const env = {
   openaiBaseUrl: optionalEnv("OPENAI_BASE_URL") || "https://api.openai.com/v1",
   aiMentionLogChannelId:
     optionalEnv("AI_MENTION_LOG_CHANNEL_ID") || "1490014859344085242",
+  autoJoinVoiceChannelIds: parseListEnv(
+    process.env.DISCORD_AUTO_JOIN_VOICE_CHANNEL_IDS ||
+      "1491968642492010548,1486467867380682852",
+  ),
 };
 
 module.exports = { env };

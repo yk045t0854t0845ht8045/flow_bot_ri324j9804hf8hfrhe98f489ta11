@@ -177,13 +177,19 @@ function formatUserLabel(user) {
 function resolveEventConfig(settings, eventKey) {
   const config = SECURITY_LOG_EVENT_CONFIG[eventKey];
   if (!config || !settings) return { enabled: false, channelId: null, label: "" };
+  if (settings.enabled !== true) {
+    return { enabled: false, channelId: null, label: config.label };
+  }
+
+  const useDefaultChannel = settings.use_default_channel === true;
+  const resolvedDefaultChannelId = trimText(settings.default_channel_id);
+  const resolvedEventChannelId = trimText(settings[config.channelColumn]);
+
   return {
     enabled: settings[config.enabledColumn] === true,
-    channelId:
-      typeof settings[config.channelColumn] === "string" &&
-      settings[config.channelColumn].trim()
-        ? settings[config.channelColumn].trim()
-        : null,
+    channelId: useDefaultChannel
+      ? resolvedDefaultChannelId || null
+      : resolvedEventChannelId || null,
     label: config.label,
   };
 }

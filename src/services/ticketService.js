@@ -455,6 +455,29 @@ async function ensureGuildRuntimeOrReply(interaction) {
 }
 
 async function showOpenTicketReasonModal(interaction) {
+  if (!interaction.inGuild()) {
+    await replyWithTicketMessage(
+      interaction,
+      {
+        title: "Servidor obrigatorio",
+        message: "Este bot funciona apenas dentro de servidores.",
+        tone: "warning",
+      },
+    );
+    return;
+  }
+
+  const runtime = await ensureGuildRuntimeOrReply(interaction);
+  if (!runtime) return;
+
+  if (!runtime.licenseUsable || runtime.settings.enabled !== true) {
+    await replyWithTicketPayload(
+      interaction,
+      buildTicketDisabledInteractionPayload(runtime),
+    );
+    return;
+  }
+
   const modal = new ModalBuilder()
     .setCustomId(CUSTOM_IDS.openTicketReasonModal)
     .setTitle("Abrir atendimento");
@@ -491,10 +514,10 @@ async function openTicketFromInteraction(interaction, openedReason = "") {
   const runtime = await ensureGuildRuntimeOrReply(interaction);
   if (!runtime) return;
 
-  if (!runtime.licenseUsable) {
+  if (!runtime.licenseUsable || runtime.settings.enabled !== true) {
     await replyWithTicketPayload(
       interaction,
-      buildTicketDisabledInteractionPayload(),
+      buildTicketDisabledInteractionPayload(runtime),
     );
     return;
   }

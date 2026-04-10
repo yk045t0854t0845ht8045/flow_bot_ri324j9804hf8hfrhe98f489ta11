@@ -538,7 +538,7 @@ async function getGuildTicketSettings(guildId) {
   const result = await supabase
     .from(TICKET_SETTINGS_TABLE)
     .select(
-      "guild_id, menu_channel_id, tickets_category_id, logs_created_channel_id, logs_closed_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, updated_at",
+      "guild_id, enabled, menu_channel_id, tickets_category_id, logs_created_channel_id, logs_closed_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, updated_at",
     )
     .eq("guild_id", guildId)
     .maybeSingle();
@@ -586,7 +586,7 @@ async function getGuildSecurityLogsSettings(guildId) {
   const result = await supabase
     .from(SECURITY_LOGS_SETTINGS_TABLE)
     .select(
-      "guild_id, nickname_change_enabled, nickname_change_channel_id, avatar_change_enabled, avatar_change_channel_id, voice_join_enabled, voice_join_channel_id, voice_leave_enabled, voice_leave_channel_id, message_delete_enabled, message_delete_channel_id, message_edit_enabled, message_edit_channel_id, member_ban_enabled, member_ban_channel_id, member_unban_enabled, member_unban_channel_id, member_kick_enabled, member_kick_channel_id, member_timeout_enabled, member_timeout_channel_id, voice_move_enabled, voice_move_channel_id, updated_at",
+      "guild_id, enabled, use_default_channel, default_channel_id, nickname_change_enabled, nickname_change_channel_id, avatar_change_enabled, avatar_change_channel_id, voice_join_enabled, voice_join_channel_id, voice_leave_enabled, voice_leave_channel_id, message_delete_enabled, message_delete_channel_id, message_edit_enabled, message_edit_channel_id, member_ban_enabled, member_ban_channel_id, member_unban_enabled, member_unban_channel_id, member_kick_enabled, member_kick_channel_id, member_timeout_enabled, member_timeout_channel_id, voice_move_enabled, voice_move_channel_id, updated_at",
     )
     .eq("guild_id", guildId)
     .maybeSingle();
@@ -800,7 +800,7 @@ async function getConfiguredTicketGuildRuntimes() {
     supabase
       .from(TICKET_SETTINGS_TABLE)
       .select(
-        "guild_id, menu_channel_id, tickets_category_id, logs_created_channel_id, logs_closed_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, updated_at",
+        "guild_id, enabled, menu_channel_id, tickets_category_id, logs_created_channel_id, logs_closed_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, updated_at",
       ),
     supabase
       .from(TICKET_STAFF_SETTINGS_TABLE)

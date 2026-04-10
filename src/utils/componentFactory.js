@@ -7,7 +7,11 @@ const DEFAULT_TICKET_PANEL_DESCRIPTION =
 const DEFAULT_TICKET_PANEL_BUTTON_LABEL = "Abrir ticket";
 
 const DISABLED_TICKET_MESSAGE =
-  "O sistema de tickets esta desligado por falta de pagamento.\nContate a administracao caso ache que isso e um erro e informe a **Flowdesk**.";
+  "O sistema de tickets esta indisponivel neste servidor no momento.\nContate a administracao caso ache que isso e um erro e informe a **Flowdesk**.";
+const TICKET_MODULE_DISABLED_MESSAGE =
+  "A abertura de tickets foi desativada pela administracao deste servidor no momento.\nTente novamente mais tarde ou fale com a equipe responsavel.";
+const TICKET_LICENSE_UNAVAILABLE_MESSAGE =
+  "O sistema de tickets nao pode abrir atendimentos neste servidor agora porque a licenca do modulo esta indisponivel no momento.\nContate a administracao caso ache que isso e um erro e informe a **Flowdesk**.";
 
 const COMPONENT_TYPE = {
   ACTION_ROW: 1,
@@ -832,7 +836,73 @@ function buildWelcomeMessagePayload({
   };
 }
 
-function buildTicketSystemDisabledPayload() {
+function buildTicketSystemDisabledPayload(input = {}) {
+  const reason = trimText(input.reason) || "system_unavailable";
+
+  if (reason === "module_disabled") {
+    return {
+      flags: MessageFlags.IsComponentsV2,
+      components: [
+        {
+          type: COMPONENT_TYPE.CONTAINER,
+          accent_color: resolveTicketMessageToneColor("warning"),
+          components: [
+            {
+              type: COMPONENT_TYPE.TEXT_DISPLAY,
+              content: [
+                "### Ticket desativado no momento",
+                TICKET_MODULE_DISABLED_MESSAGE,
+              ].join("\n\n"),
+            },
+            {
+              type: COMPONENT_TYPE.SEPARATOR,
+              spacing: SeparatorSpacingSize.Small,
+              divider: true,
+            },
+            {
+              type: COMPONENT_TYPE.TEXT_DISPLAY,
+              content:
+                "-# O Flowdesk respeita essa configuracao automaticamente e bloqueia novas aberturas ate o modulo ser reativado.",
+            },
+          ],
+        },
+      ],
+      allowedMentions: { parse: [] },
+    };
+  }
+
+  if (reason === "license_unavailable") {
+    return {
+      flags: MessageFlags.IsComponentsV2,
+      components: [
+        {
+          type: COMPONENT_TYPE.CONTAINER,
+          accent_color: resolveTicketMessageToneColor("error"),
+          components: [
+            {
+              type: COMPONENT_TYPE.TEXT_DISPLAY,
+              content: [
+                "### Sistema indisponivel",
+                TICKET_LICENSE_UNAVAILABLE_MESSAGE,
+              ].join("\n\n"),
+            },
+            {
+              type: COMPONENT_TYPE.SEPARATOR,
+              spacing: SeparatorSpacingSize.Small,
+              divider: true,
+            },
+            {
+              type: COMPONENT_TYPE.TEXT_DISPLAY,
+              content:
+                "-# Assim que a administracao regularizar o modulo no painel, a abertura de tickets volta a funcionar automaticamente.",
+            },
+          ],
+        },
+      ],
+      allowedMentions: { parse: [] },
+    };
+  }
+
   return buildTicketSimpleMessagePayload({
     title: "Sistema indisponivel",
     message: DISABLED_TICKET_MESSAGE,

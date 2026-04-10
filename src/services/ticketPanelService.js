@@ -46,7 +46,11 @@ async function fetchExistingTicketPanelMessage(channel, storedMessageId = null) 
       .fetch(storedMessageId)
       .catch(() => null);
 
-    if (storedMessage && messageLooksLikeTicketPanel(storedMessage)) {
+    if (
+      storedMessage &&
+      storedMessage.author?.bot &&
+      storedMessage.author.id === storedMessage.client.user.id
+    ) {
       return storedMessage;
     }
   }
@@ -82,9 +86,18 @@ async function syncTicketPanelForRuntime(client, runtime) {
     return { status: "skipped", reason: "channel_unavailable" };
   }
 
-  const payload = buildTicketPanelPayload({
-    settings: runtime.settings,
-  });
+  const payload =
+    runtime.settings.enabled === true && runtime.licenseUsable
+      ? buildTicketPanelPayload({
+          settings: runtime.settings,
+        })
+      : buildTicketSystemDisabledPayload({
+          reason:
+            runtime.settings.enabled !== true
+              ? "module_disabled"
+              : "license_unavailable",
+          accentColor: env.accentColor,
+        });
 
   const existingMessage = await fetchExistingTicketPanelMessage(
     channel,
@@ -162,8 +175,12 @@ async function ensureTicketPanels(client) {
   }
 }
 
-function buildTicketDisabledInteractionPayload() {
+function buildTicketDisabledInteractionPayload(runtime = null) {
   return buildTicketSystemDisabledPayload({
+    reason:
+      runtime?.settings?.enabled !== true
+        ? "module_disabled"
+        : "license_unavailable",
     accentColor: env.accentColor,
   });
 }
