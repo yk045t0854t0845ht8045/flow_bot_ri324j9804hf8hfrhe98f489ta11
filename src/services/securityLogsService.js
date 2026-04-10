@@ -1,14 +1,11 @@
 const {
+  ActionRowBuilder,
   AttachmentBuilder,
   AuditLogEvent,
-  ContainerBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   EmbedBuilder,
-  MediaGalleryBuilder,
-  MediaGalleryItemBuilder,
   MessageFlags,
-  SeparatorBuilder,
-  SeparatorSpacingSize,
-  TextDisplayBuilder,
 } = require("discord.js");
 const { calculateUserDefaultAvatarIndex } = require("@discordjs/rest");
 const { getGuildSecurityLogsRuntime } = require("./supabaseService");
@@ -23,6 +20,7 @@ const voiceStateSnapshotCache = new Map();
 const DEFAULT_AUDIT_RETRY_DELAYS_MS = [0, 1_200, 1_400, 1_600];
 const KICK_AUDIT_RETRY_DELAYS_MS = [0, 1_000, 1_500, 2_200, 3_200];
 const RECENT_EVENT_TTL_MS = 20_000;
+const SECURITY_LOG_DETAILS_PREFIX = "securitylog:details:";
 
 let canvasModuleResolved = false;
 let canvasModule = null;
@@ -272,6 +270,7 @@ async function resolveAuditEntry(guild, input) {
     predicate = null,
     retryDelaysMs = DEFAULT_AUDIT_RETRY_DELAYS_MS,
     limit = 12,
+    allowUnknownTarget = false,
   } = input;
 
   if (!guild) return null;
@@ -287,21 +286,32 @@ async function resolveAuditEntry(guild, input) {
     }
 
     const now = Date.now();
+    let fallbackUnknownTargetEntry = null;
     for (const entry of logs.entries.values()) {
       if (!entry?.executor?.id) continue;
       if (typeof entry.createdTimestamp !== "number") continue;
       if (now - entry.createdTimestamp > maxAgeMs) continue;
 
       const entryTargetId = resolveAuditEntryTargetId(entry);
-      if (targetId && entryTargetId !== targetId) {
-        continue;
-      }
-
       if (typeof predicate === "function" && !predicate(entry)) {
         continue;
       }
 
-      return entry;
+      if (!targetId) {
+        return entry;
+      }
+
+      if (entryTargetId === targetId) {
+        return entry;
+      }
+
+      if (!entryTargetId && allowUnknownTarget && !fallbackUnknownTargetEntry) {
+        fallbackUnknownTargetEntry = entry;
+      }
+    }
+
+    if (fallbackUnknownTargetEntry) {
+      return fallbackUnknownTargetEntry;
     }
   }
 
@@ -458,6 +468,188 @@ function hasAuditChangeKey(entry, keys) {
   );
 }
 
+function encodeButtonValue(value) {
+  const normalized = trimText(String(value || ""));
+  return normalized || "0";
+}
+
+function decodeButtonValue(value) {
+  const normalized = trimText(String(value || ""));
+  return normalized && normalized !== "0" ? normalized : null;
+}
+
+function buildSecurityLogDetailsCustomId(eventKey, context = {}) {
+  const targetId = encodeButtonValue(context.targetId);
+  const actorId = encodeButtonValue(context.actorId);
+  const channelId = encodeButtonValue(context.channelId);
+  const oldChannelId = encodeButtonValue(context.oldChannelId);
+  const newChannelId = encodeButtonValue(context.newChannelId);
+  const scope = encodeButtonValue(context.scope);
+  const state = encodeButtonValue(context.state);
+  const until = Number.isFinite(context.untilTimestamp)
+    ? Math.max(0, Math.trunc(context.untilTimestamp)).toString(36)
+    : "0";
+
+  switch (eventKey) {
+    case "avatarChange":
+      return `${SECURITY_LOG_DETAILS_PREFIX}av:${targetId}:${scope}`;
+    case "nicknameChange":
+      return `${SECURITY_LOG_DETAILS_PREFIX}nn:${targetId}`;
+    case "voiceJoin":
+      return `${SECURITY_LOG_DETAILS_PREFIX}vj:${targetId}:${channelId}`;
+    case "voiceLeave":
+      return `${SECURITY_LOG_DETAILS_PREFIX}vl:${targetId}:${channelId}`;
+    case "voiceMove":
+      return `${SECURITY_LOG_DETAILS_PREFIX}vm:${targetId}:${actorId}:${oldChannelId}:${newChannelId}`;
+    case "voiceMute":
+      return `${SECURITY_LOG_DETAILS_PREFIX}vt:${targetId}:${actorId}:${channelId}:${state}`;
+    case "messageDelete":
+      return `${SECURITY_LOG_DETAILS_PREFIX}md:${targetId}:${channelId}`;
+    case "messageEdit":
+      return `${SECURITY_LOG_DETAILS_PREFIX}me:${targetId}:${channelId}`;
+    case "memberBan":
+      return `${SECURITY_LOG_DETAILS_PREFIX}mb:${targetId}:${actorId}`;
+    case "memberUnban":
+      return `${SECURITY_LOG_DETAILS_PREFIX}mu:${targetId}:${actorId}`;
+    case "memberKick":
+      return `${SECURITY_LOG_DETAILS_PREFIX}mk:${targetId}:${actorId}`;
+    case "memberTimeout":
+      return `${SECURITY_LOG_DETAILS_PREFIX}mt:${targetId}:${actorId}:${until}`;
+    default:
+      return null;
+  }
+}
+
+function parseSecurityLogDetailsCustomId(customId) {
+  const normalized = trimText(customId);
+  if (!normalized.startsWith(SECURITY_LOG_DETAILS_PREFIX)) {
+    return null;
+  }
+
+  const body = normalized.slice(SECURITY_LOG_DETAILS_PREFIX.length);
+  const parts = body.split(":");
+  const code = parts.shift() || "";
+
+  switch (code) {
+    case "av":
+      return {
+        code,
+        targetId: decodeButtonValue(parts[0]),
+        scope: decodeButtonValue(parts[1]),
+      };
+    case "nn":
+      return {
+        code,
+        targetId: decodeButtonValue(parts[0]),
+      };
+    case "vj":
+    case "vl":
+    case "md":
+    case "me":
+      return {
+        code,
+        targetId: decodeButtonValue(parts[0]),
+        channelId: decodeButtonValue(parts[1]),
+      };
+    case "vm":
+      return {
+        code,
+        targetId: decodeButtonValue(parts[0]),
+        actorId: decodeButtonValue(parts[1]),
+        oldChannelId: decodeButtonValue(parts[2]),
+        newChannelId: decodeButtonValue(parts[3]),
+      };
+    case "vt":
+      return {
+        code,
+        targetId: decodeButtonValue(parts[0]),
+        actorId: decodeButtonValue(parts[1]),
+        channelId: decodeButtonValue(parts[2]),
+        state: decodeButtonValue(parts[3]),
+      };
+    case "mb":
+    case "mu":
+    case "mk":
+      return {
+        code,
+        targetId: decodeButtonValue(parts[0]),
+        actorId: decodeButtonValue(parts[1]),
+      };
+    case "mt":
+      return {
+        code,
+        targetId: decodeButtonValue(parts[0]),
+        actorId: decodeButtonValue(parts[1]),
+        untilTimestamp:
+          parts[2] && parts[2] !== "0"
+            ? Number.parseInt(parts[2], 36)
+            : null,
+      };
+    default:
+      return null;
+  }
+}
+
+function formatUserReference(userId) {
+  return userId ? `<@${userId}> (\`${userId}\`)` : "Nao identificado";
+}
+
+function formatChannelReference(channelId) {
+  return channelId ? `<#${channelId}> (\`${channelId}\`)` : "Nao identificado";
+}
+
+function buildSecurityLogActionRows(guildId, eventKey, context = {}) {
+  const buttons = [];
+  const detailCustomId = buildSecurityLogDetailsCustomId(eventKey, context);
+
+  if (detailCustomId) {
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId(detailCustomId)
+        .setStyle(ButtonStyle.Secondary)
+        .setLabel("Detalhes"),
+    );
+  }
+
+  const primaryChannelId = trimText(
+    context.newChannelId || context.channelId || "",
+  );
+  if (guildId && primaryChannelId) {
+    buttons.push(
+      new ButtonBuilder()
+        .setStyle(ButtonStyle.Link)
+        .setLabel(eventKey === "voiceMove" ? "Abrir destino" : "Abrir canal")
+        .setURL(`https://discord.com/channels/${guildId}/${primaryChannelId}`),
+    );
+  }
+
+  if (eventKey === "avatarChange") {
+    const oldAvatarUrl = trimText(context.oldAvatarUrl || "");
+    const newAvatarUrl = trimText(context.newAvatarUrl || "");
+
+    if (oldAvatarUrl) {
+      buttons.push(
+        new ButtonBuilder()
+          .setStyle(ButtonStyle.Link)
+          .setLabel("Avatar antigo")
+          .setURL(oldAvatarUrl),
+      );
+    }
+
+    if (newAvatarUrl && buttons.length < 5) {
+      buttons.push(
+        new ButtonBuilder()
+          .setStyle(ButtonStyle.Link)
+          .setLabel("Avatar novo")
+          .setURL(newAvatarUrl),
+      );
+    }
+  }
+
+  if (!buttons.length) return [];
+  return [new ActionRowBuilder().addComponents(buttons.slice(0, 5))];
+}
+
 function formatDurationMs(durationMs) {
   if (!Number.isFinite(durationMs) || durationMs <= 0) {
     return "Menos de 1 minuto";
@@ -486,6 +678,8 @@ async function sendSecurityLog({
   fields = [],
   imageBuffer = null,
   imageName = "security-log.png",
+  thumbnailUrl = null,
+  buttonContext = null,
 }) {
   const config = resolveEventConfig(settings, eventKey);
   if (!config.enabled || !config.channelId) return false;
@@ -494,90 +688,41 @@ async function sendSecurityLog({
   if (!channel) return false;
 
   const safeFields = normalizeSecurityLogFields(fields);
-  const timestampUnix = Math.floor(Date.now() / 1000);
-  const headerTitle = toSnippet(title || config.label, 180);
-  const headerLines = [`## ${headerTitle}`];
-  const metaLines = [];
-  const normalizedDescription = String(description || "").trim();
-
-  if (normalizedDescription) {
-    metaLines.push(`-# ${normalizedDescription}`);
-  }
-  metaLines.push(`-# Registrado em <t:${timestampUnix}:F>`);
-
-  headerLines.push(metaLines.join("\n"));
-
-  const fieldChunks = chunkTextBlocks(
-    safeFields.map((field) => `### ${field.name}\n${field.value}`),
-  );
-
-  const container = new ContainerBuilder()
-    .setAccentColor(color)
-    .addTextDisplayComponents(
-      new TextDisplayBuilder().setContent(headerLines.join("\n\n")),
-    );
-
-  if (fieldChunks.length) {
-    container.addSeparatorComponents(
-      new SeparatorBuilder()
-        .setSpacing(SeparatorSpacingSize.Small)
-        .setDivider(true),
-    );
-
-    for (const chunk of fieldChunks) {
-      container.addTextDisplayComponents(
-        new TextDisplayBuilder().setContent(chunk),
-      );
-    }
-  }
-
-  const payload = {
-    flags: MessageFlags.IsComponentsV2,
-    allowedMentions: { parse: [] },
-    components: [container],
-  };
-
-  if (imageBuffer) {
-    container
-      .addSeparatorComponents(
-        new SeparatorBuilder()
-          .setSpacing(SeparatorSpacingSize.Small)
-          .setDivider(true),
-      )
-      .addMediaGalleryComponents(
-        new MediaGalleryBuilder().addItems(
-          new MediaGalleryItemBuilder().setURL(`attachment://${imageName}`),
-        ),
-      );
-
-    payload.files = [new AttachmentBuilder(imageBuffer, { name: imageName })];
-  }
-
-  const sent = await channel.send(payload).catch(() => null);
-  if (sent) return true;
-
   const embed = new EmbedBuilder()
     .setColor(color)
-    .setTitle(title || config.label)
-    .setDescription(description || "")
+    .setTitle(toSnippet(title || config.label, 180))
     .setTimestamp(new Date());
+  const normalizedDescription = trimText(description || "");
+
+  if (normalizedDescription) {
+    embed.setDescription(normalizedDescription);
+  }
 
   if (safeFields.length) {
     embed.addFields(safeFields);
   }
 
-  const fallbackPayload = {
+  if (thumbnailUrl) {
+    embed.setThumbnail(thumbnailUrl);
+  }
+
+  embed.setFooter({
+    text: "Flowdesk Security Logs",
+  });
+
+  const payload = {
     embeds: [embed],
     allowedMentions: { parse: [] },
+    components: buildSecurityLogActionRows(guild.id, eventKey, buttonContext),
   };
 
   if (imageBuffer) {
     const attachment = new AttachmentBuilder(imageBuffer, { name: imageName });
     embed.setImage(`attachment://${imageName}`);
-    fallbackPayload.files = [attachment];
+    payload.files = [attachment];
   }
 
-  const fallbackSent = await channel.send(fallbackPayload).catch((error) => {
+  const sent = await channel.send(payload).catch((error) => {
     const detail = error instanceof Error ? error.message : "falha ao enviar log";
     console.warn(
       `[security-logs] falha ao enviar log ${eventKey} em guild ${guild.id} canal ${config.channelId}: ${detail}`,
@@ -585,7 +730,188 @@ async function sendSecurityLog({
     return null;
   });
 
-  return Boolean(fallbackSent);
+  return Boolean(sent);
+}
+
+function isSecurityLogButtonInteraction(interaction) {
+  return (
+    interaction?.isButton?.() &&
+    trimText(interaction.customId).startsWith(SECURITY_LOG_DETAILS_PREFIX)
+  );
+}
+
+function buildSecurityLogDetailsFields(parsed) {
+  switch (parsed?.code) {
+    case "av":
+      return [
+        { name: "Usuario", value: formatUserReference(parsed.targetId), inline: true },
+        {
+          name: "Escopo",
+          value:
+            parsed.scope === "global"
+              ? "Avatar global da conta"
+              : "Avatar especifico do servidor",
+          inline: true,
+        },
+      ];
+    case "nn":
+      return [
+        { name: "Usuario", value: formatUserReference(parsed.targetId) },
+      ];
+    case "vj":
+    case "vl":
+      return [
+        { name: "Usuario", value: formatUserReference(parsed.targetId), inline: true },
+        { name: "Canal", value: formatChannelReference(parsed.channelId), inline: true },
+      ];
+    case "vm":
+      return [
+        { name: "Usuario", value: formatUserReference(parsed.targetId), inline: true },
+        { name: "Movido por", value: formatUserReference(parsed.actorId), inline: true },
+        { name: "Canal antigo", value: formatChannelReference(parsed.oldChannelId), inline: true },
+        { name: "Canal novo", value: formatChannelReference(parsed.newChannelId), inline: true },
+      ];
+    case "vt":
+      return [
+        { name: "Usuario", value: formatUserReference(parsed.targetId), inline: true },
+        { name: "Executado por", value: formatUserReference(parsed.actorId), inline: true },
+        { name: "Canal", value: formatChannelReference(parsed.channelId), inline: true },
+        {
+          name: "Estado",
+          value: parsed.state === "muted" ? "Mutado em voz" : "Desmutado em voz",
+          inline: true,
+        },
+      ];
+    case "md":
+    case "me":
+      return [
+        { name: "Autor", value: formatUserReference(parsed.targetId), inline: true },
+        { name: "Canal", value: formatChannelReference(parsed.channelId), inline: true },
+      ];
+    case "mb":
+      return [
+        { name: "Alvo", value: formatUserReference(parsed.targetId), inline: true },
+        { name: "Executado por", value: formatUserReference(parsed.actorId), inline: true },
+      ];
+    case "mu":
+      return [
+        { name: "Alvo", value: formatUserReference(parsed.targetId), inline: true },
+        { name: "Executado por", value: formatUserReference(parsed.actorId), inline: true },
+      ];
+    case "mk":
+      return [
+        { name: "Alvo", value: formatUserReference(parsed.targetId), inline: true },
+        { name: "Executado por", value: formatUserReference(parsed.actorId), inline: true },
+      ];
+    case "mt":
+      return [
+        { name: "Alvo", value: formatUserReference(parsed.targetId), inline: true },
+        { name: "Executado por", value: formatUserReference(parsed.actorId), inline: true },
+        {
+          name: "Silenciado ate",
+          value: parsed.untilTimestamp ? formatDateTime(parsed.untilTimestamp) : "Nao informado",
+        },
+      ];
+    default:
+      return [];
+  }
+}
+
+function buildSecurityLogDetailsTitle(parsed) {
+  switch (parsed?.code) {
+    case "av":
+      return "Detalhes da alteracao de avatar";
+    case "nn":
+      return "Detalhes da alteracao de nickname";
+    case "vj":
+      return "Detalhes da entrada em call";
+    case "vl":
+      return "Detalhes da saida de call";
+    case "vm":
+      return "Detalhes da movimentacao de call";
+    case "vt":
+      return "Detalhes do mute em call";
+    case "md":
+      return "Detalhes da mensagem deletada";
+    case "me":
+      return "Detalhes da mensagem editada";
+    case "mb":
+      return "Detalhes do banimento";
+    case "mu":
+      return "Detalhes do desbanimento";
+    case "mk":
+      return "Detalhes da expulsao";
+    case "mt":
+      return "Detalhes do silenciamento";
+    default:
+      return "Detalhes da log";
+  }
+}
+
+async function handleSecurityLogButtonInteraction(interaction) {
+  const parsed = parseSecurityLogDetailsCustomId(interaction?.customId);
+  if (!parsed) return false;
+
+  const logUrl =
+    interaction?.guildId && interaction?.channelId && interaction?.message?.id
+      ? `https://discord.com/channels/${interaction.guildId}/${interaction.channelId}/${interaction.message.id}`
+      : null;
+  const primaryChannelId =
+    parsed.newChannelId || parsed.channelId || parsed.oldChannelId || null;
+  const embed = new EmbedBuilder()
+    .setColor(0x7b9cff)
+    .setTitle(buildSecurityLogDetailsTitle(parsed))
+    .setDescription(
+      logUrl
+        ? `[Abrir mensagem da log](${logUrl})`
+        : "Informacoes adicionais desta log de seguranca.",
+    )
+    .setTimestamp(
+      interaction?.message?.createdTimestamp
+        ? new Date(interaction.message.createdTimestamp)
+        : new Date(),
+    );
+
+  const fields = normalizeSecurityLogFields(buildSecurityLogDetailsFields(parsed));
+  if (fields.length) {
+    embed.addFields(fields);
+  }
+
+  const components = [];
+  if (logUrl || (interaction?.guildId && primaryChannelId)) {
+    const row = new ActionRowBuilder();
+
+    if (logUrl) {
+      row.addComponents(
+        new ButtonBuilder()
+          .setStyle(ButtonStyle.Link)
+          .setLabel("Abrir log")
+          .setURL(logUrl),
+      );
+    }
+
+    if (interaction?.guildId && primaryChannelId) {
+      row.addComponents(
+        new ButtonBuilder()
+          .setStyle(ButtonStyle.Link)
+          .setLabel(parsed.code === "vm" ? "Abrir destino" : "Abrir canal")
+          .setURL(
+            `https://discord.com/channels/${interaction.guildId}/${primaryChannelId}`,
+          ),
+      );
+    }
+
+    components.push(row);
+  }
+
+  await interaction.reply({
+    embeds: [embed],
+    components,
+    flags: MessageFlags.Ephemeral,
+    allowedMentions: { parse: [] },
+  });
+
+  return true;
 }
 
 function drawRoundedRect(context, x, y, width, height, radius) {
@@ -757,6 +1083,12 @@ async function dispatchGuildMemberAvatarChange({
     description: `Usuario: ${formatMemberLabel(newMember || oldMember || { id: userId })}`,
     imageBuffer: comparisonImage,
     imageName: `avatar-guild-compare-${userId}.png`,
+    buttonContext: {
+      targetId: userId,
+      scope: "server",
+      oldAvatarUrl,
+      newAvatarUrl,
+    },
   });
 
   return true;
@@ -834,6 +1166,12 @@ async function dispatchGlobalAvatarChange({
       description: `Usuario: ${formatMemberLabel(member)}`,
       imageBuffer: comparisonImage,
       imageName: `avatar-global-compare-${userId}.png`,
+      buttonContext: {
+        targetId: userId,
+        scope: "global",
+        oldAvatarUrl,
+        newAvatarUrl,
+      },
     });
     handled = true;
   }
@@ -869,16 +1207,20 @@ async function handleNicknameOrAvatarUpdate(oldMember, newMember) {
         color: 0x6a9cff,
         title: "Nickname alterado",
         description: `Usuario: ${formatMemberLabel(newMember)}`,
-        fields: [
-          {
-            name: "Nickname antigo",
-            value: beforeNick || "(sem nickname)",
+        thumbnailUrl: resolveStaticMemberAvatarUrl(newMember),
+      fields: [
+        {
+          name: "Nickname antigo",
+          value: beforeNick || "(sem nickname)",
           },
           {
             name: "Nickname novo",
             value: afterNick || "(sem nickname)",
           },
         ],
+        buttonContext: {
+          targetId: newMember.id,
+        },
       });
     }
   }
@@ -960,6 +1302,12 @@ async function handleNicknameOrAvatarUpdate(oldMember, newMember) {
               value: reason || "Nao informado",
             },
           ],
+          thumbnailUrl: resolveStaticMemberAvatarUrl(newMember),
+          buttonContext: {
+            targetId: newMember.id,
+            actorId: executor?.id || null,
+            untilTimestamp: afterTimeout,
+          },
         });
       }
     }
@@ -1119,7 +1467,12 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
       color: 0x53c46f,
       title: "Entrou em canal de voz",
       description: `Usuario: ${memberLabel}`,
+      thumbnailUrl: resolveStaticMemberAvatarUrl(newState.member),
       fields: [{ name: "Canal", value: `<#${newChannel.id}>` }],
+      buttonContext: {
+        targetId: newState.id,
+        channelId: newChannel.id,
+      },
     });
     handled = true;
   }
@@ -1132,7 +1485,12 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
       color: 0xff9b6a,
       title: "Saiu de canal de voz",
       description: `Usuario: ${memberLabel}`,
+      thumbnailUrl: resolveStaticMemberAvatarUrl(oldState.member),
       fields: [{ name: "Canal anterior", value: `<#${oldChannel.id}>` }],
+      buttonContext: {
+        targetId: newState.id,
+        channelId: oldChannel.id,
+      },
     });
     handled = true;
   }
@@ -1144,7 +1502,9 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
         type: AuditLogEvent.MemberMove,
         targetId: newState.id,
         maxAgeMs: 45_000,
-        retryDelaysMs: [0, 450, 850],
+        retryDelaysMs: [0, 650, 1_000, 1_600],
+        limit: 20,
+        allowUnknownTarget: true,
         predicate: (entry) => {
           const auditChannelId = entry?.extra?.channel?.id;
           return (
@@ -1176,6 +1536,7 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
             ? "Membro movido de call"
             : "Membro trocou de canal de voz",
           description: `Usuario: ${memberLabel}`,
+          thumbnailUrl: resolveStaticMemberAvatarUrl(newState.member || oldState.member),
           fields: [
             { name: "Canal antigo", value: `<#${oldChannel.id}>`, inline: true },
             { name: "Canal novo", value: `<#${newChannel.id}>`, inline: true },
@@ -1190,6 +1551,12 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
               value: reason || "Nao informado",
             },
           ],
+          buttonContext: {
+            targetId: newState.id,
+            actorId: executor?.id || null,
+            oldChannelId: oldChannel.id,
+            newChannelId: newChannel.id,
+          },
         });
         handled = true;
       }
@@ -1208,7 +1575,8 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
         type: AuditLogEvent.MemberUpdate,
         targetId: newState.id,
         maxAgeMs: 45_000,
-        retryDelaysMs: [0, 450, 850],
+        retryDelaysMs: [0, 650, 1_000, 1_600],
+        limit: 20,
         predicate: (entry) => hasAuditChangeKey(entry, ["mute"]),
       });
       const executor = muteAuditEntry?.executor || null;
@@ -1232,6 +1600,7 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
             ? "Membro mutado na call"
             : "Membro desmutado na call",
           description: `Usuario: ${memberLabel}`,
+          thumbnailUrl: resolveStaticMemberAvatarUrl(newState.member || oldState.member),
           fields: [
             {
               name: "Canal",
@@ -1248,6 +1617,12 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
               value: reason || "Nao informado",
             },
           ],
+          buttonContext: {
+            targetId: newState.id,
+            actorId: executor?.id || null,
+            channelId: currentChannel?.id || null,
+            state: newServerMute ? "muted" : "unmuted",
+          },
         });
         handled = true;
       }
@@ -1283,6 +1658,7 @@ async function handleMessageDeleteSecurityLog(message) {
     color: 0xe08989,
     title: "Mensagem deletada",
     description: `Autor: ${authorLabel}`,
+    thumbnailUrl: resolveStaticUserAvatarUrl(message.author),
     fields: [
       {
         name: "Canal",
@@ -1294,6 +1670,10 @@ async function handleMessageDeleteSecurityLog(message) {
         value: toCodeBlock(message.content, 700),
       },
     ],
+    buttonContext: {
+      targetId: message.author?.id || null,
+      channelId: message.channelId || null,
+    },
   });
 
   return true;
@@ -1321,6 +1701,7 @@ async function handleMessageEditSecurityLog(oldMessage, newMessage) {
     color: 0x69b7ff,
     title: "Mensagem editada",
     description: `Autor: ${author ? formatUserLabel(author) : "Nao identificado"}`,
+    thumbnailUrl: resolveStaticUserAvatarUrl(author),
     fields: [
       {
         name: "Canal",
@@ -1339,6 +1720,10 @@ async function handleMessageEditSecurityLog(oldMessage, newMessage) {
         value: toCodeBlock(newContent || "(indisponivel)", 520),
       },
     ],
+    buttonContext: {
+      targetId: author?.id || null,
+      channelId: newMessage?.channelId || oldMessage?.channelId || null,
+    },
   });
 
   return true;
@@ -1367,6 +1752,7 @@ async function handleGuildBanAddSecurityLog(ban) {
     color: 0xe86363,
     title: "Membro banido",
     description: `Alvo: ${formatUserLabel(user)}`,
+    thumbnailUrl: resolveStaticUserAvatarUrl(user),
     fields: [
       {
         name: "Executado por",
@@ -1377,6 +1763,10 @@ async function handleGuildBanAddSecurityLog(ban) {
         value: reason || "Nao informado",
       },
     ],
+    buttonContext: {
+      targetId: user.id,
+      actorId: executor?.id || null,
+    },
   });
 
   return true;
@@ -1405,6 +1795,7 @@ async function handleGuildBanRemoveSecurityLog(ban) {
     color: 0x6ac985,
     title: "Membro desbanido",
     description: `Alvo: ${formatUserLabel(user)}`,
+    thumbnailUrl: resolveStaticUserAvatarUrl(user),
     fields: [
       {
         name: "Executado por",
@@ -1415,6 +1806,10 @@ async function handleGuildBanRemoveSecurityLog(ban) {
         value: reason || "Nao informado",
       },
     ],
+    buttonContext: {
+      targetId: user.id,
+      actorId: executor?.id || null,
+    },
   });
 
   return true;
@@ -1452,6 +1847,7 @@ async function handleMemberRemoveSecurityLog(member) {
     color: 0xff9c5f,
     title: "Membro expulso",
     description: `Alvo: ${formatMemberLabel(member)}`,
+    thumbnailUrl: resolveStaticMemberAvatarUrl(member),
     fields: [
       {
         name: "Executado por",
@@ -1464,6 +1860,10 @@ async function handleMemberRemoveSecurityLog(member) {
         value: trimText(kickAuditEntry.reason || "") || "Nao informado",
       },
     ],
+    buttonContext: {
+      targetId: member.id,
+      actorId: kickAuditEntry.executor?.id || null,
+    },
   });
 
   return true;
@@ -1477,6 +1877,8 @@ module.exports = {
   handleMessageEditSecurityLog,
   handleNicknameOrAvatarUpdate,
   handleRawSecurityPacket,
+  handleSecurityLogButtonInteraction,
   handleUserAvatarUpdate,
   handleVoiceStateSecurityLog,
+  isSecurityLogButtonInteraction,
 };

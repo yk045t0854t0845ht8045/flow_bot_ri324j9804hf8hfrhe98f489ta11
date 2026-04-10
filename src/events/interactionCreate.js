@@ -15,6 +15,10 @@ const {
   showMemberTicketPanelFromInteraction,
   showStaffTicketPanelFromInteraction,
 } = require("../services/ticketService");
+const {
+  handleSecurityLogButtonInteraction,
+  isSecurityLogButtonInteraction,
+} = require("../services/securityLogsService");
 
 function isTicketButtonInteraction(interaction) {
   return (
@@ -88,6 +92,11 @@ module.exports = {
       }
 
       if (!interaction.isButton()) return;
+
+      if (isSecurityLogButtonInteraction(interaction)) {
+        await handleSecurityLogButtonInteraction(interaction);
+        return;
+      }
 
       if (
         interaction.customId === CUSTOM_IDS.openTicket &&
