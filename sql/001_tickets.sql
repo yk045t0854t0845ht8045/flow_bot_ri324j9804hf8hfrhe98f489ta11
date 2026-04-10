@@ -1,4 +1,17 @@
-create type public.ticket_status as enum ('open', 'closed');
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_type type_def
+    join pg_namespace namespace_def
+      on namespace_def.oid = type_def.typnamespace
+    where type_def.typname = 'ticket_status'
+      and namespace_def.nspname = 'public'
+  ) then
+    create type public.ticket_status as enum ('open', 'closed');
+  end if;
+end
+$$;
 
 create table if not exists public.tickets (
   id bigint generated always as identity primary key,

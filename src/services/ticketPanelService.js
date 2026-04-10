@@ -10,6 +10,65 @@ const {
 } = require("../utils/componentFactory");
 
 let activeTicketPanelSyncPromise = null;
+const ticketPanelSyncState = new Map();
+
+function buildTicketPanelSyncFingerprint(runtime) {
+  return JSON.stringify({
+    licenseUsable: Boolean(runtime?.licenseUsable),
+    licenseStatus: runtime?.licenseStatus || "unknown",
+    enabled: Boolean(runtime?.settings?.enabled),
+    menuChannelId: runtime?.settings?.menu_channel_id || "",
+    panelTitle: runtime?.settings?.panel_title || "",
+    panelDescription: runtime?.settings?.panel_description || "",
+    panelButtonLabel: runtime?.settings?.panel_button_label || "",
+    panelLayout: runtime?.settings?.panel_layout || null,
+  });
+}
+
+function shouldSyncTicketPanel(runtime) {
+  const fingerprint = buildTicketPanelSyncFingerprint(runtime);
+  const cachedState = ticketPanelSyncState.get(runtime.guildId);
+  const now = Date.now();
+
+  if (!cachedState) {
+    return { shouldSync: true, fingerprint };
+  }
+
+  const verificationIntervalMs = Math.max(
+    env.ticketPanelVerificationIntervalMs || 0,
+    env.ticketPanelSyncIntervalMs || 0,
+    15_000,
+  );
+
+  if (cachedState.fingerprint !== fingerprint) {
+    return { shouldSync: true, fingerprint };
+  }
+
+  if (now - cachedState.lastVerifiedAt >= verificationIntervalMs) {
+    return { shouldSync: true, fingerprint };
+  }
+
+  return { shouldSync: false, fingerprint };
+}
+
+function markTicketPanelSyncState(guildId, fingerprint) {
+  ticketPanelSyncState.set(guildId, {
+    fingerprint,
+    lastVerifiedAt: Date.now(),
+  });
+}
+
+function pruneTicketPanelSyncState(runtimes) {
+  const activeGuildIds = new Set(
+    Array.isArray(runtimes) ? runtimes.map((runtime) => runtime.guildId) : [],
+  );
+
+  for (const guildId of ticketPanelSyncState.keys()) {
+    if (!activeGuildIds.has(guildId)) {
+      ticketPanelSyncState.delete(guildId);
+    }
+  }
+}
 
 function walkComponents(components, visitor) {
   if (!Array.isArray(components)) return;
@@ -139,6 +198,7 @@ async function ensureTicketPanels(client) {
     const runtimes = await getConfiguredTicketGuildRuntimes();
     const applied = [];
     const skipped = [];
+    pruneTicketPanelSyncState(runtimes);
 
     for (const runtime of runtimes) {
       if (!runtime.isConfigured) {
@@ -146,9 +206,16 @@ async function ensureTicketPanels(client) {
         continue;
       }
 
+      const syncDecision = shouldSyncTicketPanel(runtime);
+      if (!syncDecision.shouldSync) {
+        skipped.push({ guildId: runtime.guildId, reason: "unchanged" });
+        continue;
+      }
+
       try {
         const result = await syncTicketPanelForRuntime(client, runtime);
         if (result.status === "created" || result.status === "updated") {
+          markTicketPanelSyncState(runtime.guildId, syncDecision.fingerprint);
           applied.push(result);
         } else {
           skipped.push({ guildId: runtime.guildId, reason: result.reason });

@@ -120,6 +120,18 @@ const env = {
   openCooldownSeconds: parseNumber(process.env.TICKET_OPEN_COOLDOWN_SECONDS, 120),
   maxOpenTicketsPerUser: parseNumber(process.env.TICKET_MAX_OPEN_PER_USER, 1),
   deleteDelaySeconds: parseNumber(process.env.TICKET_DELETE_DELAY_SECONDS, 8),
+  ticketPanelSyncIntervalMs: parseNumber(
+    process.env.TICKET_PANEL_SYNC_INTERVAL_MS,
+    10_000,
+  ),
+  ticketPanelVerificationIntervalMs: parseNumber(
+    process.env.TICKET_PANEL_VERIFICATION_INTERVAL_MS,
+    180_000,
+  ),
+  ticketOpenMessageSyncIntervalMs: parseNumber(
+    process.env.TICKET_OPEN_MESSAGE_SYNC_INTERVAL_MS,
+    60_000,
+  ),
   accentColor: parseAccentColor(process.env.TICKET_ACCENT_COLOR),
   panelTitle: process.env.TICKET_PANEL_TITLE || "Central de Atendimento",
   panelDescription:

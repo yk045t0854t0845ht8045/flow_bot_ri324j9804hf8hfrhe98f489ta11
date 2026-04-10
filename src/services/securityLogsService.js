@@ -451,6 +451,47 @@ function rememberVoiceStateSnapshot(guildId, userId, snapshot) {
   });
 }
 
+function resolveVoiceStateBoolean(...candidates) {
+  for (const candidate of candidates) {
+    if (typeof candidate === "boolean") {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function resolveVoiceStateFromCache(member) {
+  if (!member?.voice) return null;
+  return member.voice;
+}
+
+function rememberVoiceStateFromState(voiceState) {
+  if (!voiceState?.guild?.id || !voiceState?.id) return;
+  rememberVoiceStateSnapshot(voiceState.guild.id, voiceState.id, {
+    channelId: voiceState.channelId || null,
+    serverMute:
+      typeof voiceState.serverMute === "boolean" ? voiceState.serverMute : null,
+    serverDeaf:
+      typeof voiceState.serverDeaf === "boolean" ? voiceState.serverDeaf : null,
+  });
+}
+
+function primeVoiceStateSnapshots(client) {
+  if (!client?.guilds?.cache) return 0;
+
+  let primedCount = 0;
+  for (const guild of client.guilds.cache.values()) {
+    for (const voiceState of guild.voiceStates?.cache?.values?.() || []) {
+      if (voiceState?.member?.user?.bot) continue;
+      rememberVoiceStateFromState(voiceState);
+      primedCount += 1;
+    }
+  }
+
+  return primedCount;
+}
+
 function resolveVoiceChannel(guild, channelId, fallbackChannel = null) {
   if (fallbackChannel?.id === channelId) {
     return fallbackChannel;
@@ -473,6 +514,79 @@ function hasAuditChangeKey(entry, keys) {
   return entry.changes.some((change) =>
     allowedKeys.has(String(change?.key || "").toLowerCase()),
   );
+}
+
+function resolveVoiceAuditEntryChannelId(entry) {
+  return trimText(
+    entry?.extra?.channel?.id ||
+      entry?.extra?.channel_id ||
+      entry?.options?.channel?.id ||
+      entry?.options?.channel_id ||
+      "",
+  );
+}
+
+function resolveVoiceAuditEntryCount(entry) {
+  const rawCount = entry?.extra?.count ?? entry?.options?.count ?? null;
+  const normalizedCount = Number(rawCount);
+  return Number.isFinite(normalizedCount) ? normalizedCount : null;
+}
+
+async function resolveVoiceMoveAuditEntry(guild, userId, oldChannelId, newChannelId) {
+  return resolveAuditEntry(guild, {
+    type: AuditLogEvent.MemberMove,
+    targetId: userId,
+    maxAgeMs: 75_000,
+    retryDelaysMs: [0, 900, 1_500, 2_200, 3_200],
+    limit: 30,
+    allowUnknownTarget: true,
+    predicate: (entry) => {
+      const auditChannelId = resolveVoiceAuditEntryChannelId(entry);
+      const auditCount = resolveVoiceAuditEntryCount(entry);
+      return (
+        (!auditChannelId ||
+          auditChannelId === oldChannelId ||
+          auditChannelId === newChannelId) &&
+        (auditCount === null || auditCount >= 1)
+      );
+    },
+  });
+}
+
+async function resolveVoiceMuteAuditEntry(guild, userId, nextMutedState) {
+  const auditEntry =
+    (await resolveAuditEntry(guild, {
+      type: AuditLogEvent.MemberUpdate,
+      targetId: userId,
+      maxAgeMs: 75_000,
+      retryDelaysMs: [0, 900, 1_500, 2_200, 3_200],
+      limit: 30,
+      predicate: (entry) =>
+        hasAuditChangeKey(entry, ["mute", "suppress", "deaf"]),
+    })) ||
+    (await resolveAuditEntry(guild, {
+      type: AuditLogEvent.MemberUpdate,
+      targetId: userId,
+      maxAgeMs: 75_000,
+      retryDelaysMs: [0, 1_200, 2_000, 3_000],
+      limit: 30,
+      predicate: (entry) => {
+        if (!Array.isArray(entry?.changes)) return false;
+        return entry.changes.some((change) => {
+          const changeKey = String(change?.key || "").toLowerCase();
+          if (!["mute", "suppress", "deaf"].includes(changeKey)) return false;
+          const nextValue =
+            typeof change?.new === "boolean"
+              ? change.new
+              : typeof change?.old === "boolean"
+                ? !change.old
+                : null;
+          return nextValue === null || nextValue === nextMutedState;
+        });
+      },
+    }));
+
+  return auditEntry;
 }
 
 function encodeButtonValue(value) {
@@ -1550,18 +1664,32 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
   }
   const settings = runtime.settings;
   const snapshot = getKnownVoiceStateSnapshot(guild.id, newState.id);
-  const oldChannelId = oldState?.channelId ?? snapshot?.channelId ?? null;
+  const cachedVoiceState =
+    resolveVoiceStateFromCache(newState.member) ||
+    resolveVoiceStateFromCache(oldState?.member) ||
+    null;
+  const oldChannelId =
+    oldState?.channelId ??
+    snapshot?.channelId ??
+    (cachedVoiceState?.channelId && cachedVoiceState.channelId !== newState?.channelId
+      ? cachedVoiceState.channelId
+      : null) ??
+    null;
   const newChannelId = newState?.channelId ?? null;
   const oldChannel = resolveVoiceChannel(guild, oldChannelId, oldState?.channel || null);
   const newChannel = resolveVoiceChannel(guild, newChannelId, newState?.channel || null);
-  const oldServerMute =
-    typeof oldState?.serverMute === "boolean"
-      ? oldState.serverMute
-      : typeof snapshot?.serverMute === "boolean"
-        ? snapshot.serverMute
-        : null;
-  const newServerMute =
-    typeof newState?.serverMute === "boolean" ? newState.serverMute : null;
+  const oldServerMute = resolveVoiceStateBoolean(
+    oldState?.serverMute,
+    snapshot?.serverMute,
+    cachedVoiceState &&
+      cachedVoiceState.channelId !== newState?.channelId
+      ? cachedVoiceState.serverMute
+      : null,
+  );
+  const newServerMute = resolveVoiceStateBoolean(
+    newState?.serverMute,
+    cachedVoiceState?.serverMute,
+  );
   const memberLabel = formatMemberLabel(
     newState.member || oldState.member || { id: newState.id },
   );
@@ -1606,22 +1734,12 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
   if (oldChannel && newChannel && oldChannel.id !== newChannel.id) {
     const moveConfig = resolveEventConfig(settings, "voiceMove");
     if (moveConfig.enabled) {
-      const moveAuditEntry = await resolveAuditEntry(guild, {
-        type: AuditLogEvent.MemberMove,
-        targetId: newState.id,
-        maxAgeMs: 45_000,
-        retryDelaysMs: [0, 650, 1_000, 1_600],
-        limit: 20,
-        allowUnknownTarget: true,
-        predicate: (entry) => {
-          const auditChannelId = entry?.extra?.channel?.id;
-          return (
-            !auditChannelId ||
-            auditChannelId === oldChannel.id ||
-            auditChannelId === newChannel.id
-          );
-        },
-      });
+      const moveAuditEntry = await resolveVoiceMoveAuditEntry(
+        guild,
+        newState.id,
+        oldChannel.id,
+        newChannel.id,
+      );
       const executor = moveAuditEntry?.executor || null;
       const reason = trimText(moveAuditEntry?.reason || "");
       const movedByModerator = executor?.id && executor.id !== newState.id;
@@ -1679,17 +1797,15 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
   if (voiceMuteChanged) {
     const muteConfig = resolveEventConfig(settings, "voiceMute");
     if (muteConfig.enabled) {
-      const muteAuditEntry = await resolveAuditEntry(guild, {
-        type: AuditLogEvent.MemberUpdate,
-        targetId: newState.id,
-        maxAgeMs: 45_000,
-        retryDelaysMs: [0, 650, 1_000, 1_600],
-        limit: 20,
-        predicate: (entry) => hasAuditChangeKey(entry, ["mute"]),
-      });
+      const muteAuditEntry = await resolveVoiceMuteAuditEntry(
+        guild,
+        newState.id,
+        newServerMute,
+      );
       const executor = muteAuditEntry?.executor || null;
       const reason = trimText(muteAuditEntry?.reason || "");
       const currentChannel = newChannel || oldChannel;
+      const changedByModerator = executor?.id && executor.id !== newState.id;
       const dedupeKey = [
         "voice-mute",
         guild.id,
@@ -1716,8 +1832,10 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
               inline: true,
             },
             {
-              name: "Executado por",
-              value: executor ? formatUserLabel(executor) : "Nao identificado",
+              name: changedByModerator ? "Executado por" : "Origem da alteracao",
+              value: changedByModerator
+                ? formatUserLabel(executor)
+                : "Alteracao direta do usuario ou auditoria indisponivel",
               inline: true,
             },
             {
@@ -1989,4 +2107,5 @@ module.exports = {
   handleUserAvatarUpdate,
   handleVoiceStateSecurityLog,
   isSecurityLogButtonInteraction,
+  primeVoiceStateSnapshots,
 };

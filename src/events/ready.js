@@ -3,6 +3,7 @@ const {
   syncAllTicketPanels,
   syncOpenTicketControlMessages,
 } = require("../services/ticketService");
+const { primeVoiceStateSnapshots } = require("../services/securityLogsService");
 const { startDirectMessageQueueWorker } = require("../services/directMessageQueueService");
 const { primeInviteCacheForClient } = require("../utils/inviteTracker");
 const { syncSlashCommandsForClient } = require("../services/slashCommandSyncService");
@@ -79,6 +80,15 @@ module.exports = {
       console.error("[voice-presence]", error);
     }
 
+    try {
+      const primedVoiceStates = primeVoiceStateSnapshots(client);
+      if (primedVoiceStates > 0) {
+        console.log(`[security-logs] snapshots de voz inicializados: ${primedVoiceStates}`);
+      }
+    } catch (error) {
+      console.error("[security-logs:prime-voice-states]", error);
+    }
+
     setInterval(async () => {
       try {
         const result = await syncAllTicketPanels(client);
@@ -90,7 +100,9 @@ module.exports = {
       } catch (error) {
         console.error("[ticket-panels]", error);
       }
+    }, env.ticketPanelSyncIntervalMs);
 
+    setInterval(async () => {
       try {
         const result = await syncOpenTicketControlMessages(client);
         if (result.applied.length) {
@@ -101,6 +113,6 @@ module.exports = {
       } catch (error) {
         console.error("[ticket-open-messages]", error);
       }
-    }, 60 * 1000);
+    }, env.ticketOpenMessageSyncIntervalMs);
   },
 };
