@@ -18,9 +18,10 @@ const runtimeCache = new Map();
 const recentEventCache = new Map();
 const globalAvatarSnapshotCache = new Map();
 const guildAvatarSnapshotCache = new Map();
+const voiceStateSnapshotCache = new Map();
 
 const DEFAULT_AUDIT_RETRY_DELAYS_MS = [0, 1_200, 1_400, 1_600];
-const KICK_AUDIT_RETRY_DELAYS_MS = [0, 1_500, 1_800, 2_200, 2_600];
+const KICK_AUDIT_RETRY_DELAYS_MS = [0, 1_000, 1_500, 2_200, 3_200];
 const RECENT_EVENT_TTL_MS = 20_000;
 
 let canvasModuleResolved = false;
@@ -81,6 +82,11 @@ const SECURITY_LOG_EVENT_CONFIG = {
     enabledColumn: "voice_move_enabled",
     channelColumn: "voice_move_channel_id",
     label: "Membro movido de call",
+  },
+  voiceMute: {
+    enabledColumn: "voice_mute_enabled",
+    channelColumn: "voice_mute_channel_id",
+    label: "Mute e desmute em call",
   },
 };
 
@@ -408,6 +414,50 @@ function rememberGuildAvatarHash(guildId, userId, avatarHash) {
   );
 }
 
+function resolveVoiceStateSnapshotKey(guildId, userId) {
+  return `${guildId}:${userId}`;
+}
+
+function getKnownVoiceStateSnapshot(guildId, userId) {
+  if (!guildId || !userId) return null;
+  return voiceStateSnapshotCache.get(resolveVoiceStateSnapshotKey(guildId, userId)) || null;
+}
+
+function rememberVoiceStateSnapshot(guildId, userId, snapshot) {
+  if (!guildId || !userId || !snapshot) return;
+  voiceStateSnapshotCache.set(resolveVoiceStateSnapshotKey(guildId, userId), {
+    channelId: snapshot.channelId || null,
+    serverMute:
+      typeof snapshot.serverMute === "boolean" ? snapshot.serverMute : null,
+    serverDeaf:
+      typeof snapshot.serverDeaf === "boolean" ? snapshot.serverDeaf : null,
+  });
+}
+
+function resolveVoiceChannel(guild, channelId, fallbackChannel = null) {
+  if (fallbackChannel?.id === channelId) {
+    return fallbackChannel;
+  }
+
+  if (!guild || !channelId) return null;
+  return guild.channels?.cache?.get(channelId) || fallbackChannel || null;
+}
+
+function hasAuditChangeKey(entry, keys) {
+  if (!Array.isArray(entry?.changes) || !Array.isArray(keys) || !keys.length) {
+    return false;
+  }
+
+  const allowedKeys = new Set(
+    keys.map((key) => String(key || "").toLowerCase()).filter(Boolean),
+  );
+  if (!allowedKeys.size) return false;
+
+  return entry.changes.some((change) =>
+    allowedKeys.has(String(change?.key || "").toLowerCase()),
+  );
+}
+
 function formatDurationMs(durationMs) {
   if (!Number.isFinite(durationMs) || durationMs <= 0) {
     return "Menos de 1 minuto";
@@ -705,21 +755,6 @@ async function dispatchGuildMemberAvatarChange({
     color: 0x7b9cff,
     title: "Avatar do servidor alterado",
     description: `Usuario: ${formatMemberLabel(newMember || oldMember || { id: userId })}`,
-    fields: [
-      {
-        name: "Escopo",
-        value: "Avatar especifico deste servidor",
-        inline: true,
-      },
-      {
-        name: "Avatar antigo",
-        value: oldAvatarUrl || "(indisponivel)",
-      },
-      {
-        name: "Avatar novo",
-        value: newAvatarUrl || "(indisponivel)",
-      },
-    ],
     imageBuffer: comparisonImage,
     imageName: `avatar-guild-compare-${userId}.png`,
   });
@@ -797,21 +832,6 @@ async function dispatchGlobalAvatarChange({
       color: 0x7b9cff,
       title: "Avatar global alterado",
       description: `Usuario: ${formatMemberLabel(member)}`,
-      fields: [
-        {
-          name: "Escopo",
-          value: "Avatar global da conta do usuario",
-          inline: true,
-        },
-        {
-          name: "Avatar antigo",
-          value: oldAvatarUrl || "(indisponivel)",
-        },
-        {
-          name: "Avatar novo",
-          value: newAvatarUrl || "(indisponivel)",
-        },
-      ],
       imageBuffer: comparisonImage,
       imageName: `avatar-global-compare-${userId}.png`,
     });
@@ -829,8 +849,8 @@ async function handleNicknameOrAvatarUpdate(oldMember, newMember) {
   if (!runtime?.settings) return false;
 
   const settings = runtime.settings;
-  const beforeNick = trimText(oldMember?.nickname || oldMember?.user?.username || "");
-  const afterNick = trimText(newMember.nickname || newMember.user?.username || "");
+  const beforeNick = trimText(oldMember?.nickname || "");
+  const afterNick = trimText(newMember.nickname || "");
   const beforeMemberAvatar = oldMember?.avatar || null;
   const afterMemberAvatar = newMember?.avatar || null;
   let handled = false;
@@ -1062,11 +1082,34 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
   if (newState.member?.user?.bot) return false;
 
   const runtime = await resolveRuntime(guild.id);
-  if (!runtime?.settings) return false;
+  if (!runtime?.settings) {
+    rememberVoiceStateSnapshot(guild.id, newState.id, {
+      channelId: newState?.channelId ?? null,
+      serverMute:
+        typeof newState?.serverMute === "boolean" ? newState.serverMute : null,
+      serverDeaf:
+        typeof newState?.serverDeaf === "boolean" ? newState.serverDeaf : null,
+    });
+    return false;
+  }
   const settings = runtime.settings;
-
-  const oldChannel = oldState?.channel || null;
-  const newChannel = newState?.channel || null;
+  const snapshot = getKnownVoiceStateSnapshot(guild.id, newState.id);
+  const oldChannelId = oldState?.channelId ?? snapshot?.channelId ?? null;
+  const newChannelId = newState?.channelId ?? null;
+  const oldChannel = resolveVoiceChannel(guild, oldChannelId, oldState?.channel || null);
+  const newChannel = resolveVoiceChannel(guild, newChannelId, newState?.channel || null);
+  const oldServerMute =
+    typeof oldState?.serverMute === "boolean"
+      ? oldState.serverMute
+      : typeof snapshot?.serverMute === "boolean"
+        ? snapshot.serverMute
+        : null;
+  const newServerMute =
+    typeof newState?.serverMute === "boolean" ? newState.serverMute : null;
+  const memberLabel = formatMemberLabel(
+    newState.member || oldState.member || { id: newState.id },
+  );
+  let handled = false;
 
   if (!oldChannel && newChannel) {
     await sendSecurityLog({
@@ -1075,12 +1118,10 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
       eventKey: "voiceJoin",
       color: 0x53c46f,
       title: "Entrou em canal de voz",
-      description: `Usuario: ${formatMemberLabel(newState.member || { id: newState.id })}`,
-      fields: [
-        { name: "Canal", value: `<#${newChannel.id}>` },
-      ],
+      description: `Usuario: ${memberLabel}`,
+      fields: [{ name: "Canal", value: `<#${newChannel.id}>` }],
     });
-    return true;
+    handled = true;
   }
 
   if (oldChannel && !newChannel) {
@@ -1090,75 +1131,137 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
       eventKey: "voiceLeave",
       color: 0xff9b6a,
       title: "Saiu de canal de voz",
-      description: `Usuario: ${formatMemberLabel(oldState.member || { id: newState.id })}`,
-      fields: [
-        { name: "Canal anterior", value: `<#${oldChannel.id}>` },
-      ],
+      description: `Usuario: ${memberLabel}`,
+      fields: [{ name: "Canal anterior", value: `<#${oldChannel.id}>` }],
     });
-    return true;
+    handled = true;
   }
 
   if (oldChannel && newChannel && oldChannel.id !== newChannel.id) {
     const moveConfig = resolveEventConfig(settings, "voiceMove");
-    if (!moveConfig.enabled) {
-      return false;
-    }
-
-    const moveAuditEntry = await resolveAuditEntry(guild, {
-      type: AuditLogEvent.MemberMove,
-      targetId: newState.id,
-      maxAgeMs: 35_000,
-      retryDelaysMs: [0, 850, 1_300, 1_900],
-      predicate: (entry) => {
-        const movedToChannelId = entry?.extra?.channel?.id;
-        return !movedToChannelId || movedToChannelId === newChannel.id;
-      },
-    });
-    const executor = moveAuditEntry?.executor || null;
-    const reason = trimText(moveAuditEntry?.reason || "");
-    const movedByModerator =
-      executor?.id && executor.id !== newState.id;
-    const dedupeKey = [
-      "voice-move",
-      guild.id,
-      newState.id,
-      oldChannel.id,
-      newChannel.id,
-      executor?.id || "self",
-    ].join(":");
-
-    if (registerRecentEvent(dedupeKey)) {
-      return false;
-    }
-
-    await sendSecurityLog({
-      guild,
-      settings,
-      eventKey: "voiceMove",
-      color: movedByModerator ? 0x79a6ff : 0x6cb8ff,
-      title: movedByModerator
-        ? "Membro movido de call"
-        : "Membro trocou de canal de voz",
-      description: `Usuario: ${formatMemberLabel(newState.member || { id: newState.id })}`,
-      fields: [
-        { name: "Canal antigo", value: `<#${oldChannel.id}>`, inline: true },
-        { name: "Canal novo", value: `<#${newChannel.id}>`, inline: true },
-        {
-          name: movedByModerator ? "Executado por" : "Origem do movimento",
-          value: movedByModerator
-            ? formatUserLabel(executor)
-            : "Mudanca direta do usuario ou auditoria indisponivel",
+    if (moveConfig.enabled) {
+      const moveAuditEntry = await resolveAuditEntry(guild, {
+        type: AuditLogEvent.MemberMove,
+        targetId: newState.id,
+        maxAgeMs: 45_000,
+        retryDelaysMs: [0, 450, 850],
+        predicate: (entry) => {
+          const auditChannelId = entry?.extra?.channel?.id;
+          return (
+            !auditChannelId ||
+            auditChannelId === oldChannel.id ||
+            auditChannelId === newChannel.id
+          );
         },
-        {
-          name: "Motivo",
-          value: reason || "Nao informado",
-        },
-      ],
-    });
-    return true;
+      });
+      const executor = moveAuditEntry?.executor || null;
+      const reason = trimText(moveAuditEntry?.reason || "");
+      const movedByModerator = executor?.id && executor.id !== newState.id;
+      const dedupeKey = [
+        "voice-move",
+        guild.id,
+        newState.id,
+        oldChannel.id,
+        newChannel.id,
+        executor?.id || "self",
+      ].join(":");
+
+      if (!registerRecentEvent(dedupeKey)) {
+        await sendSecurityLog({
+          guild,
+          settings,
+          eventKey: "voiceMove",
+          color: movedByModerator ? 0x79a6ff : 0x6cb8ff,
+          title: movedByModerator
+            ? "Membro movido de call"
+            : "Membro trocou de canal de voz",
+          description: `Usuario: ${memberLabel}`,
+          fields: [
+            { name: "Canal antigo", value: `<#${oldChannel.id}>`, inline: true },
+            { name: "Canal novo", value: `<#${newChannel.id}>`, inline: true },
+            {
+              name: movedByModerator ? "Executado por" : "Origem do movimento",
+              value: movedByModerator
+                ? formatUserLabel(executor)
+                : "Mudanca direta do usuario ou auditoria indisponivel",
+            },
+            {
+              name: "Motivo",
+              value: reason || "Nao informado",
+            },
+          ],
+        });
+        handled = true;
+      }
+    }
   }
 
-  return false;
+  const voiceMuteChanged =
+    typeof oldServerMute === "boolean" &&
+    typeof newServerMute === "boolean" &&
+    oldServerMute !== newServerMute;
+
+  if (voiceMuteChanged) {
+    const muteConfig = resolveEventConfig(settings, "voiceMute");
+    if (muteConfig.enabled) {
+      const muteAuditEntry = await resolveAuditEntry(guild, {
+        type: AuditLogEvent.MemberUpdate,
+        targetId: newState.id,
+        maxAgeMs: 45_000,
+        retryDelaysMs: [0, 450, 850],
+        predicate: (entry) => hasAuditChangeKey(entry, ["mute"]),
+      });
+      const executor = muteAuditEntry?.executor || null;
+      const reason = trimText(muteAuditEntry?.reason || "");
+      const currentChannel = newChannel || oldChannel;
+      const dedupeKey = [
+        "voice-mute",
+        guild.id,
+        newState.id,
+        oldServerMute ? "muted" : "unmuted",
+        newServerMute ? "muted" : "unmuted",
+      ].join(":");
+
+      if (!registerRecentEvent(dedupeKey)) {
+        await sendSecurityLog({
+          guild,
+          settings,
+          eventKey: "voiceMute",
+          color: newServerMute ? 0xffb24d : 0x63d39a,
+          title: newServerMute
+            ? "Membro mutado na call"
+            : "Membro desmutado na call",
+          description: `Usuario: ${memberLabel}`,
+          fields: [
+            {
+              name: "Canal",
+              value: currentChannel ? `<#${currentChannel.id}>` : "Nao identificado",
+              inline: true,
+            },
+            {
+              name: "Executado por",
+              value: executor ? formatUserLabel(executor) : "Nao identificado",
+              inline: true,
+            },
+            {
+              name: "Motivo",
+              value: reason || "Nao informado",
+            },
+          ],
+        });
+        handled = true;
+      }
+    }
+  }
+
+  rememberVoiceStateSnapshot(guild.id, newState.id, {
+    channelId: newChannelId,
+    serverMute: newServerMute,
+    serverDeaf:
+      typeof newState?.serverDeaf === "boolean" ? newState.serverDeaf : null,
+  });
+
+  return handled;
 }
 
 async function handleMessageDeleteSecurityLog(message) {
@@ -1330,11 +1433,12 @@ async function handleMemberRemoveSecurityLog(member) {
   const kickAuditEntry = await resolveAuditEntry(member.guild, {
     type: AuditLogEvent.MemberKick,
     targetId: member.id,
-    maxAgeMs: 45_000,
+    maxAgeMs: 60_000,
+    limit: 20,
     retryDelaysMs: KICK_AUDIT_RETRY_DELAYS_MS,
   });
 
-  if (!kickAuditEntry?.executor) return false;
+  if (!kickAuditEntry) return false;
 
   const dedupeKey = ["kick", member.guild.id, member.id, kickAuditEntry.id].join(":");
   if (registerRecentEvent(dedupeKey, 30_000)) {
@@ -1351,7 +1455,9 @@ async function handleMemberRemoveSecurityLog(member) {
     fields: [
       {
         name: "Executado por",
-        value: formatUserLabel(kickAuditEntry.executor),
+        value: kickAuditEntry.executor
+          ? formatUserLabel(kickAuditEntry.executor)
+          : "Nao identificado",
       },
       {
         name: "Motivo",

@@ -23,6 +23,8 @@ create table if not exists public.guild_security_logs_settings (
   member_timeout_channel_id text null,
   voice_move_enabled boolean not null default false,
   voice_move_channel_id text null,
+  voice_mute_enabled boolean not null default false,
+  voice_mute_channel_id text null,
   configured_by_user_id bigint not null references public.auth_users(id) on delete restrict,
   created_at timestamptz not null default timezone('utc', now()),
   updated_at timestamptz not null default timezone('utc', now())
