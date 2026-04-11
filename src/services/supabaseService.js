@@ -8,6 +8,8 @@ const TICKET_SETTINGS_TABLE = "guild_ticket_settings";
 const TICKET_STAFF_SETTINGS_TABLE = "guild_ticket_staff_settings";
 const WELCOME_SETTINGS_TABLE = "guild_welcome_settings";
 const ANTILINK_SETTINGS_TABLE = "guild_antilink_settings";
+const AUTOROLE_SETTINGS_TABLE = "guild_autorole_settings";
+const AUTOROLE_QUEUE_TABLE = "guild_autorole_queue";
 const SECURITY_LOGS_SETTINGS_TABLE = "guild_security_logs_settings";
 const PLAN_GUILDS_TABLE = "auth_user_plan_guilds";
 const USER_PLAN_STATE_TABLE = "auth_user_plan_state";
@@ -707,6 +709,131 @@ async function rescheduleTicketDirectMessage(queueId, {
   return unwrap(result, "rescheduleTicketDirectMessage");
 }
 
+function normalizeAutoRoleRequestedSource(value) {
+  return value === "existing_members_sync" ? "existing_members_sync" : "member_join";
+}
+
+async function enqueueGuildAutoRoleQueueItems(queueItems) {
+  const normalizedItems = (queueItems || [])
+    .filter((item) => item && item.guildId && item.memberId && item.dueAt)
+    .map((item) => ({
+      guild_id: item.guildId,
+      member_id: item.memberId,
+      due_at: item.dueAt,
+      status: "pending",
+      attempt_count: 0,
+      requested_source: normalizeAutoRoleRequestedSource(item.requestedSource),
+      last_error: null,
+      processed_at: null,
+    }));
+
+  if (!normalizedItems.length) {
+    return 0;
+  }
+
+  const result = await supabase
+    .from(AUTOROLE_QUEUE_TABLE)
+    .insert(normalizedItems, { returning: "minimal" });
+
+  unwrap(result, "enqueueGuildAutoRoleQueueItems");
+  return normalizedItems.length;
+}
+
+async function getDueGuildAutoRoleQueueItems(limit = 10) {
+  const result = await supabase
+    .from(AUTOROLE_QUEUE_TABLE)
+    .select("*")
+    .eq("status", "pending")
+    .lte("due_at", new Date().toISOString())
+    .order("due_at", { ascending: true })
+    .order("created_at", { ascending: true })
+    .limit(limit);
+
+  return unwrap(result, "getDueGuildAutoRoleQueueItems") || [];
+}
+
+async function markGuildAutoRoleQueueItemProcessing(queueId, { attemptCount }) {
+  const result = await supabase
+    .from(AUTOROLE_QUEUE_TABLE)
+    .update({
+      status: "processing",
+      attempt_count: attemptCount,
+      last_error: null,
+    })
+    .eq("id", queueId)
+    .select("*")
+    .single();
+
+  return unwrap(result, "markGuildAutoRoleQueueItemProcessing");
+}
+
+async function markGuildAutoRoleQueueItemCompleted(queueId) {
+  const result = await supabase
+    .from(AUTOROLE_QUEUE_TABLE)
+    .update({
+      status: "completed",
+      processed_at: new Date().toISOString(),
+      last_error: null,
+    })
+    .eq("id", queueId)
+    .select("*")
+    .single();
+
+  return unwrap(result, "markGuildAutoRoleQueueItemCompleted");
+}
+
+async function markGuildAutoRoleQueueItemCancelled(queueId, { lastError }) {
+  const result = await supabase
+    .from(AUTOROLE_QUEUE_TABLE)
+    .update({
+      status: "cancelled",
+      processed_at: new Date().toISOString(),
+      last_error: lastError || null,
+    })
+    .eq("id", queueId)
+    .select("*")
+    .single();
+
+  return unwrap(result, "markGuildAutoRoleQueueItemCancelled");
+}
+
+async function postponeGuildAutoRoleQueueItem(queueId, { nextDueAt, lastError }) {
+  const result = await supabase
+    .from(AUTOROLE_QUEUE_TABLE)
+    .update({
+      status: "pending",
+      due_at: nextDueAt,
+      last_error: lastError || null,
+    })
+    .eq("id", queueId)
+    .select("*")
+    .single();
+
+  return unwrap(result, "postponeGuildAutoRoleQueueItem");
+}
+
+async function rescheduleGuildAutoRoleQueueItem(queueId, {
+  attemptCount,
+  nextDueAt,
+  lastError,
+  finalFailure = false,
+}) {
+  const result = await supabase
+    .from(AUTOROLE_QUEUE_TABLE)
+    .update({
+      status: finalFailure ? "failed" : "pending",
+      attempt_count: attemptCount,
+      due_at: nextDueAt,
+      last_error: lastError || null,
+      processed_at: finalFailure ? new Date().toISOString() : null,
+    })
+    .eq("id", queueId)
+    .select("*")
+    .single();
+
+  return unwrap(result, "rescheduleGuildAutoRoleQueueItem");
+}
+
 async function closeTicketAsDeleted(ticketId) {
   const result = await supabase
     .from(TICKETS_TABLE)
@@ -792,6 +919,77 @@ async function getGuildAntiLinkSettings(guildId) {
     .maybeSingle();
 
   return unwrap(result, "getGuildAntiLinkSettings");
+}
+
+async function getGuildAutoRoleSettings(guildId) {
+  const result = await supabase
+    .from(AUTOROLE_SETTINGS_TABLE)
+    .select(
+      "guild_id, enabled, role_ids, assignment_delay_minutes, existing_members_sync_requested_at, existing_members_sync_started_at, existing_members_sync_completed_at, existing_members_sync_status, existing_members_sync_error, updated_at",
+    )
+    .eq("guild_id", guildId)
+    .maybeSingle();
+
+  return unwrap(result, "getGuildAutoRoleSettings");
+}
+
+async function getPendingGuildAutoRoleSyncSettings(limit = 1) {
+  const result = await supabase
+    .from(AUTOROLE_SETTINGS_TABLE)
+    .select(
+      "guild_id, enabled, role_ids, assignment_delay_minutes, existing_members_sync_requested_at, existing_members_sync_started_at, existing_members_sync_completed_at, existing_members_sync_status, existing_members_sync_error, updated_at",
+    )
+    .eq("existing_members_sync_status", "pending")
+    .order("existing_members_sync_requested_at", { ascending: true })
+    .order("updated_at", { ascending: true })
+    .limit(limit);
+
+  return unwrap(result, "getPendingGuildAutoRoleSyncSettings") || [];
+}
+
+async function markGuildAutoRoleSyncProcessing(guildId) {
+  const result = await supabase
+    .from(AUTOROLE_SETTINGS_TABLE)
+    .update({
+      existing_members_sync_status: "processing",
+      existing_members_sync_started_at: new Date().toISOString(),
+      existing_members_sync_error: null,
+    })
+    .eq("guild_id", guildId)
+    .select("*")
+    .single();
+
+  return unwrap(result, "markGuildAutoRoleSyncProcessing");
+}
+
+async function markGuildAutoRoleSyncCompleted(guildId) {
+  const result = await supabase
+    .from(AUTOROLE_SETTINGS_TABLE)
+    .update({
+      existing_members_sync_status: "completed",
+      existing_members_sync_completed_at: new Date().toISOString(),
+      existing_members_sync_error: null,
+    })
+    .eq("guild_id", guildId)
+    .select("*")
+    .single();
+
+  return unwrap(result, "markGuildAutoRoleSyncCompleted");
+}
+
+async function markGuildAutoRoleSyncFailed(guildId, errorMessage) {
+  const result = await supabase
+    .from(AUTOROLE_SETTINGS_TABLE)
+    .update({
+      existing_members_sync_status: "failed",
+      existing_members_sync_completed_at: new Date().toISOString(),
+      existing_members_sync_error: String(errorMessage || "").slice(0, 450),
+    })
+    .eq("guild_id", guildId)
+    .select("*")
+    .single();
+
+  return unwrap(result, "markGuildAutoRoleSyncFailed");
 }
 
 async function getGuildSecurityLogsSettings(guildId) {
@@ -1044,6 +1242,22 @@ async function getGuildAntiLinkRuntime(guildId) {
   };
 }
 
+async function getGuildAutoRoleRuntime(guildId) {
+  const [settings, accountLicenseRuntime] = await Promise.all([
+    getGuildAutoRoleSettings(guildId),
+    getGuildAccountLicenseRuntime(guildId),
+  ]);
+
+  return {
+    guildId,
+    settings: settings || null,
+    licenseStatus: accountLicenseRuntime.licenseStatus,
+    licenseUsable: accountLicenseRuntime.licenseUsable,
+    latestCoverage: accountLicenseRuntime.latestCoverage,
+    isConfigured: Boolean(settings),
+  };
+}
+
 async function getGuildSecurityLogsRuntime(guildId) {
   const [settings, accountLicenseRuntime] = await Promise.all([
     getGuildSecurityLogsSettings(guildId),
@@ -1118,13 +1332,17 @@ async function updateGuildTicketPanelMessageId(guildId, panelMessageId) {
 }
 
 module.exports = {
+  enqueueGuildAutoRoleQueueItems,
   enqueueTicketDirectMessage,
   closeTicketAsDeleted,
   createTicket,
+  getDueGuildAutoRoleQueueItems,
   getDueTicketDirectMessages,
   getConfiguredTicketGuildRuntimes,
   getGuildAntiLinkRuntime,
   getGuildAntiLinkSettings,
+  getGuildAutoRoleRuntime,
+  getGuildAutoRoleSettings,
   getGuildSecurityLogsRuntime,
   getGuildSecurityLogsSettings,
   createTicketAiMessage,
@@ -1141,9 +1359,18 @@ module.exports = {
   getGuildWelcomeSettings,
   claimTicket,
   closeTicket,
+  getPendingGuildAutoRoleSyncSettings,
+  markGuildAutoRoleQueueItemCancelled,
+  markGuildAutoRoleQueueItemCompleted,
+  markGuildAutoRoleQueueItemProcessing,
+  markGuildAutoRoleSyncCompleted,
+  markGuildAutoRoleSyncFailed,
+  markGuildAutoRoleSyncProcessing,
   markTicketDirectMessageBlocked,
   markTicketDirectMessageSent,
+  postponeGuildAutoRoleQueueItem,
   registerEvent,
+  rescheduleGuildAutoRoleQueueItem,
   rescheduleTicketDirectMessage,
   upsertTicketAiSession,
   upsertTicketTranscript,

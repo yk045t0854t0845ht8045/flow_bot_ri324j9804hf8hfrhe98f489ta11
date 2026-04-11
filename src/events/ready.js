@@ -5,6 +5,7 @@ const {
 } = require("../services/ticketService");
 const { primeVoiceStateSnapshots } = require("../services/securityLogsService");
 const { startDirectMessageQueueWorker } = require("../services/directMessageQueueService");
+const { startAutoRoleWorker } = require("../services/autoRoleService");
 const { primeInviteCacheForClient } = require("../utils/inviteTracker");
 const { syncSlashCommandsForClient } = require("../services/slashCommandSyncService");
 const { startVoicePresence } = require("../services/voicePresenceService");
@@ -67,6 +68,7 @@ module.exports = {
     }
 
     startDirectMessageQueueWorker(client);
+    startAutoRoleWorker(client);
 
     try {
       await primeInviteCacheForClient(client);
