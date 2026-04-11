@@ -9,6 +9,8 @@ const TICKET_STAFF_SETTINGS_TABLE = "guild_ticket_staff_settings";
 const WELCOME_SETTINGS_TABLE = "guild_welcome_settings";
 const ANTILINK_SETTINGS_TABLE = "guild_antilink_settings";
 const SECURITY_LOGS_SETTINGS_TABLE = "guild_security_logs_settings";
+const PLAN_GUILDS_TABLE = "auth_user_plan_guilds";
+const USER_PLAN_STATE_TABLE = "auth_user_plan_state";
 const PAYMENT_ORDERS_TABLE = "payment_orders";
 const TICKET_TRANSCRIPTS_TABLE = "ticket_transcripts";
 const TICKET_DM_QUEUE_TABLE = "ticket_dm_queue";
@@ -131,6 +133,203 @@ function resolveLatestLicenseStatusFromApprovedOrders(orders, nowMs = Date.now()
       latestCoverage?.status === "paid" || latestCoverage?.status === "expired",
     latestCoverage,
   };
+}
+
+function resolvePlanStateLicenseStatus(
+  planState,
+  fallbackActivatedAt = null,
+  fallbackExpiresAt = null,
+  nowMs = Date.now(),
+) {
+  if (!planState || planState.status === "inactive") {
+    return {
+      status: "not_paid",
+      usable: false,
+      latestCoverage: null,
+    };
+  }
+
+  const activatedAtMs = Date.parse(
+    planState.activated_at || fallbackActivatedAt || new Date(nowMs).toISOString(),
+  );
+  const expiresAtMs = Date.parse(
+    planState.expires_at || fallbackExpiresAt || "",
+  );
+  const normalizedActivatedAtMs = Number.isFinite(activatedAtMs)
+    ? activatedAtMs
+    : nowMs;
+  const normalizedExpiresAtMs = Number.isFinite(expiresAtMs)
+    ? expiresAtMs
+    : normalizedActivatedAtMs;
+  const graceExpiresAtMs = normalizedExpiresAtMs + EXPIRED_GRACE_MS;
+
+  let status = planState.status === "expired" ? "expired" : "paid";
+  if (Number.isFinite(expiresAtMs)) {
+    if (nowMs <= normalizedExpiresAtMs) {
+      status = "paid";
+    } else if (nowMs <= graceExpiresAtMs) {
+      status = "expired";
+    } else {
+      status = "off";
+    }
+  }
+
+  return {
+    status,
+    usable: status === "paid" || status === "expired",
+    latestCoverage: {
+      order: null,
+      status,
+      licenseStartsAtMs: normalizedActivatedAtMs,
+      licenseExpiresAtMs: normalizedExpiresAtMs,
+      graceExpiresAtMs,
+    },
+  };
+}
+
+async function getUserPlanStatesByUserIds(userIds) {
+  const uniqueUserIds = [...new Set((userIds || []).filter((value) => Number.isFinite(value)))];
+  if (!uniqueUserIds.length) {
+    return new Map();
+  }
+
+  const result = await supabase
+    .from(USER_PLAN_STATE_TABLE)
+    .select(
+      "user_id, status, activated_at, expires_at, plan_code, plan_name, amount, currency, billing_cycle_days, updated_at",
+    )
+    .in("user_id", uniqueUserIds);
+
+  const rows = unwrap(result, "getUserPlanStatesByUserIds") || [];
+  return new Map(rows.map((row) => [row.user_id, row]));
+}
+
+async function getUserPlanStateByUserId(userId) {
+  if (!Number.isFinite(userId)) {
+    return null;
+  }
+
+  const result = await supabase
+    .from(USER_PLAN_STATE_TABLE)
+    .select(
+      "user_id, status, activated_at, expires_at, plan_code, plan_name, amount, currency, billing_cycle_days, updated_at",
+    )
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  return unwrap(result, "getUserPlanStateByUserId") || null;
+}
+
+async function getGuildAccountLicenseRuntimeMap(guildIds) {
+  const uniqueGuildIds = [...new Set((guildIds || []).filter(Boolean))];
+  const runtimeByGuild = new Map();
+
+  if (!uniqueGuildIds.length) {
+    return runtimeByGuild;
+  }
+
+  const planGuildsResult = await supabase
+    .from(PLAN_GUILDS_TABLE)
+    .select("guild_id, user_id, activated_at, created_at, is_active")
+    .in("guild_id", uniqueGuildIds);
+
+  const planGuildRows = unwrap(planGuildsResult, "getGuildAccountLicenseRuntimeMap.planGuilds") || [];
+  const planGuildByGuildId = new Map(
+    planGuildRows.map((row) => [row.guild_id, row]),
+  );
+  const missingGuildIds = uniqueGuildIds.filter(
+    (guildId) => !planGuildByGuildId.has(guildId),
+  );
+  const approvedOrdersByGuild = missingGuildIds.length
+    ? await getApprovedPaymentOrdersForGuildIds(missingGuildIds)
+    : new Map();
+  const legacyCoverageByGuild = new Map();
+
+  for (const [guildId, orders] of approvedOrdersByGuild.entries()) {
+    const latestCoverage = resolveLatestLicenseStatusFromApprovedOrders(orders).latestCoverage;
+    if (latestCoverage) {
+      legacyCoverageByGuild.set(guildId, latestCoverage);
+    }
+  }
+
+  const userIds = new Set();
+  for (const row of planGuildRows) {
+    userIds.add(row.user_id);
+  }
+  for (const coverage of legacyCoverageByGuild.values()) {
+    if (coverage?.order?.user_id) {
+      userIds.add(coverage.order.user_id);
+    }
+  }
+
+  const userPlanStates = await getUserPlanStatesByUserIds([...userIds]);
+
+  for (const guildId of uniqueGuildIds) {
+    const planGuildLink = planGuildByGuildId.get(guildId) || null;
+    const legacyCoverage = legacyCoverageByGuild.get(guildId) || null;
+    const ownerUserId =
+      planGuildLink?.user_id || legacyCoverage?.order?.user_id || null;
+
+    if (!Number.isFinite(ownerUserId)) {
+      runtimeByGuild.set(guildId, {
+        licenseStatus: "not_paid",
+        licenseUsable: false,
+        latestCoverage: null,
+        licenseOwnerUserId: null,
+        planLinkActive: false,
+      });
+      continue;
+    }
+
+    const planState = userPlanStates.get(ownerUserId) || null;
+    const fallbackActivatedAt =
+      planGuildLink?.activated_at ||
+      (legacyCoverage?.licenseStartsAtMs
+        ? new Date(legacyCoverage.licenseStartsAtMs).toISOString()
+        : null);
+    const planCoverage = resolvePlanStateLicenseStatus(
+      planState,
+      fallbackActivatedAt,
+      legacyCoverage?.licenseExpiresAtMs
+        ? new Date(legacyCoverage.licenseExpiresAtMs).toISOString()
+        : null,
+    );
+
+    let licenseStatus = planCoverage.status;
+    let latestCoverage = planCoverage.latestCoverage;
+
+    if (planGuildLink && planGuildLink.is_active === false) {
+      licenseStatus = "off";
+    } else if (licenseStatus === "not_paid" && legacyCoverage) {
+      licenseStatus = legacyCoverage.status;
+      latestCoverage = legacyCoverage;
+    } else if (licenseStatus === "not_paid" && planGuildLink) {
+      licenseStatus = "off";
+    }
+
+    runtimeByGuild.set(guildId, {
+      licenseStatus,
+      licenseUsable: licenseStatus === "paid" || licenseStatus === "expired",
+      latestCoverage,
+      licenseOwnerUserId: ownerUserId,
+      planLinkActive: planGuildLink ? planGuildLink.is_active !== false : true,
+    });
+  }
+
+  return runtimeByGuild;
+}
+
+async function getGuildAccountLicenseRuntime(guildId) {
+  const runtimeByGuild = await getGuildAccountLicenseRuntimeMap([guildId]);
+  return (
+    runtimeByGuild.get(guildId) || {
+      licenseStatus: "not_paid",
+      licenseUsable: false,
+      latestCoverage: null,
+      licenseOwnerUserId: null,
+      planLinkActive: false,
+    }
+  );
 }
 
 function normalizePlanCode(value, fallback = "pro") {
@@ -610,7 +809,7 @@ async function getGuildSecurityLogsSettings(guildId) {
 async function getApprovedPaymentOrdersForGuild(guildId) {
   const result = await supabase
     .from(PAYMENT_ORDERS_TABLE)
-    .select("id, guild_id, plan_code, paid_at, created_at, plan_billing_cycle_days")
+    .select("id, user_id, guild_id, plan_code, paid_at, created_at, expires_at, plan_billing_cycle_days")
     .eq("guild_id", guildId)
     .eq("status", "approved")
     .order("paid_at", { ascending: false, nullsFirst: false })
@@ -645,23 +844,60 @@ async function getUserPlanSnapshotByDiscordUserId(discordUserId) {
     };
   }
 
-  const approvedOrdersResult = await supabase
-    .from(PAYMENT_ORDERS_TABLE)
-    .select(
-      "id, user_id, plan_code, plan_name, paid_at, created_at, expires_at, amount, currency, plan_billing_cycle_days",
-    )
-    .eq("user_id", authUser.id)
-    .eq("status", "approved")
-    .order("paid_at", { ascending: false, nullsFirst: false })
-    .order("created_at", { ascending: false });
+  const [approvedOrdersResult, userPlanState] = await Promise.all([
+    supabase
+      .from(PAYMENT_ORDERS_TABLE)
+      .select(
+        "id, user_id, plan_code, plan_name, paid_at, created_at, expires_at, amount, currency, plan_billing_cycle_days",
+      )
+      .eq("user_id", authUser.id)
+      .eq("status", "approved")
+      .order("paid_at", { ascending: false, nullsFirst: false })
+      .order("created_at", { ascending: false }),
+    getUserPlanStateByUserId(authUser.id),
+  ]);
 
-  const approvedOrders =
-    unwrap(
-      approvedOrdersResult,
-      "getUserPlanSnapshotByDiscordUserId.approvedOrders",
-    ) || [];
+  const approvedOrders = unwrap(
+    approvedOrdersResult,
+    "getUserPlanSnapshotByDiscordUserId.approvedOrders",
+  ) || [];
 
   if (!approvedOrders.length) {
+    const accountLicense = resolvePlanStateLicenseStatus(userPlanState);
+    if (accountLicense.status === "paid" || accountLicense.status === "expired") {
+      const normalizedPlanCode = normalizePlanCode(userPlanState?.plan_code, "pro");
+      const resolvedPlanName =
+        typeof userPlanState?.plan_name === "string" && userPlanState.plan_name.trim()
+          ? userPlanState.plan_name.trim()
+          : resolvePlanNameFromOrder({ plan_code: normalizedPlanCode });
+
+      return {
+        hasPlan: true,
+        hasPurchaseHistory: false,
+        userId: authUser.id,
+        planCode: normalizedPlanCode,
+        planName: resolvedPlanName,
+        status: accountLicense.status === "paid" ? "active" : "expired",
+        rawStatus: accountLicense.status,
+        expiresAt: userPlanState?.expires_at || null,
+        purchasedAt: userPlanState?.activated_at || null,
+        amount:
+          typeof userPlanState?.amount === "number" &&
+          Number.isFinite(userPlanState.amount)
+            ? userPlanState.amount
+            : null,
+        currency:
+          typeof userPlanState?.currency === "string" && userPlanState.currency.trim()
+            ? userPlanState.currency.trim()
+            : "BRL",
+        billingCycleDays:
+          typeof userPlanState?.billing_cycle_days === "number" &&
+          Number.isFinite(userPlanState.billing_cycle_days)
+            ? userPlanState.billing_cycle_days
+            : null,
+      };
+    }
+
     return {
       hasPlan: false,
       hasPurchaseHistory: false,
@@ -672,13 +908,29 @@ async function getUserPlanSnapshotByDiscordUserId(discordUserId) {
   const license = resolveLatestLicenseStatusFromApprovedOrders(approvedOrders);
   const latestCoverage = license.latestCoverage;
   const latestOrder = latestCoverage?.order || approvedOrders[0];
-  const normalizedPlanCode = normalizePlanCode(latestOrder?.plan_code, "pro");
-  const resolvedPlanName = resolvePlanNameFromOrder(latestOrder);
-  const expiresAtIso = resolveExpiresAtIsoFromOrderOrCoverage(
-    latestOrder,
-    latestCoverage,
+  const accountLicense = resolvePlanStateLicenseStatus(
+    userPlanState,
+    latestCoverage?.licenseStartsAtMs
+      ? new Date(latestCoverage.licenseStartsAtMs).toISOString()
+      : latestOrder?.paid_at || latestOrder?.created_at || null,
+    latestCoverage?.licenseExpiresAtMs
+      ? new Date(latestCoverage.licenseExpiresAtMs).toISOString()
+      : latestOrder?.expires_at || null,
   );
-  const purchasedAtIso = latestOrder?.paid_at || latestOrder?.created_at || null;
+  const resolvedAccountStatus =
+    accountLicense.status === "not_paid" ? license.status : accountLicense.status;
+  const normalizedPlanCode = normalizePlanCode(
+    userPlanState?.plan_code || latestOrder?.plan_code,
+    "pro",
+  );
+  const resolvedPlanName =
+    (typeof userPlanState?.plan_name === "string" && userPlanState.plan_name.trim()) ||
+    resolvePlanNameFromOrder(latestOrder);
+  const expiresAtIso =
+    userPlanState?.expires_at ||
+    resolveExpiresAtIsoFromOrderOrCoverage(latestOrder, latestCoverage);
+  const purchasedAtIso =
+    userPlanState?.activated_at || latestOrder?.paid_at || latestOrder?.created_at || null;
 
   return {
     hasPlan: true,
@@ -686,22 +938,30 @@ async function getUserPlanSnapshotByDiscordUserId(discordUserId) {
     userId: authUser.id,
     planCode: normalizedPlanCode,
     planName: resolvedPlanName,
-    status: license.status === "paid" ? "active" : "expired",
-    rawStatus: license.status,
+    status: resolvedAccountStatus === "paid" ? "active" : "expired",
+    rawStatus: resolvedAccountStatus,
     expiresAt: expiresAtIso,
     purchasedAt: purchasedAtIso,
-    amount:
-      typeof latestOrder?.amount === "number" && Number.isFinite(latestOrder.amount)
+    amount: (() => {
+      const fromPlanState = Number(userPlanState?.amount);
+      if (Number.isFinite(fromPlanState)) return fromPlanState;
+      return typeof latestOrder?.amount === "number" && Number.isFinite(latestOrder.amount)
         ? latestOrder.amount
-        : null,
+        : null;
+    })(),
     currency:
-      typeof latestOrder?.currency === "string" && latestOrder.currency.trim()
-        ? latestOrder.currency.trim()
+      typeof userPlanState?.currency === "string" && userPlanState.currency.trim()
+        ? userPlanState.currency.trim()
+        : typeof latestOrder?.currency === "string" && latestOrder.currency.trim()
+          ? latestOrder.currency.trim()
         : "BRL",
     billingCycleDays:
-      typeof latestOrder?.plan_billing_cycle_days === "number" &&
-      Number.isFinite(latestOrder.plan_billing_cycle_days)
-        ? latestOrder.plan_billing_cycle_days
+      typeof userPlanState?.billing_cycle_days === "number" &&
+      Number.isFinite(userPlanState.billing_cycle_days)
+        ? userPlanState.billing_cycle_days
+        : typeof latestOrder?.plan_billing_cycle_days === "number" &&
+            Number.isFinite(latestOrder.plan_billing_cycle_days)
+          ? latestOrder.plan_billing_cycle_days
         : null,
   };
 }
@@ -714,7 +974,7 @@ async function getApprovedPaymentOrdersForGuildIds(guildIds) {
 
   const result = await supabase
     .from(PAYMENT_ORDERS_TABLE)
-    .select("id, guild_id, plan_code, paid_at, created_at, plan_billing_cycle_days")
+    .select("id, user_id, guild_id, plan_code, paid_at, created_at, expires_at, plan_billing_cycle_days")
     .in("guild_id", uniqueGuildIds)
     .eq("status", "approved")
     .order("paid_at", { ascending: false, nullsFirst: false })
@@ -735,75 +995,67 @@ async function getApprovedPaymentOrdersForGuildIds(guildIds) {
 }
 
 async function getGuildTicketRuntime(guildId) {
-  const [settings, staffSettings, approvedOrders] = await Promise.all([
+  const [settings, staffSettings, accountLicenseRuntime] = await Promise.all([
     getGuildTicketSettings(guildId),
     getGuildTicketStaffSettings(guildId),
-    getApprovedPaymentOrdersForGuild(guildId),
+    getGuildAccountLicenseRuntime(guildId),
   ]);
-
-  const license = resolveLatestLicenseStatusFromApprovedOrders(approvedOrders);
 
   return {
     guildId,
     settings: settings || null,
     staffSettings: staffSettings || null,
-    licenseStatus: license.status,
-    licenseUsable: license.usable,
-    latestCoverage: license.latestCoverage,
+    licenseStatus: accountLicenseRuntime.licenseStatus,
+    licenseUsable: accountLicenseRuntime.licenseUsable,
+    latestCoverage: accountLicenseRuntime.latestCoverage,
     isConfigured: Boolean(settings && staffSettings),
   };
 }
 
 async function getGuildWelcomeRuntime(guildId) {
-  const [settings, approvedOrders] = await Promise.all([
+  const [settings, accountLicenseRuntime] = await Promise.all([
     getGuildWelcomeSettings(guildId),
-    getApprovedPaymentOrdersForGuild(guildId),
+    getGuildAccountLicenseRuntime(guildId),
   ]);
-
-  const license = resolveLatestLicenseStatusFromApprovedOrders(approvedOrders);
 
   return {
     guildId,
     settings: settings || null,
-    licenseStatus: license.status,
-    licenseUsable: license.usable,
-    latestCoverage: license.latestCoverage,
+    licenseStatus: accountLicenseRuntime.licenseStatus,
+    licenseUsable: accountLicenseRuntime.licenseUsable,
+    latestCoverage: accountLicenseRuntime.latestCoverage,
     isConfigured: Boolean(settings),
   };
 }
 
 async function getGuildAntiLinkRuntime(guildId) {
-  const [settings, approvedOrders] = await Promise.all([
+  const [settings, accountLicenseRuntime] = await Promise.all([
     getGuildAntiLinkSettings(guildId),
-    getApprovedPaymentOrdersForGuild(guildId),
+    getGuildAccountLicenseRuntime(guildId),
   ]);
-
-  const license = resolveLatestLicenseStatusFromApprovedOrders(approvedOrders);
 
   return {
     guildId,
     settings: settings || null,
-    licenseStatus: license.status,
-    licenseUsable: license.usable,
-    latestCoverage: license.latestCoverage,
+    licenseStatus: accountLicenseRuntime.licenseStatus,
+    licenseUsable: accountLicenseRuntime.licenseUsable,
+    latestCoverage: accountLicenseRuntime.latestCoverage,
     isConfigured: Boolean(settings),
   };
 }
 
 async function getGuildSecurityLogsRuntime(guildId) {
-  const [settings, approvedOrders] = await Promise.all([
+  const [settings, accountLicenseRuntime] = await Promise.all([
     getGuildSecurityLogsSettings(guildId),
-    getApprovedPaymentOrdersForGuild(guildId),
+    getGuildAccountLicenseRuntime(guildId),
   ]);
-
-  const license = resolveLatestLicenseStatusFromApprovedOrders(approvedOrders);
 
   return {
     guildId,
     settings: settings || null,
-    licenseStatus: license.status,
-    licenseUsable: license.usable,
-    latestCoverage: license.latestCoverage,
+    licenseStatus: accountLicenseRuntime.licenseStatus,
+    licenseUsable: accountLicenseRuntime.licenseUsable,
+    latestCoverage: accountLicenseRuntime.latestCoverage,
     isConfigured: Boolean(settings),
   };
 }
@@ -824,23 +1076,27 @@ async function getConfiguredTicketGuildRuntimes() {
 
   const settingsRows = unwrap(settingsResult, "getConfiguredTicketGuildRuntimes.settings") || [];
   const staffRows = unwrap(staffResult, "getConfiguredTicketGuildRuntimes.staff") || [];
-  const approvedOrdersByGuild = await getApprovedPaymentOrdersForGuildIds(
+  const accountLicenseRuntimeByGuild = await getGuildAccountLicenseRuntimeMap(
     settingsRows.map((row) => row.guild_id),
   );
 
   const staffByGuild = new Map(staffRows.map((row) => [row.guild_id, row]));
   const runtimes = settingsRows.map((settingsRow) => {
-    const approvedOrders = approvedOrdersByGuild.get(settingsRow.guild_id) || [];
-    const license = resolveLatestLicenseStatusFromApprovedOrders(approvedOrders);
+    const accountLicenseRuntime =
+      accountLicenseRuntimeByGuild.get(settingsRow.guild_id) || {
+        licenseStatus: "not_paid",
+        licenseUsable: false,
+        latestCoverage: null,
+      };
     const staffSettings = staffByGuild.get(settingsRow.guild_id) || null;
 
     return {
       guildId: settingsRow.guild_id,
       settings: settingsRow,
       staffSettings,
-      licenseStatus: license.status,
-      licenseUsable: license.usable,
-      latestCoverage: license.latestCoverage,
+      licenseStatus: accountLicenseRuntime.licenseStatus,
+      licenseUsable: accountLicenseRuntime.licenseUsable,
+      latestCoverage: accountLicenseRuntime.latestCoverage,
       isConfigured: Boolean(settingsRow && staffSettings),
     };
   });
