@@ -9,6 +9,7 @@ const { startAutoRoleWorker } = require("../services/autoRoleService");
 const { primeInviteCacheForClient } = require("../utils/inviteTracker");
 const { syncSlashCommandsForClient } = require("../services/slashCommandSyncService");
 const { startVoicePresence } = require("../services/voicePresenceService");
+const { startStatusHeartbeat } = require("../services/statusMonitoringService");
 const { env } = require("../config/env");
 
 module.exports = {
@@ -16,6 +17,10 @@ module.exports = {
   once: true,
   async execute(client) {
     console.log(`Bot online como ${client.user.tag}`);
+    
+    // Inicia o sistema de monitoramento de status
+    startStatusHeartbeat(client);
+
     console.log(
       `[ai-mention] ${env.openaiApiKey ? "ativo" : "desativado"} | modelo principal: ${env.openaiModel}`,
     );
