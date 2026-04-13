@@ -10,8 +10,7 @@
     "deploy:commands": "node src/deploy-commands.js",
     "site:dev": "npm --prefix site run dev",
     "site:build": "npm --prefix site run build",
-    "site": "node scripts/site-publish.js",
-    "puxar": "node scripts/site-pull.js"
+    "now": "node scripts/now.js"
   },
   "keywords": [],
   "author": "",
