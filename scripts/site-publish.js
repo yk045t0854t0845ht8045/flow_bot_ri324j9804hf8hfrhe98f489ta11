@@ -1,6 +1,7 @@
 const { existsSync } = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const readline = require("node:readline");
 
 const siteDir = path.resolve(__dirname, "..", "site");
 const repoUrl =
@@ -118,13 +119,34 @@ function ensureGitRepository() {
   }
 }
 
-function commitAndPush() {
+function askCommitMessage() {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  return new Promise((resolve) => {
+    rl.question("\n> Motivo do commit: ", (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
+
+async function commitAndPush() {
   run("git", ["add", "."]);
 
   if (hasStagedChanges()) {
-    const commitMessage =
-      process.env.SITE_COMMIT_MESSAGE ||
-      `site: update ${new Date().toISOString()}`;
+    let commitMessage = process.env.SITE_COMMIT_MESSAGE;
+
+    if (!commitMessage) {
+      commitMessage = await askCommitMessage();
+    }
+
+    if (!commitMessage) {
+      commitMessage = `site: update ${new Date().toISOString()}`;
+    }
+
     run("git", ["commit", "-m", commitMessage]);
   } else {
     console.log("\nNenhuma mudanca nova para commit no /site.");
@@ -133,16 +155,18 @@ function commitAndPush() {
   run("git", ["push", "-u", "origin", "main"]);
 }
 
-function publishSite() {
+async function publishSite() {
   run("npm", ["run", "build"]);
   ensureGitRepository();
-  commitAndPush();
+  await commitAndPush();
   console.log("\nSite publicado com sucesso.");
 }
 
-try {
-  publishSite();
-} catch (error) {
-  console.error(`\nErro ao publicar o site: ${error.message}`);
-  process.exit(1);
-}
+(async () => {
+  try {
+    await publishSite();
+  } catch (error) {
+    console.error(`\nErro ao publicar o site: ${error.message}`);
+    process.exit(1);
+  }
+})();

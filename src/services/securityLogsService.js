@@ -83,11 +83,6 @@ const SECURITY_LOG_EVENT_CONFIG = {
     channelColumn: "member_timeout_channel_id",
     label: "Membro silenciado",
   },
-  voiceMove: {
-    enabledColumn: "voice_move_enabled",
-    channelColumn: "voice_move_channel_id",
-    label: "Membro movido de call",
-  },
   voiceMute: {
     enabledColumn: "voice_mute_enabled",
     channelColumn: "voice_mute_channel_id",
@@ -620,8 +615,6 @@ function buildSecurityLogDetailsCustomId(eventKey, context = {}) {
       return `${SECURITY_LOG_DETAILS_PREFIX}vj:${targetId}:${channelId}`;
     case "voiceLeave":
       return `${SECURITY_LOG_DETAILS_PREFIX}vl:${targetId}:${channelId}`;
-    case "voiceMove":
-      return `${SECURITY_LOG_DETAILS_PREFIX}vm:${targetId}:${actorId}:${oldChannelId}:${newChannelId}`;
     case "voiceMute":
       return `${SECURITY_LOG_DETAILS_PREFIX}vt:${targetId}:${actorId}:${channelId}:${state}`;
     case "messageDelete":
@@ -749,7 +742,7 @@ function buildSecurityLogActionRows(guildId, eventKey, context = {}) {
     buttons.push(
       new ButtonBuilder()
         .setStyle(ButtonStyle.Link)
-        .setLabel(eventKey === "voiceMove" ? "Abrir destino" : "Abrir canal")
+        .setLabel("Abrir canal")
         .setURL(`https://discord.com/channels/${guildId}/${primaryChannelId}`),
     );
   }
@@ -1731,63 +1724,6 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
     handled = true;
   }
 
-  if (oldChannel && newChannel && oldChannel.id !== newChannel.id) {
-    const moveConfig = resolveEventConfig(settings, "voiceMove");
-    if (moveConfig.enabled) {
-      const moveAuditEntry = await resolveVoiceMoveAuditEntry(
-        guild,
-        newState.id,
-        oldChannel.id,
-        newChannel.id,
-      );
-      const executor = moveAuditEntry?.executor || null;
-      const reason = trimText(moveAuditEntry?.reason || "");
-      const movedByModerator = executor?.id && executor.id !== newState.id;
-      const dedupeKey = [
-        "voice-move",
-        guild.id,
-        newState.id,
-        oldChannel.id,
-        newChannel.id,
-        executor?.id || "self",
-      ].join(":");
-
-      if (!registerRecentEvent(dedupeKey)) {
-        await sendSecurityLog({
-          guild,
-          settings,
-          eventKey: "voiceMove",
-          color: movedByModerator ? 0x79a6ff : 0x6cb8ff,
-          title: movedByModerator
-            ? "Membro movido de call"
-            : "Membro trocou de canal de voz",
-          description: `Usuario: ${memberLabel}`,
-          thumbnailUrl: resolveStaticMemberAvatarUrl(newState.member || oldState.member),
-          fields: [
-            { name: "Canal antigo", value: `<#${oldChannel.id}>`, inline: true },
-            { name: "Canal novo", value: `<#${newChannel.id}>`, inline: true },
-            {
-              name: movedByModerator ? "Executado por" : "Origem do movimento",
-              value: movedByModerator
-                ? formatUserLabel(executor)
-                : "Mudanca direta do usuario ou auditoria indisponivel",
-            },
-            {
-              name: "Motivo",
-              value: reason || "Nao informado",
-            },
-          ],
-          buttonContext: {
-            targetId: newState.id,
-            actorId: executor?.id || null,
-            oldChannelId: oldChannel.id,
-            newChannelId: newChannel.id,
-          },
-        });
-        handled = true;
-      }
-    }
-  }
 
   const voiceMuteChanged =
     typeof oldServerMute === "boolean" &&
@@ -1877,6 +1813,71 @@ async function handleMessageDeleteSecurityLog(message) {
     : "Nao identificado";
   const channelLabel = message.channelId ? `<#${message.channelId}>` : "Nao identificado";
 
+  let content = trimText(message.content || "");
+
+  // Resolve menções (@user) para nomes legíveis no log
+  if (content && message.mentions?.users?.size > 0) {
+    content = content.replace(/<@!?(\d+)>/g, (match, userId) => {
+      const mentionedUser = message.mentions.users.get(userId);
+      if (mentionedUser) {
+        const displayName = mentionedUser.globalName || mentionedUser.username || mentionedUser.displayName;
+        return `@${displayName}`;
+      }
+      return `@usuario:${userId}`;
+    });
+  }
+
+  // Resolve menções de cargos (@cargo) para nomes legíveis
+  if (content && message.mentions?.roles?.size > 0) {
+    content = content.replace(/<@&(\d+)>/g, (match, roleId) => {
+      const mentionedRole = message.mentions.roles?.get(roleId);
+      if (mentionedRole?.name) {
+        return `@${mentionedRole.name}`;
+      }
+      return `@cargo:${roleId}`;
+    });
+  }
+
+  // Resolve menções de canais (#canal) para nomes legíveis
+  if (content) {
+    content = content.replace(/<#(\d+)>/g, (match, channelId) => {
+      const mentionedChannel = message.guild?.channels?.cache?.get(channelId);
+      if (mentionedChannel?.name) {
+        return `#${mentionedChannel.name}`;
+      }
+      return `#canal:${channelId}`;
+    });
+  }
+
+  const extraContext = [];
+
+  for (const embed of message.embeds || []) {
+    if (trimText(embed.title || "")) extraContext.push(`Titulo: ${trimText(embed.title)}`);
+    if (trimText(embed.description || "")) extraContext.push(`Descricao: ${trimText(embed.description)}`);
+    if (trimText(embed.author?.name || "")) extraContext.push(`Autor do Embed: ${trimText(embed.author.name)}`);
+    for (const field of embed.fields || []) {
+      if (trimText(field.name || "") || trimText(field.value || "")) {
+        extraContext.push(`${trimText(field.name)}: ${trimText(field.value)}`);
+      }
+    }
+    if (trimText(embed.footer?.text || "")) extraContext.push(`Rodape: ${trimText(embed.footer.text)}`);
+  }
+
+  if (extraContext.length > 0) {
+    if (content) content += "\n\n[Embeds presentes]:\n" + extraContext.join("\n").substring(0, 500);
+    else content = "[Conteudo do Embed apagado]:\n" + extraContext.join("\n").substring(0, 600);
+  }
+
+  if (message.attachments?.size > 0) {
+    const urls = message.attachments.map((a) => a.name || a.url).join("\n");
+    if (content) content += "\n\n[Anexos no apagamento]:\n" + urls;
+    else content = "[Anexos apagados]:\n" + urls;
+  }
+
+  if (!content) {
+    content = "(Mensagem sem conteudo textual rastreavel ou apenas arquivo nao legivel)";
+  }
+
   await sendSecurityLog({
     guild: message.guild,
     settings: runtime.settings,
@@ -1893,7 +1894,7 @@ async function handleMessageDeleteSecurityLog(message) {
       },
       {
         name: "Conteudo",
-        value: toCodeBlock(message.content, 700),
+        value: toCodeBlock(content, 700),
       },
     ],
     buttonContext: {
@@ -1913,9 +1914,38 @@ async function handleMessageEditSecurityLog(oldMessage, newMessage) {
   const author = newMessage?.author || oldMessage?.author;
   if (author?.bot) return false;
 
-  const oldContent = trimText(oldMessage?.content || "");
-  const newContent = trimText(newMessage?.content || "");
+  let oldContent = trimText(oldMessage?.content || "");
+  let newContent = trimText(newMessage?.content || "");
   if (oldContent === newContent) return false;
+
+  // Helper para resolver menções em qualquer conteúdo de mensagem
+  const resolveMentions = (text, message) => {
+    if (!text || !message) return text;
+    // Usuários
+    if (message.mentions?.users?.size > 0) {
+      text = text.replace(/<@!?(\d+)>/g, (match, userId) => {
+        const u = message.mentions.users.get(userId);
+        if (u) return `@${u.globalName || u.username || u.displayName}`;
+        return `@usuario:${userId}`;
+      });
+    }
+    // Cargos
+    if (message.mentions?.roles?.size > 0) {
+      text = text.replace(/<@&(\d+)>/g, (match, roleId) => {
+        const r = message.mentions.roles?.get(roleId);
+        return r?.name ? `@${r.name}` : `@cargo:${roleId}`;
+      });
+    }
+    // Canais
+    text = text.replace(/<#(\d+)>/g, (match, channelId) => {
+      const ch = message.guild?.channels?.cache?.get(channelId);
+      return ch?.name ? `#${ch.name}` : `#canal:${channelId}`;
+    });
+    return text;
+  };
+
+  oldContent = resolveMentions(oldContent, oldMessage);
+  newContent = resolveMentions(newContent, newMessage);
 
   const runtime = await resolveRuntime(guildId);
   if (!runtime?.settings) return false;

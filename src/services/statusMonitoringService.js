@@ -24,7 +24,7 @@ async function checkAllSystems(client) {
         const results = [];
 
         // 1. DISCORD BOT (Real-time WS)
-        const botStatus = client && client.ws && client.ws.status === 0 ? "operational" : "major_outage";
+        const botStatus = client && client.ws && client.ws.status === 0 ? "operational" : "degraded_performance";
         results.push({ name: 'DISCORD BOT', status: botStatus });
 
         // 2. Armazenamento DB (Supabase Health)
@@ -37,7 +37,16 @@ async function checkAllSystems(client) {
             headers: { apikey: env.supabaseServiceRoleKey } 
         }).catch(() => null);
         const apiLatency = Date.now() - apiStart;
-        results.push({ name: 'API', status: !apiRes ? "major_outage" : apiLatency > 1500 ? "degraded_performance" : "operational" });
+        
+        let apiStatus = "operational";
+        if (!apiRes) {
+            apiStatus = "major_outage";
+        } else if (apiLatency > 3000) { // Aumentado para 3s para evitar falso positivo
+            apiStatus = "partial_outage";
+        } else if (apiLatency > 1500) {
+            apiStatus = "degraded_performance";
+        }
+        results.push({ name: 'API', status: apiStatus });
 
         // 4. FLOW AI (OpenAI API Check)
         const aiStart = Date.now();
@@ -97,7 +106,10 @@ async function checkAllSystems(client) {
 
         // IA Analysis (Only on changes or every hour)
         const hasIssues = results.some(r => r.status !== "operational");
-        if (hasIssues || now.getMinutes() === 0) {
+        if (hasIssues) {
+            console.log("[status-system] Analisando anomalias com IA para evitar falsos positivos...");
+            await runAiStatusAnalysis(results);
+        } else if (now.getMinutes() === 0) {
             await runAiStatusAnalysis(results);
         }
 

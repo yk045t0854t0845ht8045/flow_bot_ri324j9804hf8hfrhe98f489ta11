@@ -6,7 +6,7 @@ const {
   SeparatorSpacingSize,
   TextDisplayBuilder,
 } = require("discord.js");
-const { getGuildAntiLinkRuntime } = require("./supabaseService");
+const { getGuildAntiLinkRuntime, getGuildTicketSettings } = require("./supabaseService");
 
 const RUNTIME_CACHE_TTL_MS = 10_000;
 const runtimeCache = new Map();
@@ -167,6 +167,8 @@ function hasLikelyDomainWithKnownTld(value) {
   return false;
 }
 
+const TENOR_GIF_REGEX = /^https?:\/\/tenor\.com\/view\/[a-z0-9-]+/i;
+
 function detectViolation(content, settings) {
   const normalized = normalizeText(content);
   if (!normalized) return null;
@@ -174,49 +176,66 @@ function detectViolation(content, settings) {
   const compact = normalizeCompact(content);
   const deobfuscated = normalizeDeobfuscated(content);
 
-  if (
-    DISCORD_INVITE_REGEX.test(normalized) ||
-    /discord\s*[\.\u2024\u3002\uFF0E]?\s*gg\b/.test(normalized) ||
-    compact.includes("discordgg") ||
-    compact.includes("discordcominvite") ||
-    deobfuscated.includes("discord.gg/") ||
-    deobfuscated.includes("discord.com/invite/")
-  ) {
-    return {
-      rule: "discord_invite",
-      reason: "convite do Discord detectado",
-    };
+  const inviteMatch = normalized.match(DISCORD_INVITE_REGEX) || deobfuscated.match(DISCORD_INVITE_REGEX);
+  if (inviteMatch) {
+    return { rule: "discord_invite", reason: "convite do Discord detectado", url: inviteMatch[0] };
   }
 
-  if (MARKDOWN_HIDDEN_LINK_REGEX.test(normalized)) {
-    return {
-      rule: "markdown_hidden_link",
-      reason: "link escondido em texto markdown",
-    };
+  if (compact.includes("discordgg") || compact.includes("discordcominvite")) {
+    return { rule: "discord_invite", reason: "convite do Discord detectado", url: "[ofuscado: discord.gg]" };
   }
 
-  if (
-    HTTP_LINK_REGEX.test(normalized) ||
-    hasLikelyDomainWithKnownTld(normalized)
-  ) {
-    return {
-      rule: "external_link",
-      reason: "link externo detectado",
-    };
+  const markdownMatch = normalized.match(MARKDOWN_HIDDEN_LINK_REGEX);
+  if (markdownMatch) {
+    const hiddenUrl = markdownMatch[1];
+    if (!TENOR_GIF_REGEX.test(hiddenUrl)) {
+      return { rule: "markdown_hidden_link", reason: "link escondido em texto markdown", url: hiddenUrl };
+    }
   }
 
-  if (
-    OBFUSCATED_HTTP_REGEX.test(normalized) ||
-    deobfuscated.includes("http://") ||
-    deobfuscated.includes("https://") ||
-    (deobfuscated.includes("www.") &&
-      hasLikelyDomainWithKnownTld(deobfuscated)) ||
-    hasLikelyDomainWithKnownTld(deobfuscated)
-  ) {
-    return {
-      rule: "obfuscated_link",
-      reason: "link ofuscado detectado",
-    };
+  const httpRegex = new RegExp(/\b(?:https?:\/\/|www\.)[^\s<>()]+/, 'gi');
+  const httpMatches = normalized.match(httpRegex) || [];
+  for (const url of httpMatches) {
+    if (TENOR_GIF_REGEX.test(url)) continue;
+    return { rule: "external_link", reason: "link externo detectado", url };
+  }
+
+  const domainCandidates = normalized.match(DOMAIN_CANDIDATE_REGEX) || [];
+  for (const candidate of domainCandidates) {
+    if (candidate.toLowerCase().includes("tenor.com")) continue;
+
+    const parts = candidate.split(".").filter(Boolean);
+    if (parts.length < 2) continue;
+    
+    const topLevel = parts[parts.length - 1];
+    const topLevelPair = `${parts[parts.length - 2]}.${topLevel}`;
+    if (KNOWN_TLD_SET.has(topLevel) || KNOWN_TLD_SET.has(topLevelPair)) {
+      return { rule: "external_link", reason: "link externo detectado", url: candidate };
+    }
+  }
+
+  if (OBFUSCATED_HTTP_REGEX.test(normalized)) {
+    return { rule: "obfuscated_link", reason: "link ofuscado detectado", url: "[http ofuscado]" };
+  }
+
+  const deobfHttpMatches = deobfuscated.match(/\b(?:https?:\/\/)[^\s<>()]+/gi) || [];
+  for (const url of deobfHttpMatches) {
+    if (TENOR_GIF_REGEX.test(url)) continue;
+    return { rule: "obfuscated_link", reason: "link ofuscado detectado", url };
+  }
+
+  const deobfDomainCandidates = deobfuscated.match(DOMAIN_CANDIDATE_REGEX) || [];
+  for (const candidate of deobfDomainCandidates) {
+    if (candidate.toLowerCase().includes("tenor.com")) continue;
+
+    const parts = candidate.split(".").filter(Boolean);
+    if (parts.length < 2) continue;
+    
+    const topLevel = parts[parts.length - 1];
+    const topLevelPair = `${parts[parts.length - 2]}.${topLevel}`;
+    if (KNOWN_TLD_SET.has(topLevel) || KNOWN_TLD_SET.has(topLevelPair)) {
+      return { rule: "obfuscated_link", reason: "link ofuscado detectado", url: candidate };
+    }
   }
 
   return null;
@@ -460,7 +479,7 @@ async function sendAntiLinkLog({
         )
         .addTextDisplayComponents(
           new TextDisplayBuilder().setContent(
-            `### Trecho da mensagem\n\`\`\`\n${formatSnippet(message.content)}\n\`\`\``,
+            `### Link Exato Detectado\n\`\`\`\n${detection.url}\n\`\`\``,
           ),
         ),
     ],
@@ -482,8 +501,8 @@ async function sendAntiLinkLog({
       ].join("\n"),
     )
     .addFields({
-      name: "Trecho da mensagem",
-      value: `\`\`\`\n${formatSnippet(message.content)}\n\`\`\``,
+      name: "Link Exato Detectado",
+      value: `\`\`\`\n${detection.url}\n\`\`\``,
     })
     .setTimestamp(new Date());
 
@@ -517,7 +536,7 @@ async function sendAntiLinkNotice({ message, detection, action, timeoutMinutes }
         )
         .addTextDisplayComponents(
           new TextDisplayBuilder().setContent(
-            `-# Motivo: ${detection.reason}\n-# Acao: ${resolveActionLabel(action, timeoutMinutes)}`,
+            `-# Link Bloqueado: \`${detection.url}\`\n-# Acao: ${resolveActionLabel(action, timeoutMinutes)}`,
           ),
         ),
     ],
@@ -529,7 +548,7 @@ async function sendAntiLinkNotice({ message, detection, action, timeoutMinutes }
       .setColor(0x7a1212)
       .setTitle("Mensagem removida pelo AntiLink")
       .setDescription(
-        `Motivo: ${detection.reason}\nAcao: ${resolveActionLabel(action, timeoutMinutes)}`,
+        `Link Bloqueado: \`${detection.url}\`\nAcao: ${resolveActionLabel(action, timeoutMinutes)}`,
       )
       .setTimestamp(new Date());
 
@@ -570,6 +589,17 @@ async function handleAntiLinkMessage(message) {
     member.roles?.cache?.some((role) => ignoredRoleIds.includes(role.id))
   ) {
     return false;
+  }
+
+  const ignoredChannelIds = Array.isArray(settings.ignored_channel_ids) ? settings.ignored_channel_ids : [];
+  if (ignoredChannelIds.includes(message.channelId)) return false;
+
+  const ticketSettings = await getGuildTicketSettings(message.guildId).catch(() => null);
+  if (ticketSettings?.tickets_category_id) {
+    const parentIdToCheck = message.channel?.isThread?.() ? message.channel.parent?.parentId : message.channel?.parentId;
+    if (parentIdToCheck === ticketSettings.tickets_category_id) {
+      return false;
+    }
   }
 
   const textForDetection = resolveMessageTextForDetection(message);
