@@ -19,6 +19,7 @@ const {
   handleSecurityLogButtonInteraction,
   isSecurityLogButtonInteraction,
 } = require("../services/securityLogsService");
+const { isDiscordUserSuspended, isDiscordUserAtRisk } = require("../services/violationService");
 
 function isTicketButtonInteraction(interaction) {
   return (
@@ -103,6 +104,18 @@ module.exports = {
         !interaction.deferred &&
         !interaction.replied
       ) {
+        // Block suspended users from opening tickets
+        const suspended = await isDiscordUserSuspended(interaction.user.id);
+        if (suspended) {
+          const payload = buildTicketSimpleMessagePayload({
+            title: "🚫 Conta Suspensa",
+            message:
+              "Sua conta Flowdesk está **suspensa** devido a violações ativas.\nVocê não pode abrir tickets enquanto sua conta estiver suspensa.\nAcesse o painel em flwdesk.com/account para mais detalhes.",
+            tone: "error",
+          });
+          await interaction.reply({ ...payload, flags: MessageFlags.Ephemeral }).catch(() => null);
+          return;
+        }
         await showOpenTicketReasonModal(interaction);
         return;
       }

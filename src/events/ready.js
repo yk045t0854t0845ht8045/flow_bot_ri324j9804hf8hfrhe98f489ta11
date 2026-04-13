@@ -10,6 +10,7 @@ const { primeInviteCacheForClient } = require("../utils/inviteTracker");
 const { syncSlashCommandsForClient } = require("../services/slashCommandSyncService");
 const { startVoicePresence } = require("../services/voicePresenceService");
 const { startStatusHeartbeat } = require("../services/statusMonitoringService");
+const { syncAllViolationRoles } = require("../services/violationService");
 const { env } = require("../config/env");
 
 module.exports = {
@@ -121,5 +122,22 @@ module.exports = {
         console.error("[ticket-open-messages]", error);
       }
     }, env.ticketOpenMessageSyncIntervalMs);
+
+    // Sync violation roles on startup, then every 6 hours
+    try {
+      await syncAllViolationRoles(client);
+      console.log("[violation-roles] Startup sync completo.");
+    } catch (error) {
+      console.error("[violation-roles] Erro no startup sync:", error);
+    }
+
+    setInterval(async () => {
+      try {
+        await syncAllViolationRoles(client);
+        console.log("[violation-roles] Sync periódico completo.");
+      } catch (error) {
+        console.error("[violation-roles] Erro no sync periódico:", error);
+      }
+    }, 6 * 60 * 60 * 1000); // Every 6 hours
   },
 };

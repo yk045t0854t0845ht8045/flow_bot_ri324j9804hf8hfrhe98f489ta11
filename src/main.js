@@ -2,6 +2,7 @@ const { Client, GatewayIntentBits, Partials } = require("discord.js");
 const { env } = require("./config/env");
 const { loadCommands } = require("./handlers/commandHandler");
 const { loadEvents } = require("./handlers/eventHandler");
+const { initRealtimeListeners } = require("./services/realtimeService");
 
 const client = new Client({
   intents: [
@@ -17,6 +18,10 @@ const client = new Client({
 
 loadCommands(client);
 loadEvents(client);
+
+client.once("ready", () => {
+  initRealtimeListeners(client);
+});
 
 client.login(env.discordToken);
 
