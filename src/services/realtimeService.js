@@ -52,21 +52,28 @@ function initRealtimeListeners(client) {
             return;
           }
 
-          console.log(`[realtimeService] Event [${payload.eventType}] detected for user ${userId}. Syncing Discord roles...`);
+          console.log(`[realtimeService] Event [${payload.eventType}] detected for user ${userId}. Scheduling sync in 1s...`);
           
-          // Trigger the role sync logic
-          await syncViolationRolesForDiscordUser(client, user.discord_user_id);
+          // Small delay to ensure DB state is fully committed and visible
+          setTimeout(async () => {
+            try {
+              // Trigger the role sync logic
+              await syncViolationRolesForDiscordUser(client, user.discord_user_id);
 
-          // Broadcast to frontend (using Discord ID as channel identifier)
-          await supabase
-            .channel(`user_violations:${user.discord_user_id}`)
-            .send({
-              type: "broadcast",
-              event: "refresh",
-              payload: { userId, discordUserId: user.discord_user_id },
-            });
+              // Broadcast to frontend (using Discord ID as channel identifier)
+              await supabase
+                .channel(`user_violations:${user.discord_user_id}`)
+                .send({
+                  type: "broadcast",
+                  event: "refresh",
+                  payload: { userId, discordUserId: user.discord_user_id },
+                });
 
-          console.log(`[realtimeService] Broadcasted refresh to user_violations:${user.discord_user_id}`);
+              console.log(`[realtimeService] Real-time sync & broadcast completed for ${user.discord_user_id} after delay.`);
+            } catch (innerErr) {
+              console.error("[realtimeService] Error in delayed sync:", innerErr.message);
+            }
+          }, 1000);
           
         } catch (err) {
           console.error("[realtimeService] Critical error in handler:", err.message);

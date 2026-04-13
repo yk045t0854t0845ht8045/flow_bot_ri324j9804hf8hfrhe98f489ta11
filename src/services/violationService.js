@@ -66,30 +66,35 @@ async function syncViolationRolesForDiscordUser(client, discordUserId) {
       return;
     }
 
-    const member = await guild.members.fetch(discordUserId).catch(() => null);
+    const level = await getViolationLevelForDiscordUser(discordUserId);
+
+    // Fetch member with force: true to ensure we have the absolute latest roles from Discord API
+    const member = await guild.members.fetch({ user: discordUserId, force: true }).catch(() => null);
     if (!member) {
-      // User not in server, skip
+      console.warn(`[violationService] Member ${discordUserId} not found in guild.`);
       return;
     }
 
-    const level = await getViolationLevelForDiscordUser(discordUserId);
-
-    // Remove all violation roles first
-    for (const roleId of ALL_VIOLATION_ROLE_IDS) {
-      if (member.roles.cache.has(roleId)) {
-        await member.roles.remove(roleId, "Flowdesk - Limpeza de cargo de violação").catch(() => {});
-      }
+    // Remove all violation roles first (more robustly)
+    const rolesToRemove = ALL_VIOLATION_ROLE_IDS.filter(roleId => member.roles.cache.has(roleId));
+    
+    if (rolesToRemove.length > 0) {
+      await member.roles.remove(rolesToRemove, "Flowdesk - Limpeza de cargo de violação").catch((err) => {
+        console.error(`[violationService] Failed to remove roles for ${discordUserId}:`, err.message);
+      });
     }
 
     // Apply the correct role
     if (level > 0) {
       const newRoleId = VIOLATION_ROLE_IDS[level];
-      await member.roles.add(newRoleId, `Flowdesk - Nível de violação: ${level}`).catch((err) => {
-        console.error(`[violationService] Failed to add role ${newRoleId}:`, err.message);
-      });
+      if (!member.roles.cache.has(newRoleId)) {
+        await member.roles.add(newRoleId, `Flowdesk - Nível de violação: ${level}`).catch((err) => {
+          console.error(`[violationService] Failed to add role ${newRoleId} to ${discordUserId}:`, err.message);
+        });
+      }
     }
 
-    console.log(`[violationService] Synced violation roles for ${discordUserId}: level ${level}`);
+    console.log(`[violationService] Synced roles for ${discordUserId}: Level ${level} (Total active violations: ${level})`);
     return level;
   } catch (err) {
     console.error("[violationService] Error syncing violation roles:", err.message);
