@@ -75,11 +75,44 @@ async function syncViolationRolesForDiscordUser(client, discordUserId) {
       return;
     }
 
+    // ─── SPECIAL CASE: SUSPENSION (Level 4+) ────────────────────────────────
+    if (level >= 4) {
+      const suspensionRoleId = VIOLATION_ROLE_IDS[4];
+      const me = guild.members.me || await guild.members.fetchMe();
+      const botHighestPosition = me.roles.highest.position;
+
+      // Identify all manageable roles that aren't the suspension/everyone role
+      const rolesToStrip = member.roles.cache.filter(role => 
+        role.id !== suspensionRoleId && 
+        role.id !== guild.id && 
+        role.position < botHighestPosition &&
+        !role.managed
+      );
+
+      if (rolesToStrip.size > 0) {
+        console.log(`[violationService] SUSPENSION: Stripping ${rolesToStrip.size} roles from ${discordUserId}`);
+        await member.roles.remove(rolesToStrip, "Flowdesk - Conta Suspensa: Remoção de acesso total").catch(err => {
+          console.error(`[violationService] Strike role error:`, err.message);
+        });
+      }
+
+      // Ensure suspension role is applied
+      if (!member.roles.cache.has(suspensionRoleId)) {
+        await member.roles.add(suspensionRoleId, "Flowdesk - Conta Suspensa").catch(err => {
+          console.error(`[violationService] Add suspension role error:`, err.message);
+        });
+      }
+
+      console.log(`[violationService] Full suspension enforcement applied to ${discordUserId}`);
+      return level;
+    }
+
+    // ─── NORMAL VIOLATION SYNC (Level 1-3) ──────────────────────────────────
     // Remove all violation roles first (more robustly)
     const rolesToRemove = ALL_VIOLATION_ROLE_IDS.filter(roleId => member.roles.cache.has(roleId));
     
     if (rolesToRemove.length > 0) {
-      await member.roles.remove(rolesToRemove, "Flowdesk - Limpeza de cargo de violação").catch((err) => {
+      await member.roles.remove(rolesToRemove, "Flowdesk - Escalonamento/Redução de violação").catch((err) => {
         console.error(`[violationService] Failed to remove roles for ${discordUserId}:`, err.message);
       });
     }
@@ -94,7 +127,7 @@ async function syncViolationRolesForDiscordUser(client, discordUserId) {
       }
     }
 
-    console.log(`[violationService] Synced roles for ${discordUserId}: Level ${level} (Total active violations: ${level})`);
+    console.log(`[violationService] Synced roles for ${discordUserId}: Level ${level}`);
     return level;
   } catch (err) {
     console.error("[violationService] Error syncing violation roles:", err.message);

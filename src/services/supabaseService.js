@@ -567,6 +567,7 @@ async function upsertTicketTranscript({
   userId,
   closedBy,
   transcriptHtml,
+  accessCode,
   accessCodeHash,
 }) {
   const result = await supabase
@@ -580,6 +581,7 @@ async function upsertTicketTranscript({
         user_id: userId,
         closed_by: closedBy,
         transcript_html: transcriptHtml,
+        access_code: accessCode,
         access_code_hash: accessCodeHash,
       },
       { onConflict: "ticket_id" },
@@ -877,7 +879,7 @@ async function getGuildTicketSettings(guildId) {
   const result = await supabase
     .from(TICKET_SETTINGS_TABLE)
     .select(
-      "guild_id, enabled, menu_channel_id, tickets_category_id, logs_created_channel_id, logs_closed_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, updated_at",
+      "guild_id, enabled, menu_channel_id, tickets_category_id, logs_created_channel_id, logs_closed_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, ai_rules, updated_at",
     )
     .eq("guild_id", guildId)
     .maybeSingle();
@@ -1279,7 +1281,7 @@ async function getConfiguredTicketGuildRuntimes() {
     supabase
       .from(TICKET_SETTINGS_TABLE)
       .select(
-        "guild_id, enabled, menu_channel_id, tickets_category_id, logs_created_channel_id, logs_closed_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, updated_at",
+        "guild_id, enabled, menu_channel_id, tickets_category_id, logs_created_channel_id, logs_closed_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, ai_rules, updated_at",
       ),
     supabase
       .from(TICKET_STAFF_SETTINGS_TABLE)

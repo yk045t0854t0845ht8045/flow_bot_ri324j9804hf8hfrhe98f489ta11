@@ -19,6 +19,7 @@ create table if not exists public.account_violations (
 
 -- Realtime Support
 alter publication supabase_realtime add table account_violations;
+alter table public.account_violations replica identity full;
 
 -- IMPORTANT: Add category_id if it doesn't exist (Fixes the "column does not exist" error)
 alter table public.account_violations add column if not exists category_id text references public.violation_definitions(id) on delete set null;

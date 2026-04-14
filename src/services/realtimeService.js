@@ -35,32 +35,27 @@ function initRealtimeListeners(client) {
         }
 
         try {
-          // Resolve Discord ID from internal User ID
-          const { data: user, error } = await supabase
-            .from("auth_users")
-            .select("discord_user_id")
-            .eq("id", userId)
-            .maybeSingle();
-
-          if (error) {
-            console.error("[realtimeService] Error resolving discord_user_id:", error.message);
-            return;
-          }
-
-          if (!user?.discord_user_id) {
-            console.warn(`[realtimeService] Could not find discord_user_id for internal ID ${userId}`);
-            return;
-          }
-
-          console.log(`[realtimeService] Event [${payload.eventType}] detected for user ${userId}. Scheduling sync in 1s...`);
+          console.log(`[realtimeService] DB ${payload.eventType} event on user ${userId}. Syncing in 200ms...`);
           
-          // Small delay to ensure DB state is fully committed and visible
+          // Reduced delay: 200ms is usually enough for commit propagation
           setTimeout(async () => {
             try {
-              // Trigger the role sync logic
+              // 1. Resolve Discord ID
+              const { data: user } = await supabase
+                .from("auth_users")
+                .select("discord_user_id")
+                .eq("id", userId)
+                .maybeSingle();
+
+              if (!user?.discord_user_id) {
+                console.warn(`[realtimeService] Could not resolve Discord ID for user ${userId}`);
+                return;
+              }
+
+              // 2. Sync Roles
               await syncViolationRolesForDiscordUser(client, user.discord_user_id);
 
-              // Broadcast to frontend (using Discord ID as channel identifier)
+              // 3. Broadcast to site
               await supabase
                 .channel(`user_violations:${user.discord_user_id}`)
                 .send({
@@ -69,14 +64,14 @@ function initRealtimeListeners(client) {
                   payload: { userId, discordUserId: user.discord_user_id },
                 });
 
-              console.log(`[realtimeService] Real-time sync & broadcast completed for ${user.discord_user_id} after delay.`);
+              console.log(`[realtimeService] Real-time sync & broadcast completed for ${user.discord_user_id}`);
             } catch (innerErr) {
-              console.error("[realtimeService] Error in delayed sync:", innerErr.message);
+              console.error("[realtimeService] Sync error:", innerErr.message);
             }
-          }, 1000);
+          }, 200);
           
         } catch (err) {
-          console.error("[realtimeService] Critical error in handler:", err.message);
+          console.error("[realtimeService] Payload error:", err.message);
         }
       }
     )

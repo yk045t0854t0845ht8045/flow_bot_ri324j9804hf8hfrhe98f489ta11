@@ -1428,9 +1428,42 @@ async function handleTicketAiMessage(message, client) {
   }
 }
 
+async function generateAiSuggestion(reason, rules, userId) {
+  if (!env.openaiApiKey) {
+    throw new Error("OpenAI API Key não configurada.");
+  }
+
+  const systemPrompt = [
+    "Você é o assistente de triagem do Flowdesk.",
+    "Seu papel é analisar o motivo de abertura de um ticket e fornecer uma sugestão rápida de resolução baseada nas 'Regras de Atendimento' do servidor.",
+    "Seja extremamente objetivo, educado e útil.",
+    "Se a pergunta do usuário puder ser resolvida com as regras fornecidas, dê a solução agora.",
+    "Se a pergunta for complexa ou não houver regra clara, oriente brevemente sobre o que ele deve preparar enquanto o ticket é aberto.",
+    "Termine sempre perguntando se a informação ajudou.",
+    "Use Markdown do Discord para formatar sua resposta (negrito, listas, etc).",
+  ].join(" ");
+
+  const contextPrompt = `
+Regras de Atendimento do Servidor:
+${rules || "Nenhuma regra específica configurada."}
+
+Pergunta/Motivo do Usuário:
+${reason}
+  `.trim();
+
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: contextPrompt },
+  ];
+
+  const result = await callOpenAI(messages, userId);
+  return result.content;
+}
+
 module.exports = {
   handleTicketAiMessage,
   markTicketAiClosed,
   markTicketAiHandoff,
   sendInitialTicketAiMessage,
+  generateAiSuggestion,
 };

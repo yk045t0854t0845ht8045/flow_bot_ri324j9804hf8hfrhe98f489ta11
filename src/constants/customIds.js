@@ -7,6 +7,8 @@ const CUSTOM_IDS = {
   ticketMemberPanel: "ticket:panel_member",
   openTicketReasonModal: "ticket:open_modal",
   openTicketReasonInput: "ticket:open_reason",
+  aiSuggestionHelped: "ticket:ai_helped",
+  aiSuggestionContinue: "ticket:ai_continue",
 };
 
 module.exports = { CUSTOM_IDS };

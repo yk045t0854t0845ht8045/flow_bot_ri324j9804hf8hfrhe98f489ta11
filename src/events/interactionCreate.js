@@ -14,6 +14,8 @@ const {
   showAdminTicketPanelFromInteraction,
   showMemberTicketPanelFromInteraction,
   showStaffTicketPanelFromInteraction,
+  handleAiSuggestionHelped,
+  handleAiSuggestionContinue,
 } = require("../services/ticketService");
 const {
   handleSecurityLogButtonInteraction,
@@ -146,6 +148,16 @@ module.exports = {
 
       if (interaction.customId === CUSTOM_IDS.ticketMemberPanel) {
         await showMemberTicketPanelFromInteraction(interaction);
+        return;
+      }
+
+      if (interaction.customId === CUSTOM_IDS.aiSuggestionHelped) {
+        await handleAiSuggestionHelped(interaction);
+        return;
+      }
+
+      if (interaction.customId === CUSTOM_IDS.aiSuggestionContinue) {
+        await handleAiSuggestionContinue(interaction);
       }
     } catch (error) {
       if (isUnknownInteractionError(error)) {
