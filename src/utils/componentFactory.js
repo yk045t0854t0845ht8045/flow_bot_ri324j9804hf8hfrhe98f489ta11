@@ -1187,7 +1187,7 @@ function buildTicketClosureDmPayload({
 
 function buildAiSuggestionPayload({ suggestion, guildName }) {
   const lines = [
-    `### 🤖 Sugestão do Assistente`,
+    `## Sugestão do assistente`,
     suggestion,
     "",
     guildName ? `-# Baseado nas regras de atendimento de **${guildName}**` : "",
@@ -1215,7 +1215,7 @@ function buildAiSuggestionPayload({ suggestion, guildName }) {
             components: [
               {
                 type: COMPONENT_TYPE.BUTTON,
-                style: BUTTON_STYLE.SUCCESS,
+                style: BUTTON_STYLE.SECONDARY,
                 label: "Ajudou, Não abrir ticket",
                 custom_id: CUSTOM_IDS.aiSuggestionHelped,
               },
