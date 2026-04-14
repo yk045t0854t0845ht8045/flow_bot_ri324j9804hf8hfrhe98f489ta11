@@ -38,6 +38,7 @@ const {
   buildLogPayload,
   buildTicketIntroPayload,
   buildTicketSimpleMessagePayload,
+  buildAiSuggestionPayload,
 } = require("../utils/componentFactory");
 const { generateProtocol } = require("../utils/protocol");
 const {
@@ -56,10 +57,10 @@ const {
   processDirectMessageQueue,
 } = require("./directMessageQueueService");
 const {
-  markTicketAiClosed,
   markTicketAiHandoff,
   sendInitialTicketAiMessage,
   generateAiSuggestion,
+  sendTicketAiInteractionLog,
 } = require("./ticketAiService");
 
 const pendingTicketReasons = new Map();
@@ -875,32 +876,25 @@ async function openTicketFromModalSubmit(interaction) {
         openedReason,
         runtime.settings.ai_rules,
         interaction.user.id,
+        {
+          guildName: interaction.guild.name,
+          userName: interaction.user.displayName || interaction.user.username,
+        },
       );
 
       const pendingKey = buildPendingReasonKey(interaction.guild.id, interaction.user.id);
       pendingTicketReasons.set(pendingKey, {
         reason: openedReason,
-        expiresAt: Date.now() + 1000 * 60 * 10, // 10 minutes session
+        suggestion, // Store suggestion for logging later
+        expiresAt: Date.now() + 1000 * 60 * 10,
       });
 
-      const { ButtonBuilder, ButtonStyle } = require("discord.js");
-
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(CUSTOM_IDS.aiSuggestionHelped)
-          .setLabel("Ajudou, Não abrir ticket")
-          .setStyle(ButtonStyle.Success),
-        new ButtonBuilder()
-          .setCustomId(CUSTOM_IDS.aiSuggestionContinue)
-          .setLabel("Continuar com ticket")
-          .setStyle(ButtonStyle.Primary),
-      );
-
-      await interaction.followUp({
-        content: `### 🤖 Sugestão da IA\n\n${suggestion}`,
-        components: [row],
-        flags: MessageFlags.Ephemeral,
+      const payload = buildAiSuggestionPayload({
+        suggestion,
+        guildName: interaction.guild.name,
       });
+
+      await interaction.followUp(payload);
       return;
     } catch (error) {
       console.error("[ticketService:aiSuggestion] Falha ao gerar sugestão:", error);
@@ -917,7 +911,19 @@ async function openTicketFromModalSubmit(interaction) {
 
 async function handleAiSuggestionHelped(interaction) {
   const pendingKey = buildPendingReasonKey(interaction.guild.id, interaction.user.id);
+  const cached = pendingTicketReasons.get(pendingKey);
   pendingTicketReasons.delete(pendingKey);
+
+  if (cached) {
+    await sendTicketAiInteractionLog(interaction.client, {
+      ticket: { guild_id: interaction.guild.id, protocol: "N/A (Pre-ticket)" },
+      userId: interaction.user.id,
+      prompt: cached.reason,
+      response: cached.suggestion,
+      source: "ai_suggestion",
+      status: "resolved_by_ai",
+    }).catch(console.error);
+  }
 
   await interaction.reply({
     content: "Fico feliz que a sugestão ajudou! Atendimento encerrado antes de abrir o ticket.",
@@ -939,6 +945,15 @@ async function handleAiSuggestionContinue(interaction) {
   }
 
   pendingTicketReasons.delete(pendingKey);
+
+  await sendTicketAiInteractionLog(interaction.client, {
+    ticket: { guild_id: interaction.guild.id, protocol: "N/A (Pre-ticket)" },
+    userId: interaction.user.id,
+    prompt: cached.reason,
+    response: cached.suggestion,
+    source: "ai_suggestion",
+    status: "continued_to_ticket",
+  }).catch(console.error);
   
   if (!interaction.deferred && !interaction.replied) {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });

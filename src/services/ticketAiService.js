@@ -1428,22 +1428,26 @@ async function handleTicketAiMessage(message, client) {
   }
 }
 
-async function generateAiSuggestion(reason, rules, userId) {
+async function generateAiSuggestion(reason, rules, userId, { guildName, userName } = {}) {
   if (!env.openaiApiKey) {
     throw new Error("OpenAI API Key não configurada.");
   }
 
   const systemPrompt = [
     "Você é o assistente de triagem do Flowdesk.",
+    guildName ? `Você está atendendo no servidor **${guildName}**.` : "",
     "Seu papel é analisar o motivo de abertura de um ticket e fornecer uma sugestão rápida de resolução baseada nas 'Regras de Atendimento' do servidor.",
     "Seja extremamente objetivo, educado e útil.",
     "Se a pergunta do usuário puder ser resolvida com as regras fornecidas, dê a solução agora.",
     "Se a pergunta for complexa ou não houver regra clara, oriente brevemente sobre o que ele deve preparar enquanto o ticket é aberto.",
     "Termine sempre perguntando se a informação ajudou.",
     "Use Markdown do Discord para formatar sua resposta (negrito, listas, etc).",
-  ].join(" ");
+  ].filter(Boolean).join(" ");
 
   const contextPrompt = `
+Usuário: ${userName || "Desconhecido"} (${userId})
+Servidor: ${guildName || "Desconhecido"}
+
 Regras de Atendimento do Servidor:
 ${rules || "Nenhuma regra específica configurada."}
 
@@ -1466,4 +1470,5 @@ module.exports = {
   markTicketAiHandoff,
   sendInitialTicketAiMessage,
   generateAiSuggestion,
+  sendTicketAiInteractionLog,
 };

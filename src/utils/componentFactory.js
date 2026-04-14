@@ -1,4 +1,4 @@
-﻿const { MessageFlags, SeparatorSpacingSize } = require("discord.js");
+const { MessageFlags, SeparatorSpacingSize } = require("discord.js");
 const { CUSTOM_IDS } = require("../constants/customIds");
 
 const DEFAULT_TICKET_PANEL_TITLE = "Abrir atendimento";
@@ -1185,6 +1185,54 @@ function buildTicketClosureDmPayload({
   };
 }
 
+function buildAiSuggestionPayload({ suggestion, guildName }) {
+  const lines = [
+    `### 🤖 Sugestão do Assistente`,
+    suggestion,
+    "",
+    guildName ? `-# Baseado nas regras de atendimento de **${guildName}**` : "",
+  ].filter(Boolean);
+
+  return {
+    flags: MessageFlags.IsComponentsV2,
+    components: [
+      {
+        type: COMPONENT_TYPE.CONTAINER,
+        accent_color: resolveTicketMessageToneColor("neutral"),
+        components: [
+          {
+            type: COMPONENT_TYPE.TEXT_DISPLAY,
+            content: lines.join("\n"),
+          },
+          {
+            type: COMPONENT_TYPE.SEPARATOR,
+            divider: true,
+            spacing: SeparatorSpacingSize.Small,
+          },
+          {
+            type: COMPONENT_TYPE.ACTION_ROW,
+            components: [
+              {
+                type: COMPONENT_TYPE.BUTTON,
+                style: BUTTON_STYLE.SUCCESS,
+                label: "Ajudou, Não abrir ticket",
+                custom_id: CUSTOM_IDS.aiSuggestionHelped,
+              },
+              {
+                type: COMPONENT_TYPE.BUTTON,
+                style: BUTTON_STYLE.PRIMARY,
+                label: "Continuar com ticket",
+                custom_id: CUSTOM_IDS.aiSuggestionContinue,
+              },
+            ],
+          },
+        ],
+      },
+    ],
+    allowedMentions: { parse: [] },
+  };
+}
+
 module.exports = {
   buildTicketPanelPayload,
   buildWelcomeMessagePayload,
@@ -1193,5 +1241,6 @@ module.exports = {
   buildTicketIntroPayload,
   buildLogPayload,
   buildTicketClosureDmPayload,
+  buildAiSuggestionPayload,
 };
 
