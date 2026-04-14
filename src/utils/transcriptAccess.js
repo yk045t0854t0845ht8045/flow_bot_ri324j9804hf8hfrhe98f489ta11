@@ -70,7 +70,7 @@ function buildTranscriptUrl(protocol) {
 }
 
 function createTranscriptAccessCode() {
-  return String(Math.floor(Math.random() * 10000)).padStart(4, "0");
+  return crypto.randomBytes(6).toString("base64url").slice(0, 8).toUpperCase();
 }
 
 function hashTranscriptAccessCode(protocol, code) {

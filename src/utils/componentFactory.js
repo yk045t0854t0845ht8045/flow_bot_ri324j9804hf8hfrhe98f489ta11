@@ -1186,12 +1186,7 @@ function buildTicketClosureDmPayload({
 }
 
 function buildAiSuggestionPayload({ suggestion, guildName }) {
-  const mainContent = [
-    `## Sugestão do assistente`,
-    suggestion,
-  ].join("\n");
-
-  const footerLine = `<:flowdesk_icon:1485070577982116000> Todos os direitos reservados (c) 2026 Flowdesk. FlowAI pode cometer erros confira todas as informações geradas. Esta é uma sugestão automática. Se não resolveu, clique em "Continuar com ticket".`;
+  const footerLine = `-# <:flowdesk_icon:1485070577982116000> Todos os direitos reservados (c) 2026 **Flowdesk®**. **FlowAI** pode cometer erros confira todas as informações geradas. Esta é uma sugestão automática. Se não resolveu, clique em "**Continuar com ticket**".`;
 
   return {
     flags: MessageFlags.IsComponentsV2,
@@ -1202,7 +1197,16 @@ function buildAiSuggestionPayload({ suggestion, guildName }) {
         components: [
           {
             type: COMPONENT_TYPE.TEXT_DISPLAY,
-            content: mainContent,
+            content: `## Sugestão do assistente`,
+          },
+          {
+            type: COMPONENT_TYPE.SEPARATOR,
+            divider: true,
+            spacing: SeparatorSpacingSize.Small,
+          },
+          {
+            type: COMPONENT_TYPE.TEXT_DISPLAY,
+            content: suggestion,
           },
           {
             type: COMPONENT_TYPE.SEPARATOR,
