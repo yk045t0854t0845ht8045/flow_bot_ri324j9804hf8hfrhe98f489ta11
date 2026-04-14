@@ -1,33 +1,51 @@
-# Tutorial: Configurando a API da OpenProvider
+# Openprovider - checklist de configuracao
 
-Para que o sistema de busca de domínios funcione, você precisa configurar suas credenciais da OpenProvider no arquivo `.env`.
+Este projeto consulta dominios pela API REST oficial da Openprovider.
 
-## Passo 1: Criar uma conta na OpenProvider
-1. Acesse [OpenProvider](https://www.openprovider.com/) e crie uma conta (RCP - Reseller Control Panel).
-2. Note que a OpenProvider é focada em revendedores, então você precisará preencher os dados de empresa/profissional.
+## Variaveis obrigatorias
 
-## Passo 2: Gerar credenciais de API
-A OpenProvider utiliza o seu **Nome de Usuário** e **Senha** da conta para autenticação na API REST.
-
-1. Faça login no seu painel da OpenProvider.
-2. Certifique-se de que o acesso via API está habilitado em sua conta.
-3. Vá em **Account** > **Settings** > **API settings**.
-4. Lá você pode restringir os IPs que podem acessar a API (recomendado colocar o IP do seu servidor de produção).
-
-## Passo 3: Configurar o arquivo .env
-No diretório `site/`, abra o arquivo `.env` e adicione as seguintes linhas:
+No arquivo `site/.env`, configure:
 
 ```env
-# Credentials for Domain Search (OpenProvider)
-OPENPROVIDER_USERNAME=seu_usuario_aqui
-OPENPROVIDER_PASSWORD=sua_senha_aqui
+OPENPROVIDER_BASE_URL=https://api.openprovider.eu/v1beta
+OPENPROVIDER_TIMEOUT_MS=12000
+OPENPROVIDER_USERNAME=seu-usuario
+OPENPROVIDER_PASSWORD=sua-senha
 ```
 
-> [!IMPORTANT]
-> Se você estiver em ambiente de testes, a OpenProvider possui um ambiente de "Sandbox" (CTE). Caso queira usar o Sandbox, a URL no arquivo `site/app/api/domains/check/route.ts` deve ser alterada de `api.openprovider.eu` para `api.test.openprovider.eu`.
+## Variaveis opcionais recomendadas
 
-## Passo 4: Reiniciar o Servidor
-Após salvar o arquivo `.env`, reinicie seu servidor de desenvolvimento para que as mudanças façam efeito:
-```bash
-npm run dev
+```env
+# Se sua conta restringe chamadas por IP, informe o IP liberado.
+OPENPROVIDER_IP=0.0.0.0
+
+# Ordem de extensoes consultadas na vitrine do /domains.
+OPENPROVIDER_TLDS=com.br,com,ai,io,org,net
 ```
+
+## Checklist rapido para nao dar Authentication/Authorization Failed
+
+1. Confirme se `OPENPROVIDER_USERNAME` e `OPENPROVIDER_PASSWORD` estao corretos.
+2. Verifique no painel da Openprovider se o acesso via API esta habilitado.
+3. Se houver whitelist de IP, libere o IP do servidor onde o Next.js roda.
+4. Se usar `OPENPROVIDER_IP`, envie exatamente o mesmo IP autorizado na conta.
+5. Reinicie o servidor do site depois de mudar o `.env`.
+6. Confirme que o ambiente esta apontando para o host certo:
+   producao: `https://api.openprovider.eu/v1beta`
+   sandbox: `https://api.test.openprovider.eu/v1beta`
+
+## O que o sistema faz agora
+
+1. Autentica na Openprovider com retry controlado.
+2. Consulta a disponibilidade do dominio com `domains/check`.
+3. Se o preco vier vazio para um dominio livre, busca fallback em `domains/prices`.
+4. Ordena a lista com o dominio exato primeiro, depois disponibilidade e prioridade de TLD.
+5. Retorna mensagens claras quando o problema e credencial, timeout, manutencao ou configuracao.
+
+## Validacao manual recomendada
+
+1. Rode `npm --prefix site run dev`.
+2. Abra `/domains`.
+3. Teste um nome base, por exemplo `flowdesk`.
+4. Teste um dominio completo, por exemplo `flowdesk.com.br`.
+5. Se houver falha de autenticacao, revise a whitelist de IP antes de trocar o codigo.
