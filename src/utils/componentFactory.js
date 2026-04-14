@@ -1191,6 +1191,7 @@ function buildAiSuggestionPayload({ suggestion, guildName }) {
     suggestion,
     "",
     guildName ? `-# Baseado nas regras de atendimento de **${guildName}**` : "",
+    `-# 💡 Esta é uma sugestão automática. Se não resolveu, clique em "Continuar com ticket".`,
   ].filter(Boolean);
 
   return {

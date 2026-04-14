@@ -565,7 +565,7 @@ async function showOpenTicketReasonModal(interaction) {
   await interaction.showModal(modal);
 }
 
-async function openTicketFromInteraction(interaction, openedReason = "") {
+async function openTicketFromInteraction(interaction, openedReason = "", aiSuggestion = null) {
   if (!interaction.inGuild()) {
     await replyWithTicketMessage(
       interaction,
@@ -805,7 +805,27 @@ async function openTicketFromInteraction(interaction, openedReason = "") {
             tone: "success",
           }),
         )
-        .catch(() => null);
+    }
+    
+    // Send AI suggestion summary for staff visibility
+    if (aiSuggestion) {
+      try {
+        await channel.send(buildTicketSimpleMessagePayload({
+          title: "🤖 Triagem IA",
+          message: [
+            "O usuário recebeu a seguinte sugestão antes de abrir este ticket:",
+            "",
+            aiSuggestion,
+          ].join("\n"),
+          tone: "neutral",
+        })).catch(() => null);
+      } catch (error) {
+        logTicketFlowFailure("send-ai-suggestion-summary", error, {
+          guildId: guild.id,
+          channelId: channel.id,
+          protocol: ticket.protocol,
+        });
+      }
     }
 
     try {
@@ -962,8 +982,360 @@ async function handleAiSuggestionContinue(interaction) {
     await interaction.editReply({ content: "Abrindo seu ticket agora...", components: [] });
   }
   
-  await openTicketFromInteraction(interaction, cached.reason);
+  await openTicketFromInteraction(interaction, cached.reason, cached.suggestion);
 }
+
+async function claimTicketFromInteraction(interaction) {
+  if (!interaction.inGuild()) {
+    await replyWithTicketMessage(
+      interaction,
+      {
+        title: "Servidor obrigatorio",
+        message: "Este comando funciona apenas dentro de servidores.",
+        tone: "warning",
+      },
+    );
+    return;
+  }
+
+  const runtime = await ensureGuildRuntimeOrReply(interaction);
+  if (!runtime) return;
+
+  if (!canClaimTicket(interaction.member, runtime.staffSettings)) {
+    await replyWithTicketMessage(
+      interaction,
+      {
+        title: "Acesso negado",
+        message: "Apenas a equipe configurada pode assumir tickets.",
+        tone: "error",
+      },
+    );
+    return;
+  }
+
+  const channel = interaction.channel;
+  const guild = interaction.guild;
+  const ticket = await getOpenTicketByChannel(guild.id, channel.id);
+
+  if (!ticket) {
+    await replyWithTicketMessage(
+      interaction,
+      {
+        title: "Ticket nao encontrado",
+        message: "Este canal nao possui ticket aberto vinculado.",
+        tone: "error",
+      },
+    );
+    return;
+  }
+
+  if (ticket.claimed_by === interaction.user.id) {
+    await replyWithTicketMessage(
+      interaction,
+      {
+        title: "Acao duplicada",
+        message: "Voce ja esta como responsavel deste ticket.",
+        tone: "warning",
+      },
+    );
+    return;
+  }
+
+  const updated = await claimTicket(ticket.id, interaction.user.id);
+
+  await registerEvent({
+    ticketId: updated.id,
+    protocol: updated.protocol,
+    guildId: guild.id,
+    channelId: channel.id,
+    actorId: interaction.user.id,
+    eventType: "claimed",
+  });
+
+  try {
+    await markTicketAiHandoff(updated, {
+      handoffReason: "ticket_claimed",
+      handedOffBy: interaction.user.id,
+      handedOffAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    logTicketFlowFailure("mark-ticket-ai-claimed", error, {
+      guildId: guild.id,
+      channelId: channel.id,
+      protocol: updated.protocol,
+      actorId: interaction.user.id,
+    });
+  }
+
+  await channel.send(
+    buildLogPayload({
+      accentColor: runtime.accentColor,
+      title: "Ticket assumido",
+      lines: [
+        `**Protocolo:** \`${updated.protocol}\``,
+        `**Responsavel:** <@${interaction.user.id}>`,
+      ],
+    }),
+  );
+
+  await sendTicketClaimedLog(guild, updated, interaction.user.id, runtime);
+
+  await replyWithTicketMessage(interaction, {
+    title: "Ticket assumido",
+    message: "Ticket assumido com sucesso.",
+    tone: "success",
+  });
+}
+
+async function closeTicketFromInteraction(interaction) {
+  if (!interaction.inGuild()) {
+    await replyWithTicketMessage(
+      interaction,
+      {
+        title: "Servidor obrigatorio",
+        message: "Este comando funciona apenas dentro de servidores.",
+        tone: "warning",
+      },
+    );
+    return;
+  }
+
+  const runtime = await ensureGuildRuntimeOrReply(interaction);
+  if (!runtime) return;
+
+  if (!canCloseTicket(interaction.member, runtime.staffSettings)) {
+    await replyWithTicketMessage(
+      interaction,
+      {
+        title: "Acesso negado",
+        message: "Apenas a equipe configurada pode fechar tickets.",
+        tone: "error",
+      },
+    );
+    return;
+  }
+
+  const channel = interaction.channel;
+  const guild = interaction.guild;
+  const ticket = await getOpenTicketByChannel(guild.id, channel.id);
+
+  if (!ticket) {
+    await replyWithTicketMessage(
+      interaction,
+      {
+        title: "Ticket nao encontrado",
+        message: "Este canal nao possui ticket aberto vinculado.",
+        tone: "error",
+      },
+    );
+    return;
+  }
+
+  try {
+    const result = await closeOpenTicketChannel({
+      client: interaction.client,
+      guild,
+      channel,
+      ticket,
+      actorId: interaction.user.id,
+      runtime,
+    });
+
+    await replyWithTicketMessage(
+      interaction,
+      {
+        title: "Ticket fechado",
+        message: buildTicketClosureReplyMessage(
+          result.transcriptAvailable,
+          result.dmDeliveryStatus,
+        ),
+        tone: resolveTicketClosureReplyTone(
+          result.transcriptAvailable,
+          result.dmDeliveryStatus,
+        ),
+      },
+    );
+  } catch (error) {
+    if (String(error?.message || "").includes("Transcript vazio gerado")) {
+      await replyWithTicketMessage(interaction, {
+        title: "Falha no transcript",
+        message:
+          "Nao foi possivel proteger e salvar o transcript deste ticket agora. Tente fechar novamente em alguns segundos.",
+        tone: "error",
+      });
+      return;
+    }
+
+    throw error;
+  }
+}
+
+async function closeOpenTicketChannel({
+  client,
+  guild,
+  channel,
+  ticket,
+  actorId,
+  runtime,
+}) {
+  let transcriptHtml = "";
+  let transcriptUrl = "";
+  let accessCode = "";
+  let dmDeliveryStatus = "queued";
+  let transcriptAvailable = false;
+
+  try {
+    transcriptAvailable = await shouldGenerateTranscript(channel);
+
+    if (transcriptAvailable) {
+      transcriptHtml = await generateTranscriptHtml(channel);
+      if (!String(transcriptHtml || "").trim()) {
+        throw new Error("Transcript vazio gerado para o ticket.");
+      }
+
+      transcriptUrl = buildTranscriptUrl(ticket.protocol);
+      accessCode = createTranscriptAccessCode();
+
+      await upsertTicketTranscript({
+        ticketId: ticket.id,
+        protocol: ticket.protocol,
+        guildId: guild.id,
+        channelId: channel.id,
+        userId: ticket.user_id,
+        closedBy: actorId,
+        transcriptHtml,
+        accessCodeHash: hashTranscriptAccessCode(ticket.protocol, accessCode),
+      });
+    }
+  } catch (error) {
+    logTicketFlowFailure("prepare-transcript", error, {
+      guildId: guild.id,
+      channelId: channel.id,
+      protocol: ticket.protocol,
+      actorId,
+    });
+    throw error;
+  }
+
+  const updated = await closeTicket(
+    ticket.id,
+    actorId,
+    transcriptAvailable ? transcriptUrl : null,
+  );
+
+  try {
+    await markTicketAiClosed(updated, {
+      handedOffBy: actorId,
+      handoffReason: "ticket_closed",
+    });
+  } catch (error) {
+    logTicketFlowFailure("mark-ticket-ai-closed", error, {
+      guildId: guild.id,
+      channelId: channel.id,
+      protocol: updated.protocol,
+      actorId,
+    });
+  }
+
+  try {
+    const { notificationKey } = await enqueueTicketClosureDirectMessage({
+      ticket: updated,
+      closedBy: actorId,
+      transcriptAvailable,
+      transcriptUrl,
+      accessCode,
+    });
+    const queueResults = await processDirectMessageQueue(client, {
+      limit: 10,
+      notificationKey,
+    });
+    dmDeliveryStatus = resolveTicketClosureDmStatus(
+      queueResults,
+      notificationKey,
+    );
+  } catch (error) {
+    dmDeliveryStatus = "failed";
+    logTicketFlowFailure("queue-ticket-closure-dm", error, {
+      guildId: guild.id,
+      channelId: channel.id,
+      protocol: ticket.protocol,
+      userId: ticket.user_id,
+      notificationKey: buildTicketClosureNotificationKey(updated.id),
+    });
+  }
+
+  await registerEvent({
+    ticketId: updated.id,
+    protocol: updated.protocol,
+    guildId: guild.id,
+    channelId: channel.id,
+    actorId,
+    eventType: "closed",
+    metadata: {
+      transcript_url: transcriptUrl,
+      transcript_available: transcriptAvailable,
+      transcript_dm_delivered: dmDeliveryStatus === "sent",
+      transcript_dm_status: dmDeliveryStatus,
+      transcript_reason: transcriptAvailable ? "available" : "insufficient_messages",
+    },
+  });
+
+  try {
+    await sendTicketClosedLog(
+      guild,
+      updated,
+      {
+        available: transcriptAvailable,
+        url: transcriptUrl,
+        dmStatus: dmDeliveryStatus,
+      },
+      actorId,
+      runtime,
+    );
+  } catch (error) {
+    logTicketFlowFailure("send-closed-log", error, {
+      guildId: guild.id,
+      channelId: channel.id,
+      protocol: updated.protocol,
+    });
+  }
+
+  await channel
+    .send(
+      buildLogPayload({
+        accentColor: runtime.accentColor,
+        title: "Encerramento",
+        lines: [
+          `**Protocolo:** \`${updated.protocol}\``,
+          `**Fechado por:** <@${actorId}>`,
+          `Canal sera removido em ${env.deleteDelaySeconds}s.`,
+        ],
+      }),
+    )
+    .catch((error) => {
+      logTicketFlowFailure("send-close-summary", error, {
+        guildId: guild.id,
+        channelId: channel.id,
+        protocol: updated.protocol,
+      });
+    });
+
+  setTimeout(async () => {
+    await channel.delete("Ticket encerrado").catch(() => null);
+  }, env.deleteDelaySeconds * 1000);
+
+  return {
+    updated,
+    transcriptAvailable,
+    dmDeliveryStatus,
+    transcriptUrl,
+  };
+}
+
+async function syncAllTicketPanels(client) {
+  return ensureTicketPanels(client);
+}
+
 
 module.exports = {
   reconcileDeletedTicketChannel,
