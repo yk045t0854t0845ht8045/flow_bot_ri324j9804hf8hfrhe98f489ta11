@@ -884,49 +884,82 @@ async function openTicketFromModalSubmit(interaction) {
     CUSTOM_IDS.openTicketReasonInput,
   );
 
-  const runtime = await ensureGuildRuntimeOrReply(interaction);
-  if (!runtime) return;
+  // Immediate feedback
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-  // Use AI suggestion if rules are configured
-  if (runtime.settings?.ai_rules && env.openaiApiKey) {
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-    try {
-      const suggestion = await generateAiSuggestion(
-        openedReason,
-        runtime.settings.ai_rules,
-        interaction.user.id,
-        {
-          guildName: interaction.guild.name,
-          userName: interaction.user.displayName || interaction.user.username,
-        },
-      );
-
-      const pendingKey = buildPendingReasonKey(interaction.guild.id, interaction.user.id);
-      pendingTicketReasons.set(pendingKey, {
-        reason: openedReason,
-        suggestion, // Store suggestion for logging later
-        expiresAt: Date.now() + 1000 * 60 * 10,
-      });
-
-      const payload = buildAiSuggestionPayload({
-        suggestion,
-        guildName: interaction.guild.name,
-      });
-
-      await interaction.followUp(payload);
+  try {
+    const runtime = await getGuildTicketRuntime(interaction.guild.id);
+    
+    if (!runtime.settings || !runtime.staffSettings) {
+      await interaction.editReply(buildTicketSimpleMessagePayload({
+        title: "Configuracao pendente",
+        message: "As configuracoes do ticket deste servidor ainda nao foram concluidas no Flowdesk.",
+        tone: "warning",
+      }));
       return;
-    } catch (error) {
-      console.error("[ticketService:aiSuggestion] Falha ao gerar sugestão:", error);
-      // Fallback: Continue with standard ticket opening if AI fails
     }
+
+    const guildRuntime = {
+      ...runtime,
+      accentColor: env.accentColor,
+    };
+
+    // Use AI suggestion if OpenAI is configured
+    // Trigger even if ai_rules is empty (General Triage Mode)
+    if (env.openaiApiKey) {
+      try {
+        const suggestion = await generateAiSuggestion(
+          openedReason,
+          guildRuntime.settings.ai_rules, // Can be null/empty
+          interaction.user.id,
+          {
+            guildName: interaction.guild.name,
+            userName: interaction.user.displayName || interaction.user.username,
+          },
+        );
+
+        const pendingKey = buildPendingReasonKey(interaction.guild.id, interaction.user.id);
+        pendingTicketReasons.set(pendingKey, {
+          reason: openedReason,
+          suggestion,
+          expiresAt: Date.now() + 1000 * 60 * 10,
+        });
+
+        const payload = buildAiSuggestionPayload({
+          suggestion,
+          guildName: interaction.guild.name,
+        });
+
+        await interaction.editReply(payload);
+        return;
+      } catch (error) {
+        console.error("[ticketService:aiSuggestion] Falha ao gerar sugestão:", error);
+        // If it's a specific AI/Token error, we can continue to standard flow
+      }
+    }
+
+    // Fallback or explicit skip to standard ticket opening
+    await openTicketFromInteraction(interaction, openedReason);
+  } catch (error) {
+    const errorMessage = String(error?.message || "");
+    
+    // Check if it's a database migration issue (missing column)
+    if (errorMessage.includes("ai_rules") || errorMessage.includes("column does not exist")) {
+      await interaction.editReply(buildTicketSimpleMessagePayload({
+        title: "⚠️ Erro de Banco de Dados",
+        message: "A coluna `ai_rules` não foi encontrada no seu banco de dados Supabase.\n\n**Ação necessária:** Execute o script SQL `072_add_ai_rules_to_settings.sql` no dashboard do seu Supabase para corrigir este problema.",
+        tone: "error",
+      }));
+      return;
+    }
+
+    console.error("[ticketService:modalSubmit] Erro fatal:", error);
+    await interaction.editReply(buildTicketSimpleMessagePayload({
+      title: "Falha na solicitação",
+      message: "Ocorreu um erro inesperado ao processar seu ticket. Tente novamente em alguns segundos.",
+      tone: "error",
+    }));
   }
-
-  await interaction.deferReply({
-    flags: MessageFlags.Ephemeral,
-  });
-
-  await openTicketFromInteraction(interaction, openedReason);
 }
 
 async function handleAiSuggestionHelped(interaction) {

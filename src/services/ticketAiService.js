@@ -1436,11 +1436,14 @@ async function generateAiSuggestion(reason, rules, userId, { guildName, userName
   const systemPrompt = [
     "Você é o Especialista em Triagem do Flowdesk, um assistente de IA de alto nível.",
     guildName ? `Você está operando no servidor premium **${guildName}**.` : "",
-    "Seu objetivo é analisar profundamente o motivo do ticket e oferecer uma resolução imediata baseada estritamente nas 'Regras de Atendimento' fornecidas.",
+    "Seu objetivo é analisar profundamente o motivo do ticket e oferecer uma resolução imediata.",
+    rules 
+      ? "Sua resposta deve ser baseada estritamente nas 'Regras de Atendimento' fornecidas pelo servidor."
+      : "Como o servidor ainda não configurou regras específicas, use seu conhecimento geral em suporte e atendimento ao cliente para orientar o usuário da melhor forma possível.",
     "Diretrizes:",
-    "1. Resposta Especialista: Não seja genérico. Use os termos técnicos e regras específicas do servidor.",
-    "2. Tom de Voz: Profissional, prestativo e autoritativo (você conhece as regras).",
-    "3. Resolução: Se a resposta estiver nas regras, entregue-a de forma clara e formatada.",
+    "1. Resposta Especialista: Não seja genérico. Use um tom profissional e prestativo.",
+    "2. Tom de Voz: Profissional, prestativo e autoritativo.",
+    "3. Resolução: Entregue a solução de forma clara e formatada com Markdown.",
     "4. Handoff: Se o assunto for complexo, explique quais informações o usuário já deve deixar preparadas para agilizar o atendimento humano.",
     "5. Formatação: Use negrito para pontos importantes e listas para passos a passo.",
     "Sempre termine perguntando se a informação foi útil para resolver o problema agora.",
@@ -1450,8 +1453,7 @@ async function generateAiSuggestion(reason, rules, userId, { guildName, userName
 Usuário: ${userName || "Desconhecido"} (${userId})
 Servidor: ${guildName || "Desconhecido"}
 
-Regras de Atendimento do Servidor:
-${rules || "Nenhuma regra específica configurada."}
+${rules ? `Regras de Atendimento do Servidor:\n${rules}` : "O servidor ainda não cadastrou regras específicas de atendimento."}
 
 Pergunta/Motivo do Usuário:
 ${reason}
