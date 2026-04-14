@@ -978,10 +978,21 @@ async function handleAiSuggestionHelped(interaction) {
     }).catch(console.error);
   }
 
-  await interaction.reply({
-    content: "Fico feliz que a sugestão ajudou! Atendimento encerrado antes de abrir o ticket.",
-    flags: MessageFlags.Ephemeral,
-  }).catch(() => interaction.editReply({ content: "Fico feliz que ajudou!", components: [] }));
+  const successPayload = buildTicketSimpleMessagePayload({
+    title: "✅ Atendimento Encerrado",
+    message: "Fico feliz que a sugestão ajudou! Atendimento encerrado antes de abrir o ticket.",
+    tone: "success",
+  });
+
+  await interaction.update({
+    ...successPayload,
+    components: [], // Explicitly ensure buttons are gone
+  }).catch(() => {
+    interaction.editReply({ 
+      content: "✅ Atendimento encerrado. Fico feliz que ajudou!", 
+      components: [] 
+    }).catch(() => null);
+  });
 }
 
 async function handleAiSuggestionContinue(interaction) {
