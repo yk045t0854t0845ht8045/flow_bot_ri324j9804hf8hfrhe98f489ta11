@@ -910,7 +910,7 @@ async function openTicketFromModalSubmit(interaction) {
       try {
         const suggestion = await generateAiSuggestion(
           openedReason,
-          guildRuntime.settings.ai_rules, // Can be null/empty
+          guildRuntime.settings, // Full settings for dynamic triage identity
           interaction.user.id,
           {
             guildName: interaction.guild.name,

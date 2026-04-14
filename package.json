@@ -10,7 +10,8 @@
     "deploy:commands": "node src/deploy-commands.js",
     "site:dev": "npm --prefix site run dev",
     "site:build": "npm --prefix site run build",
-    "now": "node scripts/now.js"
+    "now": "node scripts/now.js",
+    "puxar": "git pull --rebase --autostash"
   },
   "keywords": [],
   "author": "",

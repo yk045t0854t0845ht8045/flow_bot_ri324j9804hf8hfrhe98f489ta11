@@ -42,16 +42,12 @@ const guildContextCache = new Map();
 const proactiveConversationStore = new Map();
 const proactiveReplyCooldownStore = new Map();
 
-const SYSTEM_PROMPT = [
-  "Voce e o Flowdesk, assistente oficial do servidor do Discord.",
-  "Atenda em PT-BR com tom humano, leve, carismatico e claro.",
-  "Fora de assuntos sensiveis, tenha energia de bot de comunidade: simpatico, natural e agradavel, sem soar infantil.",
-  "Lembre um assistente estilo comunidade do Discord: prestativo, rapido e com personalidade.",
+const SYSTEM_CORE_BEHAVIOR = [
+  "Atenda em PT-BR.",
   "Responda duvidas, oriente passos, resolva problemas e mantenha a conversa fluindo.",
   "Use Markdown do Discord apenas quando ajudar na leitura: **destaque**, > citacoes, listas e `rotulos` curtos.",
   "Prefira respostas bem organizadas e objetivas.",
   "Evite soar como robo, texto corporativo seco ou resposta engessada.",
-  "Quando o assunto for sensivel, serio ou envolver risco, mude o tom para mais profissional e sobrio sem perder clareza.",
   "Se faltar contexto, faca uma pergunta curta antes de presumir.",
   "Nao invente informacoes, links, permissoes, erros ou recursos inexistentes.",
   "Nunca gere scripts, codigos, comandos longos ou blocos de codigo.",
@@ -59,6 +55,33 @@ const SYSTEM_PROMPT = [
   "Nao use @everyone, @here, IDs ou mencoes desnecessarias.",
   "Salvo quando o usuario pedir profundidade, mantenha a resposta curta o suficiente para caber bem no Discord.",
 ].join(" ");
+
+function buildDynamicSystemPrompt(guildContext) {
+  const settings = guildContext?.ticketRuntime?.settings;
+  const name = settings?.ai_company_name || "Assistente Oficial";
+  const bio = settings?.ai_company_bio || "Assistente oficial do servidor do Discord.";
+  const rules = settings?.ai_rules || "";
+  const tone = settings?.ai_tone || "professional";
+
+  const toneInstruction = tone === "friendly"
+    ? "Atenda com tom humano, leve, carismatico e amigavel, como um bot de comunidade proximo. Fora de assuntos sensiveis, tenha energia de bot de comunidade: simpatico, natural e agradavel."
+    : "Atenda com tom profissional, sobrio, polido e seguro. Mantenha a formalidade e seguranca em todas as interacoes.";
+
+  const identity = [
+    `Voce e o ${name}, ${bio}.`,
+    toneInstruction,
+  ];
+
+  if (rules) {
+    identity.push(`\nRegras e diretrizes especificas da empresa para seguir:\n${rules}`);
+  }
+
+  return [
+    identity.join("\n"),
+    "\nInstrucoes de comportamento funcional:",
+    SYSTEM_CORE_BEHAVIOR
+  ].join("\n");
+}
 
 const SCRIPT_REQUEST_TOKENS = new Set([
   "script",
@@ -1670,7 +1693,7 @@ async function generateConversationReply({
     );
     const result = await callOpenAI(
       [
-        { role: "system", content: SYSTEM_PROMPT },
+        { role: "system", content: buildDynamicSystemPrompt(guildContext) },
         ...(toneGuidance
           ? [{ role: "system", content: toneGuidance }]
           : []),

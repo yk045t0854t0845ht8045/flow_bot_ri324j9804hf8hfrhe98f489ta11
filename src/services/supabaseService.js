@@ -875,8 +875,77 @@ async function registerEvent({
   unwrap(result, "registerEvent");
 }
 
+function isMissingDedicatedTicketAiColumns(error) {
+  const message = String(error?.message || "").toLowerCase();
+  const code = String(error?.code || "").toLowerCase();
+
+  return (
+    code === "42703" ||
+    message.includes("ai_enabled") ||
+    message.includes("ai_company_name") ||
+    message.includes("ai_company_bio") ||
+    message.includes("ai_tone")
+  );
+}
+
+function expandLegacyTicketAiSettings(row) {
+  const rawRules = typeof row?.ai_rules === "string" ? row.ai_rules.trim() : "";
+  const base = {
+    ...row,
+    ai_rules: rawRules.startsWith("{") ? "" : rawRules,
+    ai_enabled: false,
+    ai_company_name: "",
+    ai_company_bio: "",
+    ai_tone: "formal",
+  };
+
+  if (!rawRules.startsWith("{")) {
+    return base;
+  }
+
+  try {
+    const parsed = JSON.parse(rawRules);
+    return {
+      ...base,
+      ai_rules:
+        typeof parsed?.rules === "string" ? parsed.rules.trim() : base.ai_rules,
+      ai_enabled: parsed?.enabled === true,
+      ai_company_name:
+        typeof parsed?.companyName === "string"
+          ? parsed.companyName.trim()
+          : "",
+      ai_company_bio:
+        typeof parsed?.companyBio === "string"
+          ? parsed.companyBio.trim()
+          : "",
+      ai_tone:
+        typeof parsed?.tone === "string" && parsed.tone.trim().toLowerCase() === "friendly"
+          ? "friendly"
+          : "formal",
+    };
+  } catch {
+    return base;
+  }
+}
+
 async function getGuildTicketSettings(guildId) {
   const result = await supabase
+    .from(TICKET_SETTINGS_TABLE)
+    .select(
+      "guild_id, enabled, menu_channel_id, tickets_category_id, logs_created_channel_id, logs_closed_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, ai_rules, ai_enabled, ai_company_name, ai_company_bio, ai_tone, updated_at",
+    )
+    .eq("guild_id", guildId)
+    .maybeSingle();
+
+  if (!result.error) {
+    return result.data;
+  }
+
+  if (!isMissingDedicatedTicketAiColumns(result.error)) {
+    return unwrap(result, "getGuildTicketSettings");
+  }
+
+  const legacyResult = await supabase
     .from(TICKET_SETTINGS_TABLE)
     .select(
       "guild_id, enabled, menu_channel_id, tickets_category_id, logs_created_channel_id, logs_closed_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, ai_rules, updated_at",
@@ -884,7 +953,8 @@ async function getGuildTicketSettings(guildId) {
     .eq("guild_id", guildId)
     .maybeSingle();
 
-  return unwrap(result, "getGuildTicketSettings");
+  const legacyRow = unwrap(legacyResult, "getGuildTicketSettingsLegacy");
+  return legacyRow ? expandLegacyTicketAiSettings(legacyRow) : legacyRow;
 }
 
 async function getGuildTicketStaffSettings(guildId) {
