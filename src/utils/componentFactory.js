@@ -1186,13 +1186,12 @@ function buildTicketClosureDmPayload({
 }
 
 function buildAiSuggestionPayload({ suggestion, guildName }) {
-  const lines = [
+  const mainContent = [
     `## Sugestão do assistente`,
     suggestion,
-    "",
-    guildName ? `-# Baseado nas regras de atendimento de **${guildName}**` : "",
-    `-# 💡 Esta é uma sugestão automática. Se não resolveu, clique em "Continuar com ticket".`,
-  ].filter(Boolean);
+  ].join("\n");
+
+  const footerLine = `<:flowdesk_icon:1485070577982116000> Todos os direitos reservados (c) 2026 Flowdesk. FlowAI pode cometer erros confira todas as informações geradas. Esta é uma sugestão automática. Se não resolveu, clique em "Continuar com ticket".`;
 
   return {
     flags: MessageFlags.IsComponentsV2,
@@ -1203,7 +1202,7 @@ function buildAiSuggestionPayload({ suggestion, guildName }) {
         components: [
           {
             type: COMPONENT_TYPE.TEXT_DISPLAY,
-            content: lines.join("\n"),
+            content: mainContent,
           },
           {
             type: COMPONENT_TYPE.SEPARATOR,
@@ -1211,21 +1210,25 @@ function buildAiSuggestionPayload({ suggestion, guildName }) {
             spacing: SeparatorSpacingSize.Small,
           },
           {
-            type: COMPONENT_TYPE.ACTION_ROW,
-            components: [
-              {
-                type: COMPONENT_TYPE.BUTTON,
-                style: BUTTON_STYLE.SECONDARY,
-                label: "Ajudou, Não abrir ticket",
-                custom_id: CUSTOM_IDS.aiSuggestionHelped,
-              },
-              {
-                type: COMPONENT_TYPE.BUTTON,
-                style: BUTTON_STYLE.PRIMARY,
-                label: "Continuar com ticket",
-                custom_id: CUSTOM_IDS.aiSuggestionContinue,
-              },
-            ],
+            type: COMPONENT_TYPE.TEXT_DISPLAY,
+            content: footerLine,
+          },
+        ],
+      },
+      {
+        type: COMPONENT_TYPE.ACTION_ROW,
+        components: [
+          {
+            type: COMPONENT_TYPE.BUTTON,
+            style: BUTTON_STYLE.SECONDARY,
+            label: "Ajudou, Não abrir ticket",
+            custom_id: CUSTOM_IDS.aiSuggestionHelped,
+          },
+          {
+            type: COMPONENT_TYPE.BUTTON,
+            style: BUTTON_STYLE.PRIMARY,
+            label: "Continuar com ticket",
+            custom_id: CUSTOM_IDS.aiSuggestionContinue,
           },
         ],
       },
