@@ -2,6 +2,7 @@ const { Client, GatewayIntentBits, Partials } = require("discord.js");
 const { env } = require("./config/env");
 const { loadCommands } = require("./handlers/commandHandler");
 const { loadEvents } = require("./handlers/eventHandler");
+const { startHealthServer } = require("./services/healthServerService");
 const { initRealtimeListeners } = require("./services/realtimeService");
 
 const client = new Client({
@@ -18,6 +19,7 @@ const client = new Client({
 
 loadCommands(client);
 loadEvents(client);
+startHealthServer(client);
 
 client.once("ready", () => {
   initRealtimeListeners(client);

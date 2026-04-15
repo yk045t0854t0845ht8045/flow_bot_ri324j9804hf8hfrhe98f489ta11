@@ -51,6 +51,15 @@ npm start
 - Use `SUPABASE_SERVICE_ROLE_KEY` no `.env` (nao use anon key).
 - `TICKET_CATEGORY_ID` precisa apontar para uma categoria existente.
 - `TICKET_SUPPORT_ROLE_ID` precisa ser o cargo da equipe de suporte.
+- O bot agora expõe `GET /health` localmente para monitoramento de status.
+- Variaveis opcionais do health server do bot:
+  - `BOT_HEALTH_HOST` (padrao `127.0.0.1`)
+  - `BOT_HEALTH_PORT` (padrao `3210`)
+  - `BOT_HEALTH_TOKEN` (opcional para proteger o endpoint)
+- No site, o monitor usa por padrao `http://127.0.0.1:3210/health`.
+- Se o bot estiver em outra maquina ou container, defina no ambiente do site:
+  - `DISCORD_BOT_STATUS_URL`
+  - `DISCORD_BOT_HEALTH_TOKEN` (se houver token)
 
 ## 6) Site Next.js integrado
 

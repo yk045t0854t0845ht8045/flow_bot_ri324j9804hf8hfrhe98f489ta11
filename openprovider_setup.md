@@ -21,6 +21,19 @@ OPENPROVIDER_IP=0.0.0.0
 
 # Ordem de extensoes consultadas na vitrine do /domains.
 OPENPROVIDER_TLDS=com.br,com,ai,io,org,net
+
+# Configuracoes de resiliencia
+OPENPROVIDER_TIMEOUT_MS=12000
+OPENPROVIDER_MAX_RETRIES=3
+OPENPROVIDER_RETRY_BASE_DELAY_MS=1000
+OPENPROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD=5
+OPENPROVIDER_CIRCUIT_BREAKER_RECOVERY_TIMEOUT_MS=60000
+
+# Configuracoes de performance
+OPENPROVIDER_BATCH_SIZE=12
+OPENPROVIDER_BATCH_CONCURRENCY=2
+OPENPROVIDER_PRICE_CONCURRENCY=4
+OPENPROVIDER_MAX_TLDS=24
 ```
 
 ## Checklist rapido para nao dar Authentication/Authorization Failed
@@ -36,11 +49,25 @@ OPENPROVIDER_TLDS=com.br,com,ai,io,org,net
 
 ## O que o sistema faz agora
 
-1. Autentica na Openprovider com retry controlado.
-2. Consulta a disponibilidade do dominio com `domains/check`.
-3. Se o preco vier vazio para um dominio livre, busca fallback em `domains/prices`.
-4. Ordena a lista com o dominio exato primeiro, depois disponibilidade e prioridade de TLD.
-5. Retorna mensagens claras quando o problema e credencial, timeout, manutencao ou configuracao.
+1. **Autenticação robusta**: Autentica na Openprovider com retry controlado e cache de token.
+2. **Retry automático com backoff exponencial**: Tenta novamente automaticamente em caso de falhas temporárias (timeouts, 5xx, rate limits).
+3. **Circuit breaker**: Protege contra sobrecarga quando a API está instável, evitando cascata de falhas.
+4. **Consulta otimizada**: Consulta a disponibilidade do dominio com `domains/check` em lotes para melhor performance.
+5. **Fallback de preços**: Se o preço vier vazio para um dominio livre, busca fallback em `domains/prices`.
+6. **Resiliência a falhas parciais**: Se uma consulta em lote falhar, tenta consultas individuais como fallback.
+7. **Ordenação inteligente**: Ordena a lista com o dominio exato primeiro, depois disponibilidade e prioridade de TLD.
+8. **Health check**: Endpoint `/api/domains/health` para monitorar o status do sistema.
+9. **Rate limiting**: Controle de taxa de requisições por IP para evitar abuso.
+10. **UI de manutenção**: Quando o sistema está indisponível, mostra interface dedicada de manutenção em vez de botões desabilitados.
+11. **Tratamento de erro detalhado**: Mensagens claras quando o problema é credencial, timeout, manutenção ou configuração.
+12. **Logs estruturados**: Logs com IDs de requisição para rastreamento e debugging.
+
+## Monitoramento
+
+- **Health check**: `GET /api/domains/health` - Verifica conectividade e status do circuit breaker
+- **Circuit breaker status**: Disponível no health check e em respostas de erro
+- **Métricas de retry**: Contador de tentativas incluído em logs e respostas de erro
+- **Logs de performance**: Tempo de resposta e status de cache em logs
 
 ## Validacao manual recomendada
 
