@@ -7,12 +7,15 @@ function buildHealthPayload(client) {
   const guildCount = typeof client?.guilds?.cache?.size === "number" ? client.guilds.cache.size : null;
   const userTag = client?.user?.tag || null;
   const uptimeMs = Math.round(process.uptime() * 1000);
+  const ping = typeof client?.ws?.ping === "number" ? client.ws.ping : null;
 
   let status = "major_outage";
   if (ready && wsStatus === 0) {
-    status = "operational";
-  } else if (wsStatus === 0) {
+    status = typeof ping === "number" && ping > 1000 ? "degraded_performance" : "operational";
+  } else if (wsStatus === 1 || wsStatus === 2 || wsStatus === 8) {
     status = "degraded_performance";
+  } else if (wsStatus === 5) {
+    status = "partial_outage";
   }
 
   return {
@@ -21,6 +24,7 @@ function buildHealthPayload(client) {
     status,
     ready,
     wsStatus,
+    ping,
     guildCount,
     userTag,
     uptimeMs,

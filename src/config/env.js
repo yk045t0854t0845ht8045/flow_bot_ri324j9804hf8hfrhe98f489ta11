@@ -143,8 +143,8 @@ const env = {
   openaiBaseUrl: optionalEnv("OPENAI_BASE_URL") || "https://api.openai.com/v1",
   aiMentionLogChannelId:
     optionalEnv("AI_MENTION_LOG_CHANNEL_ID") || "1490014859344085242",
-  botHealthHost: optionalEnv("BOT_HEALTH_HOST") || "127.0.0.1",
-  botHealthPort: parseNumber(process.env.BOT_HEALTH_PORT, 3210),
+  botHealthHost: optionalEnv("BOT_HEALTH_HOST") || process.env.HOST || "0.0.0.0",
+  botHealthPort: parseNumber(process.env.PORT, parseNumber(process.env.BOT_HEALTH_PORT, 3210)),
   botHealthToken: optionalEnv("BOT_HEALTH_TOKEN"),
   autoJoinVoiceChannelIds: parseListEnv(
     process.env.DISCORD_AUTO_JOIN_VOICE_CHANNEL_IDS ||
