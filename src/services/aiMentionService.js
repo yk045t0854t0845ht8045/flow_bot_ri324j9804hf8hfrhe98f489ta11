@@ -1,6 +1,7 @@
 const { MessageFlags, SeparatorSpacingSize } = require("discord.js");
 const { env } = require("../config/env");
 const { getGuildTicketRuntime } = require("./supabaseService");
+const { requestFlowAiChat } = require("./flowAiClient");
 
 const MAX_INPUT_CHARS = 1600;
 const MAX_HISTORY_MESSAGES = 10;
@@ -1432,68 +1433,22 @@ function setCachedResponse(cacheKey, content) {
 }
 
 async function callOpenAI(messages, userId) {
-  if (!env.openaiApiKey) {
-    throw new Error("OPENAI_API_KEY nao configurada.");
+  const result = await requestFlowAiChat({
+    taskKey: "discord_mention",
+    messages,
+    userId,
+    temperature: 0.45,
+    maxTokens: MAX_OUTPUT_TOKENS,
+  });
+
+  if (!result?.content) {
+    throw new Error("Nenhum modelo disponivel respondeu com sucesso.");
   }
 
-  if (typeof fetch !== "function") {
-    throw new Error("Fetch indisponivel no runtime.");
-  }
-
-  let lastError = null;
-
-  for (const model of buildModelCandidates()) {
-    const response = await fetch(`${env.openaiBaseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${env.openaiApiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages,
-        temperature: 0.45,
-        max_tokens: MAX_OUTPUT_TOKENS,
-        user: userId ? String(userId).slice(0, 64) : undefined,
-      }),
-    });
-
-    const rawText = await response.text().catch(() => "");
-    if (!response.ok) {
-      lastError = new Error(
-        `Falha ao chamar OpenAI com ${model}: ${response.status} ${response.statusText} ${rawText}`,
-      );
-
-      if (isModelAccessError(response.status, rawText)) {
-        unavailableModelCache.set(model, nowMs() + 1000 * 60 * 30);
-        console.warn(`[ai-mention] modelo sem acesso, tentando fallback: ${model}`);
-        continue;
-      }
-
-      if (response.status >= 500 || response.status === 429) {
-        console.warn(`[ai-mention] erro temporario com ${model}, tentando fallback.`);
-        continue;
-      }
-
-      throw lastError;
-    }
-
-    const data = parseErrorPayload(rawText);
-    const content = normalizeMultilineText(
-      data?.choices?.[0]?.message?.content || "",
-      4000,
-    );
-
-    if (!content) {
-      lastError = new Error(`Resposta vazia da OpenAI com ${model}.`);
-      continue;
-    }
-
-    unavailableModelCache.delete(model);
-    return { content, model };
-  }
-
-  throw lastError || new Error("Nenhum modelo disponivel respondeu com sucesso.");
+  return {
+    content: normalizeMultilineText(result.content, 4000),
+    model: result.model,
+  };
 }
 
 function resolveResponseAccentColor(source) {

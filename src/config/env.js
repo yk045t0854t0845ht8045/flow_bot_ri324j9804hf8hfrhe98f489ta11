@@ -85,6 +85,20 @@ function parseBoolean(value, fallback) {
   return fallback;
 }
 
+function buildUrl(baseUrl, pathname) {
+  const normalizedBase = String(baseUrl || "").trim().replace(/\/+$/, "");
+  const normalizedPath = String(pathname || "").trim();
+  if (!normalizedBase) {
+    return normalizedPath;
+  }
+
+  if (!normalizedPath) {
+    return normalizedBase;
+  }
+
+  return `${normalizedBase}${normalizedPath.startsWith("/") ? normalizedPath : `/${normalizedPath}`}`;
+}
+
 for (const key of REQUIRED_KEYS) {
   requireEnv(key);
 }
@@ -141,6 +155,21 @@ const env = {
   openaiModel: optionalEnv("OPENAI_MODEL") || "gpt-4",
   openaiModelFallbacks: parseListEnv(process.env.OPENAI_MODEL_FALLBACKS),
   openaiBaseUrl: optionalEnv("OPENAI_BASE_URL") || "https://api.openai.com/v1",
+  flowAiApiUrl:
+    optionalEnv("FLOWAI_API_URL") ||
+    buildUrl(
+      process.env.NEXT_PUBLIC_APP_URL ||
+        process.env.APP_URL ||
+        process.env.SITE_URL ||
+        DEFAULT_PUBLIC_APP_URL,
+      "/api/internal/flowai",
+    ),
+  flowAiApiToken:
+    optionalEnv("FLOWAI_INTERNAL_API_TOKEN") ||
+    optionalEnv("CRON_SECRET") ||
+    optionalEnv("OPENAI_API_KEY") ||
+    null,
+  flowAiApiTimeoutMs: parseNumber(process.env.FLOWAI_API_TIMEOUT_MS, 20_000),
   aiMentionLogChannelId:
     optionalEnv("AI_MENTION_LOG_CHANNEL_ID") || "1490014859344085242",
   botHealthHost: optionalEnv("BOT_HEALTH_HOST") || process.env.HOST || "0.0.0.0",

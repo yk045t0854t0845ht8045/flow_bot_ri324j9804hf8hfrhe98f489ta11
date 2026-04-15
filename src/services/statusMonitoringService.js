@@ -2,6 +2,7 @@ const { createClient } = require("@supabase/supabase-js");
 const { env } = require("../config/env");
 const dns = require("dns").promises;
 const https = require("https");
+const { requestFlowAiHealth, requestFlowAiJson } = require("./flowAiClient");
 
 const supabase = createClient(env.supabaseUrl, env.supabaseServiceRoleKey);
 
@@ -48,12 +49,15 @@ async function checkAllSystems(client) {
         }
         results.push({ name: 'API', status: apiStatus });
 
-        // 4. FLOW AI (OpenAI API Check)
-        const aiStart = Date.now();
-        const aiRes = await fetch("https://api.openai.com/v1/models", {
-            headers: { Authorization: `Bearer ${env.openaiApiKey}` }
-        }).catch(() => null);
-        results.push({ name: 'Flow AI', status: !aiRes || !aiRes.ok ? "partial_outage" : "operational" });
+        // 4. FLOW AI (Unified internal API health)
+        const flowAiHealth = await requestFlowAiHealth().catch((error) => {
+            console.error("[status-system] FlowAI health check falhou:", error);
+            return null;
+        });
+        results.push({
+            name: 'Flow AI',
+            status: flowAiHealth?.overall?.status || "partial_outage",
+        });
 
         // 5. CDN (Asset Availability)
         const cdnRes = await fetch(`${env.supabaseUrl}/storage/v1/object/public/cdn/logos/logo.png`).catch(() => null);
@@ -137,20 +141,50 @@ async function checkSSL(hostname) {
 }
 
 async function runAiStatusAnalysis(results) {
-    if (!env.openaiApiKey) return;
-
     const issues = results.filter(r => r.status !== 'operational');
     if (issues.length === 0) return;
 
     try {
         // AI Logic to generate a professional incident report if major
         if (issues.some(i => i.status === 'major_outage')) {
+            const narrative = await requestFlowAiJson({
+                taskKey: "status_note",
+                temperature: 0.2,
+                maxTokens: 220,
+                cacheKey: `status-major:${issues.map((item) => `${item.name}:${item.status}`).join("|")}`,
+                cacheTtlMs: 1000 * 30,
+                messages: [
+                    {
+                        role: "system",
+                        content:
+                            "Voce escreve comunicados curtos para pagina de status. Responda somente JSON com as chaves title e description em PT-BR, com tom profissional e transparente.",
+                    },
+                    {
+                        role: "user",
+                        content: JSON.stringify({
+                            objective: "Gerar um comunicado curto para falha critica detectada pelo monitoramento.",
+                            affectedComponents: issues.map((item) => ({
+                                name: item.name,
+                                status: item.status,
+                            })),
+                            constraints: {
+                                titleMaxWords: 9,
+                                descriptionMaxWords: 42,
+                            },
+                        }),
+                    },
+                ],
+            }).catch(() => null);
+            const aiTitle = String(narrative?.object?.title || "").trim();
+            const aiDescription = String(narrative?.object?.description || "").trim();
             const { data: incident } = await supabase
                 .from('system_incidents')
                 .insert({
-                    title: `Anomalia detectada em: ${issues.map(i => i.name).join(', ')}`,
+                    title: aiTitle || `Anomalia detectada em: ${issues.map(i => i.name).join(', ')}`,
                     impact: "critical",
-                    status: "investigating"
+                    status: "investigating",
+                    public_summary: aiDescription || null,
+                    ai_summary: aiDescription || null,
                 })
                 .select()
                 .single();

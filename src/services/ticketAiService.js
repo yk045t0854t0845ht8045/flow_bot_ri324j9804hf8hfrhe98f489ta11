@@ -9,6 +9,7 @@ const {
   upsertTicketAiSession,
 } = require("./supabaseService");
 const { canClaimTicket, canCloseTicket } = require("../utils/staff");
+const { requestFlowAiChat } = require("./flowAiClient");
 
 const MAX_TICKET_AI_MESSAGES = 12;
 const MAX_TICKET_AI_CONTENT = 1800;
@@ -397,72 +398,22 @@ function buildModelCandidates() {
 }
 
 async function callOpenAI(messages, userId) {
-  if (!env.openaiApiKey) {
-    throw new Error("OPENAI_API_KEY nao configurada.");
+  const result = await requestFlowAiChat({
+    taskKey: "ticket_reply",
+    messages,
+    userId,
+    temperature: 0.35,
+    maxTokens: 420,
+  });
+
+  if (!result?.content) {
+    throw new Error("Nenhum modelo disponivel respondeu no ticket.");
   }
 
-  let lastError = null;
-
-  for (const model of buildModelCandidates()) {
-    const blockedUntil = unavailableModelCache.get(model) || 0;
-    if (blockedUntil > nowMs()) {
-      continue;
-    }
-
-    const response = await fetch(`${env.openaiBaseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${env.openaiApiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages,
-        temperature: 0.35,
-        max_tokens: 420,
-        user: String(userId || "").slice(0, 64) || undefined,
-      }),
-    });
-
-    const rawText = await response.text().catch(() => "");
-    if (!response.ok) {
-      lastError = new Error(
-        `Falha ao chamar OpenAI com ${model}: ${response.status} ${response.statusText} ${rawText}`,
-      );
-
-      if (isModelAccessError(response.status, rawText)) {
-        unavailableModelCache.set(model, nowMs() + 1000 * 60 * 30);
-        continue;
-      }
-
-      if (response.status === 429 || response.status >= 500) {
-        continue;
-      }
-
-      throw lastError;
-    }
-
-    let data = null;
-    try {
-      data = JSON.parse(rawText);
-    } catch (error) {
-      lastError = new Error(
-        `Resposta invalida da OpenAI com ${model}: ${error instanceof Error ? error.message : String(error)}`,
-      );
-      continue;
-    }
-
-    const content = normalizeText(data?.choices?.[0]?.message?.content || "", 3500);
-    if (!content) {
-      lastError = new Error(`Resposta vazia da OpenAI com ${model}.`);
-      continue;
-    }
-
-    unavailableModelCache.delete(model);
-    return { content, model };
-  }
-
-  throw lastError || new Error("Nenhum modelo disponivel respondeu no ticket.");
+  return {
+    content: normalizeText(result.content, 3500),
+    model: result.model,
+  };
 }
 
 function formatChannel(channelId) {
@@ -1453,7 +1404,7 @@ async function handleTicketAiMessage(message, client) {
 }
 
 async function generateAiSuggestion(reason, settings, userId, { guildName, userName } = {}) {
-  if (!env.openaiApiKey) {
+  if (!env.openaiApiKey && !env.flowAiApiToken) {
     throw new Error("OpenAI API Key não configurada.");
   }
 
@@ -1501,7 +1452,16 @@ ${reason}
     { role: "user", content: contextPrompt },
   ];
 
-  const result = await callOpenAI(messages, userId);
+  const result = await requestFlowAiChat({
+    taskKey: "ticket_suggestion",
+    messages,
+    userId,
+    temperature: 0.45,
+    maxTokens: 420,
+    cacheKey: `ticket-suggestion:${userId}:${normalizeIntentText(reason)}`,
+    cacheTtlMs: 1000 * 60 * 5,
+  });
+
   return result.content;
 }
 

@@ -2,6 +2,7 @@
 const { env } = require("../config/env");
 const { getGuildTicketRuntime, getOpenTicketByChannel } = require("./supabaseService");
 const { closeOpenTicketChannel } = require("./ticketService");
+const { requestFlowAiJson } = require("./flowAiClient");
 
 const ADMIN_ACTION_SYSTEM_PROMPT = [
   "Voce interpreta pedidos administrativos para um bot do Discord.",
@@ -275,86 +276,32 @@ function isModelAccessError(status, rawText) {
 }
 
 async function callOpenAIForAdminPlan(prompt, context, userId) {
-  if (!env.openaiApiKey) {
-    throw new Error("OPENAI_API_KEY nao configurada.");
-  }
-
-  let lastError = null;
-
-  for (const model of buildModelCandidates()) {
-    const response = await fetch(`${env.openaiBaseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${env.openaiApiKey}`,
+  const result = await requestFlowAiJson({
+    taskKey: "admin_plan",
+    userId,
+    temperature: 0.1,
+    maxTokens: 900,
+    messages: [
+      { role: "system", content: ADMIN_ACTION_SYSTEM_PROMPT },
+      { role: "system", content: context },
+      {
+        role: "user",
+        content: [
+          "Mensagem do admin:",
+          prompt,
+          "",
+          "Retorne JSON no formato:",
+          '{"intent":"execute|clarify|ignore","summary":"...","clarification":"...","actions":[{"type":"create_category|create_channel|create_role|send_message|send_embed|purge_messages|close_ticket"}]}',
+        ].join("\n"),
       },
-      body: JSON.stringify({
-        model,
-        temperature: 0.1,
-        max_tokens: 900,
-        user: String(userId || "").slice(0, 64) || undefined,
-        messages: [
-          { role: "system", content: ADMIN_ACTION_SYSTEM_PROMPT },
-          { role: "system", content: context },
-          {
-            role: "user",
-            content: [
-              "Mensagem do admin:",
-              prompt,
-              "",
-              "Retorne JSON no formato:",
-              '{"intent":"execute|clarify|ignore","summary":"...","clarification":"...","actions":[{"type":"create_category|create_channel|create_role|send_message|send_embed|purge_messages|close_ticket"}]}'
-            ].join("\n"),
-          },
-        ],
-      }),
-    });
+    ],
+  });
 
-    const rawText = await response.text().catch(() => "");
-    if (!response.ok) {
-      lastError = new Error(
-        `Falha ao chamar OpenAI com ${model}: ${response.status} ${response.statusText} ${rawText}`,
-      );
-
-      if (isModelAccessError(response.status, rawText)) {
-        continue;
-      }
-
-      if (response.status === 429 || response.status >= 500) {
-        continue;
-      }
-
-      throw lastError;
-    }
-
-    let data = null;
-    try {
-      data = JSON.parse(rawText);
-    } catch (error) {
-      lastError = new Error(
-        `Resposta invalida da OpenAI com ${model}: ${error instanceof Error ? error.message : String(error)}`,
-      );
-      continue;
-    }
-
-    const content = normalizeText(data?.choices?.[0]?.message?.content || "", 16000);
-    if (!content) {
-      lastError = new Error(`Resposta vazia da OpenAI com ${model}.`);
-      continue;
-    }
-
-    try {
-      return JSON.parse(content);
-    } catch {
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        return JSON.parse(jsonMatch[0]);
-      }
-      lastError = new Error("A IA nao retornou JSON valido para o plano administrativo.");
-    }
+  if (!result?.object) {
+    throw new Error("A IA nao retornou JSON valido para o plano administrativo.");
   }
 
-  throw lastError || new Error("Nenhum modelo conseguiu interpretar o pedido administrativo.");
+  return result.object;
 }
 
 function heuristicAdminPlan(prompt, message) {
