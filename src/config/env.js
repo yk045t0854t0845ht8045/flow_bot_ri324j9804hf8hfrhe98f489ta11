@@ -169,7 +169,18 @@ const env = {
     optionalEnv("CRON_SECRET") ||
     optionalEnv("OPENAI_API_KEY") ||
     null,
+  flowAiSigningSecret:
+    optionalEnv("FLOWAI_INTERNAL_SIGNING_SECRET") ||
+    optionalEnv("FLOWAI_INTERNAL_API_TOKEN") ||
+    optionalEnv("CRON_SECRET") ||
+    optionalEnv("OPENAI_API_KEY") ||
+    null,
   flowAiApiTimeoutMs: parseNumber(process.env.FLOWAI_API_TIMEOUT_MS, 20_000),
+  flowAiApiMaxRetries: parseNumber(process.env.FLOWAI_API_MAX_RETRIES, 2),
+  flowAiApiClockSkewMs: parseNumber(
+    process.env.FLOWAI_API_CLOCK_SKEW_MS,
+    300_000,
+  ),
   aiMentionLogChannelId:
     optionalEnv("AI_MENTION_LOG_CHANNEL_ID") || "1490014859344085242",
   botHealthHost: optionalEnv("BOT_HEALTH_HOST") || process.env.HOST || "0.0.0.0",
