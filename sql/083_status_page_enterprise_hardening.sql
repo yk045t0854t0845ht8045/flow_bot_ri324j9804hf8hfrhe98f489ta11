@@ -917,8 +917,8 @@ begin
 
   select *
   into v_policy
-  from public.system_status_monitor_policies
-  where component_id = v_component.id;
+  from public.system_status_monitor_policies p
+  where p.component_id = v_component.id;
 
   if not found then
     insert into public.system_status_monitor_policies (component_id)
@@ -1025,11 +1025,11 @@ begin
 
   with recent as (
     select
-      status,
-      row_number() over (order by observed_at desc, id desc) as rn
-    from public.system_status_monitor_snapshots
-    where component_id = v_component.id
-    order by observed_at desc, id desc
+      s.status,
+      row_number() over (order by s.observed_at desc, s.id desc) as rn
+    from public.system_status_monitor_snapshots s
+    where s.component_id = v_component.id
+    order by s.observed_at desc, s.id desc
     limit greatest(v_policy.evaluation_window, 5)
   )
   select
