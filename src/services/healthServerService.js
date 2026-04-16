@@ -70,8 +70,11 @@ function startHealthServer(client) {
   });
 
   server.listen(env.botHealthPort, env.botHealthHost, () => {
+    // 0.0.0.0 = escuta em todas as interfaces; exibe o IP real para clareza
+    const displayHost =
+      env.botHealthHost === "0.0.0.0" || env.botHealthHost === "::" ? "localhost" : env.botHealthHost;
     console.log(
-      `[health-server] online em http://${env.botHealthHost}:${env.botHealthPort}/health`,
+      `[health-server] online em http://${displayHost}:${env.botHealthPort}/health (bind: ${env.botHealthHost})`,
     );
   });
 

@@ -23,6 +23,7 @@ truncate table
   public.guild_ticket_settings,
   public.ticket_ai_messages,
   public.ticket_ai_sessions,
+  public.ticket_ai_suggestion_sessions,
   public.ticket_dm_queue,
   public.ticket_events,
   public.ticket_transcripts,

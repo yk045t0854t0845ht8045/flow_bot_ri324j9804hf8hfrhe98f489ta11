@@ -18,6 +18,7 @@ const TICKET_TRANSCRIPTS_TABLE = "ticket_transcripts";
 const TICKET_DM_QUEUE_TABLE = "ticket_dm_queue";
 const TICKET_AI_SESSIONS_TABLE = "ticket_ai_sessions";
 const TICKET_AI_MESSAGES_TABLE = "ticket_ai_messages";
+const TICKET_AI_SUGGESTION_SESSIONS_TABLE = "ticket_ai_suggestion_sessions";
 const DEFAULT_LICENSE_VALIDITY_DAYS = 30;
 const EXPIRED_GRACE_MS = 3 * 24 * 60 * 60 * 1000;
 
@@ -471,6 +472,18 @@ async function getTicketAiSession(ticketId) {
   return unwrap(result, "getTicketAiSession");
 }
 
+async function getTicketAiSuggestionSession(guildId, userId) {
+  const result = await supabase
+    .from(TICKET_AI_SUGGESTION_SESSIONS_TABLE)
+    .select("*")
+    .eq("guild_id", guildId)
+    .eq("user_id", userId)
+    .is("consumed_at", null)
+    .maybeSingle();
+
+  return unwrap(result, "getTicketAiSuggestionSession");
+}
+
 async function upsertTicketAiSession(input) {
   const result = await supabase
     .from(TICKET_AI_SESSIONS_TABLE)
@@ -495,6 +508,38 @@ async function upsertTicketAiSession(input) {
     .single();
 
   return unwrap(result, "upsertTicketAiSession");
+}
+
+async function upsertTicketAiSuggestionSession(input) {
+  const result = await supabase
+    .from(TICKET_AI_SUGGESTION_SESSIONS_TABLE)
+    .upsert(
+      {
+        guild_id: input.guildId,
+        user_id: input.userId,
+        reason: String(input.reason || "").trim(),
+        suggestion: String(input.suggestion || "").trim(),
+        expires_at: input.expiresAt,
+        consumed_at: null,
+      },
+      { onConflict: "guild_id,user_id" },
+    )
+    .select("*")
+    .single();
+
+  return unwrap(result, "upsertTicketAiSuggestionSession");
+}
+
+async function deleteTicketAiSuggestionSession(guildId, userId) {
+  const result = await supabase
+    .from(TICKET_AI_SUGGESTION_SESSIONS_TABLE)
+    .delete()
+    .eq("guild_id", guildId)
+    .eq("user_id", userId)
+    .select("*")
+    .maybeSingle();
+
+  return unwrap(result, "deleteTicketAiSuggestionSession");
 }
 
 async function createTicketAiMessage(input) {
@@ -1408,6 +1453,7 @@ module.exports = {
   enqueueTicketDirectMessage,
   closeTicketAsDeleted,
   createTicket,
+  deleteTicketAiSuggestionSession,
   getDueGuildAutoRoleQueueItems,
   getDueTicketDirectMessages,
   getConfiguredTicketGuildRuntimes,
@@ -1419,7 +1465,9 @@ module.exports = {
   getGuildSecurityLogsSettings,
   createTicketAiMessage,
   getGuildTicketRuntime,
+  getGuildTicketSettings,
   getTicketAiSession,
+  getTicketAiSuggestionSession,
   getRecentTicketAiMessages,
   getGuildWelcomeRuntime,
   getLastTicketForUser,
@@ -1445,6 +1493,7 @@ module.exports = {
   rescheduleGuildAutoRoleQueueItem,
   rescheduleTicketDirectMessage,
   upsertTicketAiSession,
+  upsertTicketAiSuggestionSession,
   upsertTicketTranscript,
   updateGuildTicketPanelMessageId,
   updateTicketIntroMessageId,

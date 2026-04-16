@@ -13,12 +13,15 @@ const {
   closeTicket,
   closeTicketAsDeleted,
   createTicket,
+  deleteTicketAiSuggestionSession,
   getAllOpenTickets,
   getGuildTicketRuntime,
   getLastTicketForUser,
   getOpenTicketByChannel,
   getOpenTicketsForUser,
+  getTicketAiSuggestionSession,
   registerEvent,
+  upsertTicketAiSuggestionSession,
   upsertTicketTranscript,
   updateTicketIntroMessageId,
 } = require("./supabaseService");
@@ -65,10 +68,12 @@ const {
 
 const pendingTicketReasons = new Map();
 
+const AI_SUGGESTION_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const OPEN_TICKET_LOCK_TTL_MS = 15 * 1000;
 const MINIMUM_MESSAGES_FOR_TRANSCRIPT = 6;
 const openTicketLocks = new Map();
 let warnedAboutMissingIntroMessageColumn = false;
+let warnedAboutMissingAiSuggestionSessionTable = false;
 
 function buildOpenTicketLockKey(guildId, userId) {
   return `${guildId}:${userId}`;
@@ -76,6 +81,155 @@ function buildOpenTicketLockKey(guildId, userId) {
 
 function buildPendingReasonKey(guildId, userId) {
   return `${guildId}:${userId}`;
+}
+
+function resolveAiSuggestionSessionExpiresAt() {
+  return Date.now() + AI_SUGGESTION_SESSION_TTL_MS;
+}
+
+function readPendingTicketReasonFromMemory(guildId, userId) {
+  const pendingKey = buildPendingReasonKey(guildId, userId);
+  const cached = pendingTicketReasons.get(pendingKey);
+  if (!cached) {
+    return null;
+  }
+
+  if (!cached.expiresAt || cached.expiresAt < Date.now()) {
+    pendingTicketReasons.delete(pendingKey);
+    return null;
+  }
+
+  return cached;
+}
+
+function cachePendingTicketReason(guildId, userId, value) {
+  const pendingKey = buildPendingReasonKey(guildId, userId);
+  pendingTicketReasons.set(pendingKey, {
+    reason: String(value?.reason || "").trim(),
+    suggestion: String(value?.suggestion || "").trim(),
+    expiresAt:
+      typeof value?.expiresAt === "number" && Number.isFinite(value.expiresAt)
+        ? value.expiresAt
+        : resolveAiSuggestionSessionExpiresAt(),
+  });
+}
+
+function clearPendingTicketReasonFromMemory(guildId, userId) {
+  pendingTicketReasons.delete(buildPendingReasonKey(guildId, userId));
+}
+
+function isMissingAiSuggestionSessionTableError(error) {
+  const normalized = String(error?.message || "").toLowerCase();
+  return (
+    normalized.includes("ticket_ai_suggestion_sessions") &&
+    (normalized.includes("does not exist") || normalized.includes("relation"))
+  );
+}
+
+function logAiSuggestionSessionFallback(operation, error) {
+  if (!isMissingAiSuggestionSessionTableError(error) || warnedAboutMissingAiSuggestionSessionTable) {
+    return;
+  }
+
+  warnedAboutMissingAiSuggestionSessionTable = true;
+  logTicketFlowFailure(`ai-suggestion-session-${operation}-migration-missing`, error);
+}
+
+async function persistPendingTicketReason(guildId, userId, reason, suggestion) {
+  const expiresAt = resolveAiSuggestionSessionExpiresAt();
+  cachePendingTicketReason(guildId, userId, {
+    reason,
+    suggestion,
+    expiresAt,
+  });
+
+  try {
+    await upsertTicketAiSuggestionSession({
+      guildId,
+      userId,
+      reason,
+      suggestion,
+      expiresAt: new Date(expiresAt).toISOString(),
+    });
+  } catch (error) {
+    if (isMissingAiSuggestionSessionTableError(error)) {
+      logAiSuggestionSessionFallback("persist", error);
+      return;
+    }
+
+    logTicketFlowFailure("persist-ai-suggestion-session", error, {
+      guildId,
+      userId,
+    });
+  }
+}
+
+async function loadPendingTicketReason(guildId, userId) {
+  const cached = readPendingTicketReasonFromMemory(guildId, userId);
+  if (cached) {
+    return cached;
+  }
+
+  try {
+    const session = await getTicketAiSuggestionSession(guildId, userId);
+    if (!session) {
+      return null;
+    }
+
+    const expiresAtMs = Date.parse(String(session.expires_at || ""));
+    if (!Number.isFinite(expiresAtMs) || expiresAtMs < Date.now()) {
+      await clearPendingTicketReason(guildId, userId);
+      return null;
+    }
+
+    const restored = {
+      reason: String(session.reason || "").trim(),
+      suggestion: String(session.suggestion || "").trim(),
+      expiresAt: expiresAtMs,
+    };
+
+    cachePendingTicketReason(guildId, userId, restored);
+    return restored;
+  } catch (error) {
+    if (isMissingAiSuggestionSessionTableError(error)) {
+      logAiSuggestionSessionFallback("load", error);
+      return null;
+    }
+
+    logTicketFlowFailure("load-ai-suggestion-session", error, {
+      guildId,
+      userId,
+    });
+    return null;
+  }
+}
+
+async function clearPendingTicketReason(guildId, userId) {
+  clearPendingTicketReasonFromMemory(guildId, userId);
+
+  try {
+    await deleteTicketAiSuggestionSession(guildId, userId);
+  } catch (error) {
+    if (isMissingAiSuggestionSessionTableError(error)) {
+      logAiSuggestionSessionFallback("clear", error);
+      return;
+    }
+
+    logTicketFlowFailure("clear-ai-suggestion-session", error, {
+      guildId,
+      userId,
+    });
+  }
+}
+
+async function ensureAiSuggestionInteractionAcknowledged(interaction) {
+  if (!interaction.deferred && !interaction.replied) {
+    await interaction.deferUpdate();
+  }
+}
+
+async function replaceAiSuggestionReply(interaction, message) {
+  await interaction.editReply(buildTicketSimpleMessagePayload(message));
 }
 
 function normalizeOpenedReason(reason) {
@@ -918,12 +1072,12 @@ async function openTicketFromModalSubmit(interaction) {
           },
         );
 
-        const pendingKey = buildPendingReasonKey(interaction.guild.id, interaction.user.id);
-        pendingTicketReasons.set(pendingKey, {
-          reason: openedReason,
+        await persistPendingTicketReason(
+          interaction.guild.id,
+          interaction.user.id,
+          openedReason,
           suggestion,
-          expiresAt: Date.now() + 1000 * 60 * 10,
-        });
+        );
 
         const payload = buildAiSuggestionPayload({
           suggestion,
@@ -963,9 +1117,9 @@ async function openTicketFromModalSubmit(interaction) {
 }
 
 async function handleAiSuggestionHelped(interaction) {
-  const pendingKey = buildPendingReasonKey(interaction.guild.id, interaction.user.id);
-  const cached = pendingTicketReasons.get(pendingKey);
-  pendingTicketReasons.delete(pendingKey);
+  await ensureAiSuggestionInteractionAcknowledged(interaction);
+  const cached = await loadPendingTicketReason(interaction.guild.id, interaction.user.id);
+  await clearPendingTicketReason(interaction.guild.id, interaction.user.id);
 
   if (cached) {
     await sendTicketAiInteractionLog(interaction.client, {
@@ -977,6 +1131,13 @@ async function handleAiSuggestionHelped(interaction) {
       status: "resolved_by_ai",
     }).catch(console.error);
   }
+
+  await replaceAiSuggestionReply(interaction, {
+    title: "Atendimento encerrado",
+    message: "Perfeito. A sugestao resolveu seu caso e o ticket nao foi aberto.",
+    tone: "success",
+  }).catch(() => null);
+  return;
 
   const successPayload = buildTicketSimpleMessagePayload({
     title: "✅ Atendimento Encerrado",
@@ -996,6 +1157,44 @@ async function handleAiSuggestionHelped(interaction) {
 }
 
 async function handleAiSuggestionContinue(interaction) {
+  await ensureAiSuggestionInteractionAcknowledged(interaction);
+  const restoredSession = await loadPendingTicketReason(interaction.guild.id, interaction.user.id);
+
+  if (!restoredSession) {
+    await clearPendingTicketReason(interaction.guild.id, interaction.user.id);
+    await replaceAiSuggestionReply(interaction, {
+      title: "Sessao encerrada",
+      message: "Essa sugestao nao esta mais disponivel. Abra o ticket novamente para gerar uma nova triagem.",
+      hint: "A sessao da sugestao fica salva por ate 12 horas.",
+      tone: "warning",
+    }).catch(() => null);
+    await replyWithTicketMessage(interaction, {
+      title: "Sessao encerrada",
+      message: "Essa sugestao nao esta mais disponivel. Abra o ticket novamente para gerar uma nova triagem.",
+      tone: "warning",
+    });
+    return;
+  }
+
+  await sendTicketAiInteractionLog(interaction.client, {
+    ticket: { guild_id: interaction.guild.id, protocol: "N/A (Pre-ticket)" },
+    userId: interaction.user.id,
+    prompt: restoredSession.reason,
+    response: restoredSession.suggestion,
+    source: "ai_suggestion",
+    status: "continued_to_ticket",
+  }).catch(console.error);
+
+  await replaceAiSuggestionReply(interaction, {
+    title: "Abrindo ticket",
+    message: "Estou usando essa triagem para abrir seu atendimento agora.",
+    hint: "Se algo impedir a abertura, eu aviso logo abaixo.",
+    tone: "neutral",
+  }).catch(() => null);
+
+  await openTicketFromInteraction(interaction, restoredSession.reason, restoredSession.suggestion);
+  return;
+
   const pendingKey = buildPendingReasonKey(interaction.guild.id, interaction.user.id);
   const cached = pendingTicketReasons.get(pendingKey);
   
