@@ -1,10 +1,8 @@
 const {
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
   MessageFlags,
 } = require("discord.js");
 const { CUSTOM_IDS } = require("../constants/customIds");
+const { env } = require("../config/env");
 const { buildTicketSimpleMessagePayload } = require("../utils/componentFactory");
 const {
   claimTicketFromInteraction,
@@ -60,19 +58,16 @@ async function replyWithTicketErrorPayload(interaction, payload) {
   await interaction.reply(normalizedPayload).catch(() => null);
 }
 
-function buildGenericCommandErrorPayload() {
-  return {
-    content:
-      "Nao consegui concluir este comando agora.\nTente novamente em alguns segundos ou acompanhe o status da plataforma.",
-    components: [
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setStyle(ButtonStyle.Link)
-          .setLabel("Verificar status")
-          .setURL("https://status.flwdesk.com"),
-      ),
-    ],
-  };
+function buildPlatformStatusErrorPayload() {
+  return buildTicketSimpleMessagePayload({
+    title: "Algo de errado aconteceu aqui",
+    message:
+      "Nao consegui concluir sua solicitacao agora. Tente novamente em alguns instantes.",
+    hint: "Se o problema continuar, acompanhe nossa pagina de status.",
+    buttonLabel: "Verificar status",
+    buttonUrl: env.statusPageUrl,
+    tone: "error",
+  });
 }
 
 module.exports = {
@@ -179,19 +174,15 @@ module.exports = {
       if (interaction.isChatInputCommand()) {
         await replyWithTicketErrorPayload(
           interaction,
-          buildGenericCommandErrorPayload(),
+          buildPlatformStatusErrorPayload(),
         );
         return;
       }
 
-      const payload = buildTicketSimpleMessagePayload({
-        title: "Falha na solicitacao",
-        message:
-          "Ocorreu um erro ao processar sua solicitacao. Verifique os IDs e permissoes no .env.",
-        tone: "error",
-      });
-
-      await replyWithTicketErrorPayload(interaction, payload);
+      await replyWithTicketErrorPayload(
+        interaction,
+        buildPlatformStatusErrorPayload(),
+      );
     }
   },
 };

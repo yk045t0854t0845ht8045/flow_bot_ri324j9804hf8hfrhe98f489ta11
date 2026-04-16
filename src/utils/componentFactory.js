@@ -926,11 +926,21 @@ function resolveTicketMessageToneColor(tone) {
 function buildTicketSimpleMessagePayload(input) {
   const normalizedInput =
     typeof input === "string"
-      ? { message: input, title: "", tone: "neutral" }
+      ? {
+          message: input,
+          title: "",
+          tone: "neutral",
+          hint: "",
+          buttonLabel: "",
+          buttonUrl: "",
+        }
       : {
           message: String(input?.message || "").trim(),
           title: String(input?.title || "").trim(),
           tone: input?.tone || "neutral",
+          hint: String(input?.hint || "").trim(),
+          buttonLabel: String(input?.buttonLabel || "").trim(),
+          buttonUrl: String(input?.buttonUrl || "").trim(),
         };
 
   const description = [
@@ -941,18 +951,52 @@ function buildTicketSimpleMessagePayload(input) {
     .join("\n\n")
     .trim();
 
+  const containerComponents = [
+    {
+      type: COMPONENT_TYPE.TEXT_DISPLAY,
+      content: description,
+    },
+  ];
+
+  const hint = stripMarkdownDecorators(normalizedInput.hint);
+  const hasLinkButton = normalizedInput.buttonLabel && normalizedInput.buttonUrl;
+
+  if (hint || hasLinkButton) {
+    containerComponents.push({
+      type: COMPONENT_TYPE.SEPARATOR,
+      divider: true,
+      spacing: SeparatorSpacingSize.Small,
+    });
+  }
+
+  if (hint) {
+    containerComponents.push({
+      type: COMPONENT_TYPE.TEXT_DISPLAY,
+      content: `-# ${hint}`,
+    });
+  }
+
+  if (hasLinkButton) {
+    containerComponents.push({
+      type: COMPONENT_TYPE.ACTION_ROW,
+      components: [
+        {
+          type: COMPONENT_TYPE.BUTTON,
+          style: BUTTON_STYLE.LINK,
+          label: normalizedInput.buttonLabel,
+          url: normalizedInput.buttonUrl,
+        },
+      ],
+    });
+  }
+
   return {
     flags: MessageFlags.IsComponentsV2,
     components: [
       {
         type: COMPONENT_TYPE.CONTAINER,
         accent_color: resolveTicketMessageToneColor(normalizedInput.tone),
-        components: [
-          {
-            type: COMPONENT_TYPE.TEXT_DISPLAY,
-            content: description,
-          },
-        ],
+        components: containerComponents,
       },
     ],
     allowedMentions: { parse: [] },
@@ -1251,4 +1295,3 @@ module.exports = {
   buildTicketClosureDmPayload,
   buildAiSuggestionPayload,
 };
-

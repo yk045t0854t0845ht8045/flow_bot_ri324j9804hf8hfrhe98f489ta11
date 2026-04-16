@@ -13,7 +13,7 @@ const {
 const { env } = require("../config/env");
 const { getUserPlanSnapshotByDiscordUserId } = require("../services/supabaseService");
 
-const STATUS_PAGE_URL = "https://status.flwdesk.com";
+const STATUS_PAGE_URL = env.statusPageUrl;
 
 function normalizeBaseAppUrl() {
   const candidate =

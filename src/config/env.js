@@ -120,6 +120,8 @@ const env = {
     process.env.OFFICIAL_TERMS_URL || `${DEFAULT_PUBLIC_APP_URL}/terms`,
   officialPrivacyUrl:
     process.env.OFFICIAL_PRIVACY_URL || `${DEFAULT_PUBLIC_APP_URL}/privacy`,
+  statusPageUrl:
+    optionalEnv("STATUS_PAGE_URL") || "https://status.flwdesk.com",
   autoDeployCommands: parseBoolean(process.env.DISCORD_AUTO_DEPLOY_COMMANDS, true),
   appUrl:
     process.env.NEXT_PUBLIC_APP_URL ||

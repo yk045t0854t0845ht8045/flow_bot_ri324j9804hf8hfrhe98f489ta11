@@ -11,6 +11,8 @@ const { syncSlashCommandsForClient } = require("../services/slashCommandSyncServ
 const { startVoicePresence } = require("../services/voicePresenceService");
 const { startStatusHeartbeat } = require("../services/statusMonitoringService");
 const { syncAllViolationRoles } = require("../services/violationService");
+const { initRealtimeListeners } = require("../services/realtimeService");
+const { verifySupabaseAdminConnection } = require("../services/supabaseConnectivityService");
 const { env } = require("../config/env");
 
 module.exports = {
@@ -18,9 +20,17 @@ module.exports = {
   once: true,
   async execute(client) {
     console.log(`Bot online como ${client.user.tag}`);
-    
-    // Inicia o sistema de monitoramento de status
-    startStatusHeartbeat(client);
+
+    const supabaseReady = await verifySupabaseAdminConnection();
+
+    if (supabaseReady) {
+      initRealtimeListeners(client);
+      startStatusHeartbeat(client);
+    } else {
+      console.warn(
+        "[startup] Servicos dependentes do Supabase foram pausados ate a chave correta ser configurada.",
+      );
+    }
 
     console.log(
       `[ai-mention] ${env.openaiApiKey ? "ativo" : "desativado"} | modelo principal: ${env.openaiModel}`,
@@ -53,28 +63,30 @@ module.exports = {
       console.error("[official-link-panel]", error);
     }
 
-    try {
-      const result = await syncAllTicketPanels(client);
-      console.log(
-        `[ticket-panels] synced ${result.applied.length}/${result.total} paineis`,
-      );
-    } catch (error) {
-      console.error("[ticket-panels]", error);
-    }
-
-    try {
-      const result = await syncOpenTicketControlMessages(client);
-      if (result.applied.length || result.total) {
+    if (supabaseReady) {
+      try {
+        const result = await syncAllTicketPanels(client);
         console.log(
-          `[ticket-open-messages] synced ${result.applied.length}/${result.total} mensagens`,
+          `[ticket-panels] synced ${result.applied.length}/${result.total} paineis`,
         );
+      } catch (error) {
+        console.error("[ticket-panels]", error);
       }
-    } catch (error) {
-      console.error("[ticket-open-messages]", error);
-    }
 
-    startDirectMessageQueueWorker(client);
-    startAutoRoleWorker(client);
+      try {
+        const result = await syncOpenTicketControlMessages(client);
+        if (result.applied.length || result.total) {
+          console.log(
+            `[ticket-open-messages] synced ${result.applied.length}/${result.total} mensagens`,
+          );
+        }
+      } catch (error) {
+        console.error("[ticket-open-messages]", error);
+      }
+
+      startDirectMessageQueueWorker(client);
+      startAutoRoleWorker(client);
+    }
 
     try {
       await primeInviteCacheForClient(client);
@@ -97,47 +109,48 @@ module.exports = {
       console.error("[security-logs:prime-voice-states]", error);
     }
 
-    setInterval(async () => {
-      try {
-        const result = await syncAllTicketPanels(client);
-        if (result.applied.length) {
-          console.log(
-            `[ticket-panels] synced ${result.applied.length}/${result.total} paineis`,
-          );
+    if (supabaseReady) {
+      setInterval(async () => {
+        try {
+          const result = await syncAllTicketPanels(client);
+          if (result.applied.length) {
+            console.log(
+              `[ticket-panels] synced ${result.applied.length}/${result.total} paineis`,
+            );
+          }
+        } catch (error) {
+          console.error("[ticket-panels]", error);
         }
-      } catch (error) {
-        console.error("[ticket-panels]", error);
-      }
-    }, env.ticketPanelSyncIntervalMs);
+      }, env.ticketPanelSyncIntervalMs);
 
-    setInterval(async () => {
-      try {
-        const result = await syncOpenTicketControlMessages(client);
-        if (result.applied.length) {
-          console.log(
-            `[ticket-open-messages] synced ${result.applied.length}/${result.total} mensagens`,
-          );
+      setInterval(async () => {
+        try {
+          const result = await syncOpenTicketControlMessages(client);
+          if (result.applied.length) {
+            console.log(
+              `[ticket-open-messages] synced ${result.applied.length}/${result.total} mensagens`,
+            );
+          }
+        } catch (error) {
+          console.error("[ticket-open-messages]", error);
         }
-      } catch (error) {
-        console.error("[ticket-open-messages]", error);
-      }
-    }, env.ticketOpenMessageSyncIntervalMs);
+      }, env.ticketOpenMessageSyncIntervalMs);
 
-    // Sync violation roles on startup, then every 6 hours
-    try {
-      await syncAllViolationRoles(client);
-      console.log("[violation-roles] Startup sync completo.");
-    } catch (error) {
-      console.error("[violation-roles] Erro no startup sync:", error);
-    }
-
-    setInterval(async () => {
       try {
         await syncAllViolationRoles(client);
-        console.log("[violation-roles] Sync periódico completo.");
+        console.log("[violation-roles] Startup sync completo.");
       } catch (error) {
-        console.error("[violation-roles] Erro no sync periódico:", error);
+        console.error("[violation-roles] Erro no startup sync:", error);
       }
-    }, 6 * 60 * 60 * 1000); // Every 6 hours
+
+      setInterval(async () => {
+        try {
+          await syncAllViolationRoles(client);
+          console.log("[violation-roles] Sync periodico completo.");
+        } catch (error) {
+          console.error("[violation-roles] Erro no sync periodico:", error);
+        }
+      }, 6 * 60 * 60 * 1000);
+    }
   },
 };
