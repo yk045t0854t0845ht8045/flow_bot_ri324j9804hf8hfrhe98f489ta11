@@ -2,6 +2,7 @@ begin;
 
 truncate table
   public.payment_order_events,
+  public.payment_provider_event_inbox,
   public.payment_coupon_redemptions,
   public.payment_gift_card_redemptions,
   public.auth_security_events,
