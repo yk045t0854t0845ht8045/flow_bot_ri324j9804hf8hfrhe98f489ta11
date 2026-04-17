@@ -21,6 +21,28 @@ const TICKET_AI_MESSAGES_TABLE = "ticket_ai_messages";
 const TICKET_AI_SUGGESTION_SESSIONS_TABLE = "ticket_ai_suggestion_sessions";
 const DEFAULT_LICENSE_VALIDITY_DAYS = 30;
 const EXPIRED_GRACE_MS = 3 * 24 * 60 * 60 * 1000;
+const MODULE_RUNTIME_CACHE_TTL_MS = 20 * 1000;
+const LICENSE_RUNTIME_CACHE_TTL_MS = 45 * 1000;
+const CONFIGURED_TICKET_GUILDS_CACHE_TTL_MS = 30 * 1000;
+
+const licenseRuntimeCache = new Map();
+const licenseRuntimeInflight = new Map();
+const moduleRuntimeCache = {
+  ticket: new Map(),
+  welcome: new Map(),
+  antiLink: new Map(),
+  autoRole: new Map(),
+  securityLogs: new Map(),
+};
+const moduleRuntimeInflight = {
+  ticket: new Map(),
+  welcome: new Map(),
+  antiLink: new Map(),
+  autoRole: new Map(),
+  securityLogs: new Map(),
+};
+let configuredTicketGuildRuntimesCache = null;
+let configuredTicketGuildRuntimesInflight = null;
 
 const supabase = createClient(env.supabaseUrl, env.supabaseServiceRoleKey, {
   auth: {
@@ -37,6 +59,64 @@ function unwrap(result, operation) {
   }
 
   return result.data;
+}
+
+function cloneCachedValue(value) {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  return JSON.parse(JSON.stringify(value));
+}
+
+function readCacheEntry(cache, key) {
+  const entry = cache.get(key);
+  if (!entry) {
+    return { hit: false, value: undefined };
+  }
+
+  if (entry.expiresAt <= Date.now()) {
+    cache.delete(key);
+    return { hit: false, value: undefined };
+  }
+
+  return {
+    hit: true,
+    value: cloneCachedValue(entry.value),
+  };
+}
+
+function writeCacheEntry(cache, key, value, ttlMs) {
+  cache.set(key, {
+    expiresAt: Date.now() + ttlMs,
+    value: cloneCachedValue(value),
+  });
+}
+
+async function withCachedResult(cache, inflight, key, ttlMs, loader) {
+  const cached = readCacheEntry(cache, key);
+  if (cached.hit) {
+    return cached.value;
+  }
+
+  const existingPromise = inflight.get(key);
+  if (existingPromise) {
+    return cloneCachedValue(await existingPromise);
+  }
+
+  const loadPromise = (async () => {
+    const value = await loader();
+    writeCacheEntry(cache, key, value, ttlMs);
+    return value;
+  })();
+
+  inflight.set(key, loadPromise);
+
+  try {
+    return cloneCachedValue(await loadPromise);
+  } finally {
+    inflight.delete(key);
+  }
 }
 
 function resolveLicenseBaseTimestamp(order) {
@@ -231,16 +311,31 @@ async function getGuildAccountLicenseRuntimeMap(guildIds) {
     return runtimeByGuild;
   }
 
+  const unresolvedGuildIds = [];
+  for (const guildId of uniqueGuildIds) {
+    const cached = readCacheEntry(licenseRuntimeCache, guildId);
+    if (cached.hit) {
+      runtimeByGuild.set(guildId, cached.value);
+      continue;
+    }
+
+    unresolvedGuildIds.push(guildId);
+  }
+
+  if (!unresolvedGuildIds.length) {
+    return runtimeByGuild;
+  }
+
   const planGuildsResult = await supabase
     .from(PLAN_GUILDS_TABLE)
     .select("guild_id, user_id, activated_at, created_at, is_active")
-    .in("guild_id", uniqueGuildIds);
+    .in("guild_id", unresolvedGuildIds);
 
   const planGuildRows = unwrap(planGuildsResult, "getGuildAccountLicenseRuntimeMap.planGuilds") || [];
   const planGuildByGuildId = new Map(
     planGuildRows.map((row) => [row.guild_id, row]),
   );
-  const missingGuildIds = uniqueGuildIds.filter(
+  const missingGuildIds = unresolvedGuildIds.filter(
     (guildId) => !planGuildByGuildId.has(guildId),
   );
   const approvedOrdersByGuild = missingGuildIds.length
@@ -267,20 +362,27 @@ async function getGuildAccountLicenseRuntimeMap(guildIds) {
 
   const userPlanStates = await getUserPlanStatesByUserIds([...userIds]);
 
-  for (const guildId of uniqueGuildIds) {
+  for (const guildId of unresolvedGuildIds) {
     const planGuildLink = planGuildByGuildId.get(guildId) || null;
     const legacyCoverage = legacyCoverageByGuild.get(guildId) || null;
     const ownerUserId =
       planGuildLink?.user_id || legacyCoverage?.order?.user_id || null;
 
     if (!Number.isFinite(ownerUserId)) {
-      runtimeByGuild.set(guildId, {
+      const runtime = {
         licenseStatus: "not_paid",
         licenseUsable: false,
         latestCoverage: null,
         licenseOwnerUserId: null,
         planLinkActive: false,
-      });
+      };
+      writeCacheEntry(
+        licenseRuntimeCache,
+        guildId,
+        runtime,
+        LICENSE_RUNTIME_CACHE_TTL_MS,
+      );
+      runtimeByGuild.set(guildId, cloneCachedValue(runtime));
       continue;
     }
 
@@ -310,28 +412,43 @@ async function getGuildAccountLicenseRuntimeMap(guildIds) {
       licenseStatus = "off";
     }
 
-    runtimeByGuild.set(guildId, {
+    const runtime = {
       licenseStatus,
       licenseUsable: licenseStatus === "paid" || licenseStatus === "expired",
       latestCoverage,
       licenseOwnerUserId: ownerUserId,
       planLinkActive: planGuildLink ? planGuildLink.is_active !== false : true,
-    });
+    };
+    writeCacheEntry(
+      licenseRuntimeCache,
+      guildId,
+      runtime,
+      LICENSE_RUNTIME_CACHE_TTL_MS,
+    );
+    runtimeByGuild.set(guildId, cloneCachedValue(runtime));
   }
 
   return runtimeByGuild;
 }
 
 async function getGuildAccountLicenseRuntime(guildId) {
-  const runtimeByGuild = await getGuildAccountLicenseRuntimeMap([guildId]);
-  return (
-    runtimeByGuild.get(guildId) || {
-      licenseStatus: "not_paid",
-      licenseUsable: false,
-      latestCoverage: null,
-      licenseOwnerUserId: null,
-      planLinkActive: false,
-    }
+  return await withCachedResult(
+    licenseRuntimeCache,
+    licenseRuntimeInflight,
+    guildId,
+    LICENSE_RUNTIME_CACHE_TTL_MS,
+    async () => {
+      const runtimeByGuild = await getGuildAccountLicenseRuntimeMap([guildId]);
+      return (
+        runtimeByGuild.get(guildId) || {
+          licenseStatus: "not_paid",
+          licenseUsable: false,
+          latestCoverage: null,
+          licenseOwnerUserId: null,
+          planLinkActive: false,
+        }
+      );
+    },
   );
 }
 
@@ -1309,7 +1426,7 @@ async function getApprovedPaymentOrdersForGuildIds(guildIds) {
   return ordersByGuild;
 }
 
-async function getGuildTicketRuntime(guildId) {
+async function loadGuildTicketRuntime(guildId) {
   const [settings, staffSettings, accountLicenseRuntime] = await Promise.all([
     getGuildTicketSettings(guildId),
     getGuildTicketStaffSettings(guildId),
@@ -1327,7 +1444,17 @@ async function getGuildTicketRuntime(guildId) {
   };
 }
 
-async function getGuildWelcomeRuntime(guildId) {
+async function getGuildTicketRuntime(guildId) {
+  return await withCachedResult(
+    moduleRuntimeCache.ticket,
+    moduleRuntimeInflight.ticket,
+    guildId,
+    MODULE_RUNTIME_CACHE_TTL_MS,
+    () => loadGuildTicketRuntime(guildId),
+  );
+}
+
+async function loadGuildWelcomeRuntime(guildId) {
   const [settings, accountLicenseRuntime] = await Promise.all([
     getGuildWelcomeSettings(guildId),
     getGuildAccountLicenseRuntime(guildId),
@@ -1343,7 +1470,17 @@ async function getGuildWelcomeRuntime(guildId) {
   };
 }
 
-async function getGuildAntiLinkRuntime(guildId) {
+async function getGuildWelcomeRuntime(guildId) {
+  return await withCachedResult(
+    moduleRuntimeCache.welcome,
+    moduleRuntimeInflight.welcome,
+    guildId,
+    MODULE_RUNTIME_CACHE_TTL_MS,
+    () => loadGuildWelcomeRuntime(guildId),
+  );
+}
+
+async function loadGuildAntiLinkRuntime(guildId) {
   const [settings, accountLicenseRuntime] = await Promise.all([
     getGuildAntiLinkSettings(guildId),
     getGuildAccountLicenseRuntime(guildId),
@@ -1359,7 +1496,17 @@ async function getGuildAntiLinkRuntime(guildId) {
   };
 }
 
-async function getGuildAutoRoleRuntime(guildId) {
+async function getGuildAntiLinkRuntime(guildId) {
+  return await withCachedResult(
+    moduleRuntimeCache.antiLink,
+    moduleRuntimeInflight.antiLink,
+    guildId,
+    MODULE_RUNTIME_CACHE_TTL_MS,
+    () => loadGuildAntiLinkRuntime(guildId),
+  );
+}
+
+async function loadGuildAutoRoleRuntime(guildId) {
   const [settings, accountLicenseRuntime] = await Promise.all([
     getGuildAutoRoleSettings(guildId),
     getGuildAccountLicenseRuntime(guildId),
@@ -1375,7 +1522,17 @@ async function getGuildAutoRoleRuntime(guildId) {
   };
 }
 
-async function getGuildSecurityLogsRuntime(guildId) {
+async function getGuildAutoRoleRuntime(guildId) {
+  return await withCachedResult(
+    moduleRuntimeCache.autoRole,
+    moduleRuntimeInflight.autoRole,
+    guildId,
+    MODULE_RUNTIME_CACHE_TTL_MS,
+    () => loadGuildAutoRoleRuntime(guildId),
+  );
+}
+
+async function loadGuildSecurityLogsRuntime(guildId) {
   const [settings, accountLicenseRuntime] = await Promise.all([
     getGuildSecurityLogsSettings(guildId),
     getGuildAccountLicenseRuntime(guildId),
@@ -1391,7 +1548,17 @@ async function getGuildSecurityLogsRuntime(guildId) {
   };
 }
 
-async function getConfiguredTicketGuildRuntimes() {
+async function getGuildSecurityLogsRuntime(guildId) {
+  return await withCachedResult(
+    moduleRuntimeCache.securityLogs,
+    moduleRuntimeInflight.securityLogs,
+    guildId,
+    MODULE_RUNTIME_CACHE_TTL_MS,
+    () => loadGuildSecurityLogsRuntime(guildId),
+  );
+}
+
+async function loadConfiguredTicketGuildRuntimes() {
   const [settingsResult, staffResult] = await Promise.all([
     supabase
       .from(TICKET_SETTINGS_TABLE)
@@ -1433,6 +1600,32 @@ async function getConfiguredTicketGuildRuntimes() {
   });
 
   return runtimes.filter((runtime) => runtime.settings);
+}
+
+async function getConfiguredTicketGuildRuntimes() {
+  if (
+    configuredTicketGuildRuntimesCache &&
+    configuredTicketGuildRuntimesCache.expiresAt > Date.now()
+  ) {
+    return cloneCachedValue(configuredTicketGuildRuntimesCache.value);
+  }
+
+  if (configuredTicketGuildRuntimesInflight) {
+    return cloneCachedValue(await configuredTicketGuildRuntimesInflight);
+  }
+
+  configuredTicketGuildRuntimesInflight = loadConfiguredTicketGuildRuntimes();
+
+  try {
+    const runtimes = await configuredTicketGuildRuntimesInflight;
+    configuredTicketGuildRuntimesCache = {
+      expiresAt: Date.now() + CONFIGURED_TICKET_GUILDS_CACHE_TTL_MS,
+      value: cloneCachedValue(runtimes),
+    };
+    return cloneCachedValue(runtimes);
+  } finally {
+    configuredTicketGuildRuntimesInflight = null;
+  }
 }
 
 async function updateGuildTicketPanelMessageId(guildId, panelMessageId) {

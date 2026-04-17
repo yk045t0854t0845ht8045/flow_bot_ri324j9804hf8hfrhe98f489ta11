@@ -84,34 +84,17 @@ alter table public.payment_coupon_redemptions enable row level security;
 alter table public.payment_gift_cards enable row level security;
 alter table public.payment_gift_card_redemptions enable row level security;
 
-drop policy if exists "service_role_all_payment_coupons" on public.payment_coupons;
-create policy "service_role_all_payment_coupons"
-on public.payment_coupons
-for all
-to service_role
-using (true)
-with check (true);
-
-drop policy if exists "service_role_all_payment_coupon_redemptions" on public.payment_coupon_redemptions;
-create policy "service_role_all_payment_coupon_redemptions"
-on public.payment_coupon_redemptions
-for all
-to service_role
-using (true)
-with check (true);
-
-drop policy if exists "service_role_all_payment_gift_cards" on public.payment_gift_cards;
-create policy "service_role_all_payment_gift_cards"
-on public.payment_gift_cards
-for all
-to service_role
-using (true)
-with check (true);
-
-drop policy if exists "service_role_all_payment_gift_card_redemptions" on public.payment_gift_card_redemptions;
-create policy "service_role_all_payment_gift_card_redemptions"
-on public.payment_gift_card_redemptions
-for all
-to service_role
-using (true)
-with check (true);
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    execute 'drop policy if exists "service_role_all_payment_coupons" on public.payment_coupons';
+    execute 'create policy "service_role_all_payment_coupons" on public.payment_coupons for all to service_role using (true) with check (true)';
+    execute 'drop policy if exists "service_role_all_payment_coupon_redemptions" on public.payment_coupon_redemptions';
+    execute 'create policy "service_role_all_payment_coupon_redemptions" on public.payment_coupon_redemptions for all to service_role using (true) with check (true)';
+    execute 'drop policy if exists "service_role_all_payment_gift_cards" on public.payment_gift_cards';
+    execute 'create policy "service_role_all_payment_gift_cards" on public.payment_gift_cards for all to service_role using (true) with check (true)';
+    execute 'drop policy if exists "service_role_all_payment_gift_card_redemptions" on public.payment_gift_card_redemptions';
+    execute 'create policy "service_role_all_payment_gift_card_redemptions" on public.payment_gift_card_redemptions for all to service_role using (true) with check (true)';
+  end if;
+end
+$$;

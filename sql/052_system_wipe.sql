@@ -1,3 +1,7 @@
+-- MANUTENCAO OPERACIONAL APENAS.
+-- NUNCA use este arquivo em bootstrap, migracao nova ou portabilidade.
+-- Este script apaga dados e reinicia identities.
+
 begin;
 
 truncate table

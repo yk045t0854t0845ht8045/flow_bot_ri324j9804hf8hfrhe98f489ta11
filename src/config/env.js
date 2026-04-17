@@ -138,11 +138,11 @@ const env = {
   deleteDelaySeconds: parseNumber(process.env.TICKET_DELETE_DELAY_SECONDS, 8),
   ticketPanelSyncIntervalMs: parseNumber(
     process.env.TICKET_PANEL_SYNC_INTERVAL_MS,
-    10_000,
+    60_000,
   ),
   ticketPanelVerificationIntervalMs: parseNumber(
     process.env.TICKET_PANEL_VERIFICATION_INTERVAL_MS,
-    180_000,
+    300_000,
   ),
   ticketOpenMessageSyncIntervalMs: parseNumber(
     process.env.TICKET_OPEN_MESSAGE_SYNC_INTERVAL_MS,
@@ -169,19 +169,21 @@ const env = {
   flowAiApiToken:
     optionalEnv("FLOWAI_INTERNAL_API_TOKEN") ||
     optionalEnv("CRON_SECRET") ||
-    optionalEnv("OPENAI_API_KEY") ||
     null,
   flowAiSigningSecret:
     optionalEnv("FLOWAI_INTERNAL_SIGNING_SECRET") ||
     optionalEnv("FLOWAI_INTERNAL_API_TOKEN") ||
     optionalEnv("CRON_SECRET") ||
-    optionalEnv("OPENAI_API_KEY") ||
     null,
   flowAiApiTimeoutMs: parseNumber(process.env.FLOWAI_API_TIMEOUT_MS, 20_000),
   flowAiApiMaxRetries: parseNumber(process.env.FLOWAI_API_MAX_RETRIES, 2),
   flowAiApiClockSkewMs: parseNumber(
     process.env.FLOWAI_API_CLOCK_SKEW_MS,
     300_000,
+  ),
+  statusHeartbeatIntervalMs: parseNumber(
+    process.env.STATUS_HEARTBEAT_INTERVAL_MS,
+    180_000,
   ),
   aiMentionLogChannelId:
     optionalEnv("AI_MENTION_LOG_CHANNEL_ID") || "1490014859344085242",

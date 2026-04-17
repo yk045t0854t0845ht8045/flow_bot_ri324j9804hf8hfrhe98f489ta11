@@ -14,13 +14,14 @@ execute function public.set_updated_at();
 
 alter table public.auth_user_plan_flow_points enable row level security;
 
-drop policy if exists "service_role_all_auth_user_plan_flow_points" on public.auth_user_plan_flow_points;
-create policy "service_role_all_auth_user_plan_flow_points"
-on public.auth_user_plan_flow_points
-for all
-to service_role
-using (true)
-with check (true);
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    execute 'drop policy if exists "service_role_all_auth_user_plan_flow_points" on public.auth_user_plan_flow_points';
+    execute 'create policy "service_role_all_auth_user_plan_flow_points" on public.auth_user_plan_flow_points for all to service_role using (true) with check (true)';
+  end if;
+end
+$$;
 
 create table if not exists public.auth_user_plan_flow_point_events (
   id bigserial primary key,
@@ -48,13 +49,14 @@ where payment_order_id is not null;
 
 alter table public.auth_user_plan_flow_point_events enable row level security;
 
-drop policy if exists "service_role_all_auth_user_plan_flow_point_events" on public.auth_user_plan_flow_point_events;
-create policy "service_role_all_auth_user_plan_flow_point_events"
-on public.auth_user_plan_flow_point_events
-for all
-to service_role
-using (true)
-with check (true);
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    execute 'drop policy if exists "service_role_all_auth_user_plan_flow_point_events" on public.auth_user_plan_flow_point_events';
+    execute 'create policy "service_role_all_auth_user_plan_flow_point_events" on public.auth_user_plan_flow_point_events for all to service_role using (true) with check (true)';
+  end if;
+end
+$$;
 
 create table if not exists public.auth_user_plan_scheduled_changes (
   id bigserial primary key,
@@ -87,13 +89,14 @@ execute function public.set_updated_at();
 
 alter table public.auth_user_plan_scheduled_changes enable row level security;
 
-drop policy if exists "service_role_all_auth_user_plan_scheduled_changes" on public.auth_user_plan_scheduled_changes;
-create policy "service_role_all_auth_user_plan_scheduled_changes"
-on public.auth_user_plan_scheduled_changes
-for all
-to service_role
-using (true)
-with check (true);
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    execute 'drop policy if exists "service_role_all_auth_user_plan_scheduled_changes" on public.auth_user_plan_scheduled_changes';
+    execute 'create policy "service_role_all_auth_user_plan_scheduled_changes" on public.auth_user_plan_scheduled_changes for all to service_role using (true) with check (true)';
+  end if;
+end
+$$;
 
 create or replace function public.apply_user_plan_flow_points_event(
   p_user_id bigint,

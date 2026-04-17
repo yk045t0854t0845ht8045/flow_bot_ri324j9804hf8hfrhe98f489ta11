@@ -40,13 +40,14 @@ execute function public.set_updated_at();
 
 alter table public.payment_provider_event_inbox enable row level security;
 
-drop policy if exists "service_role_all_payment_provider_event_inbox" on public.payment_provider_event_inbox;
-create policy "service_role_all_payment_provider_event_inbox"
-on public.payment_provider_event_inbox
-for all
-to service_role
-using (true)
-with check (true);
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    execute 'drop policy if exists "service_role_all_payment_provider_event_inbox" on public.payment_provider_event_inbox';
+    execute 'create policy "service_role_all_payment_provider_event_inbox" on public.payment_provider_event_inbox for all to service_role using (true) with check (true)';
+  end if;
+end
+$$;
 
 with ranked_pending_drafts as (
   select

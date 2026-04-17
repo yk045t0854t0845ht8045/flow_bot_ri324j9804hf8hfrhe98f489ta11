@@ -474,7 +474,7 @@ function startStatusHeartbeat(client) {
   void checkAllSystems(client);
   setInterval(() => {
     void checkAllSystems(client);
-  }, 60000);
+  }, Math.max(60_000, Number(env.statusHeartbeatIntervalMs) || 180_000));
 }
 
 async function checkAllSystems(client) {

@@ -1,4 +1,6 @@
--- Reset completo de plano/pagamentos para a conta do user_id = 1
+-- MANUTENCAO OPERACIONAL APENAS.
+-- NUNCA use este arquivo em bootstrap, migracao nova ou portabilidade.
+-- Reset completo de plano/pagamentos para a conta do user_id = 1.
 -- Protegido por validacao do discord_user_id informado.
 -- Ajuste os dois valores abaixo se quiser reutilizar para outra conta.
 

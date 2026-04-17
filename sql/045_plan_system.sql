@@ -91,10 +91,11 @@ execute function public.set_updated_at();
 
 alter table public.auth_user_plan_state enable row level security;
 
-drop policy if exists "service_role_all_auth_user_plan_state" on public.auth_user_plan_state;
-create policy "service_role_all_auth_user_plan_state"
-on public.auth_user_plan_state
-for all
-to service_role
-using (true)
-with check (true);
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    execute 'drop policy if exists "service_role_all_auth_user_plan_state" on public.auth_user_plan_state';
+    execute 'create policy "service_role_all_auth_user_plan_state" on public.auth_user_plan_state for all to service_role using (true) with check (true)';
+  end if;
+end
+$$;
