@@ -63,6 +63,15 @@ function parseNumber(value, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function parseEnum(value, allowedValues, fallback) {
+  if (typeof value !== "string") {
+    return fallback;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  return allowedValues.includes(normalized) ? normalized : fallback;
+}
+
 function parseAccentColor(value) {
   if (!value) return 0x2d7ff9;
 
@@ -184,6 +193,36 @@ const env = {
   statusHeartbeatIntervalMs: parseNumber(
     process.env.STATUS_HEARTBEAT_INTERVAL_MS,
     180_000,
+  ),
+  violationStartupSyncMode: parseEnum(
+    process.env.VIOLATION_STARTUP_SYNC_MODE,
+    ["targeted", "full", "off"],
+    "targeted",
+  ),
+  violationPeriodicSyncMode: parseEnum(
+    process.env.VIOLATION_PERIODIC_SYNC_MODE,
+    ["targeted", "full", "off"],
+    "full",
+  ),
+  violationPeriodicSyncIntervalMs: parseNumber(
+    process.env.VIOLATION_PERIODIC_SYNC_INTERVAL_MS,
+    12 * 60 * 60 * 1000,
+  ),
+  violationSyncConcurrency: Math.max(
+    1,
+    parseNumber(process.env.VIOLATION_SYNC_CONCURRENCY, 4),
+  ),
+  realtimeReconnectBaseMs: parseNumber(
+    process.env.REALTIME_RECONNECT_BASE_MS,
+    2_000,
+  ),
+  realtimeReconnectMaxMs: parseNumber(
+    process.env.REALTIME_RECONNECT_MAX_MS,
+    30_000,
+  ),
+  realtimeBroadcastSubscribeTimeoutMs: parseNumber(
+    process.env.REALTIME_BROADCAST_SUBSCRIBE_TIMEOUT_MS,
+    8_000,
   ),
   aiMentionLogChannelId:
     optionalEnv("AI_MENTION_LOG_CHANNEL_ID") || "1490014859344085242",

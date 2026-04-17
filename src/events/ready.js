@@ -110,6 +110,9 @@ module.exports = {
     }
 
     if (supabaseReady) {
+      const startupViolationSyncMode = env.violationStartupSyncMode;
+      const periodicViolationSyncMode = env.violationPeriodicSyncMode;
+
       setInterval(async () => {
         try {
           const result = await syncAllTicketPanels(client);
@@ -136,21 +139,37 @@ module.exports = {
         }
       }, env.ticketOpenMessageSyncIntervalMs);
 
-      try {
-        await syncAllViolationRoles(client);
-        console.log("[violation-roles] Startup sync completo.");
-      } catch (error) {
-        console.error("[violation-roles] Erro no startup sync:", error);
+      if (startupViolationSyncMode !== "off") {
+        try {
+          const result = await syncAllViolationRoles(client, {
+            mode: startupViolationSyncMode,
+          });
+          console.log(
+            `[violation-roles] Startup sync ${result.mode} completo (${result.synced}/${result.candidateCount}).`,
+          );
+        } catch (error) {
+          console.error("[violation-roles] Erro no startup sync:", error);
+        }
+      } else {
+        console.log("[violation-roles] Startup sync desativado por configuracao.");
       }
 
-      setInterval(async () => {
-        try {
-          await syncAllViolationRoles(client);
-          console.log("[violation-roles] Sync periodico completo.");
-        } catch (error) {
-          console.error("[violation-roles] Erro no sync periodico:", error);
-        }
-      }, 6 * 60 * 60 * 1000);
+      if (periodicViolationSyncMode !== "off") {
+        setInterval(async () => {
+          try {
+            const result = await syncAllViolationRoles(client, {
+              mode: periodicViolationSyncMode,
+            });
+            console.log(
+              `[violation-roles] Sync periodico ${result.mode} completo (${result.synced}/${result.candidateCount}).`,
+            );
+          } catch (error) {
+            console.error("[violation-roles] Erro no sync periodico:", error);
+          }
+        }, env.violationPeriodicSyncIntervalMs);
+      } else {
+        console.log("[violation-roles] Sync periodico desativado por configuracao.");
+      }
     }
   },
 };

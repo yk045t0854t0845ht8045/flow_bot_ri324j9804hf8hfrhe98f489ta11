@@ -56,6 +56,33 @@ function chunkArray(values, size = 250) {
   return chunks;
 }
 
+async function runWithConcurrency(items, worker) {
+  const queue = Array.isArray(items) ? items : [];
+  if (!queue.length) {
+    return 0;
+  }
+
+  const concurrency = Math.max(
+    1,
+    Math.min(env.violationSyncConcurrency || 1, queue.length),
+  );
+  let cursor = 0;
+  let completed = 0;
+
+  await Promise.all(
+    Array.from({ length: concurrency }, async () => {
+      while (cursor < queue.length) {
+        const item = queue[cursor];
+        cursor += 1;
+        await worker(item);
+        completed += 1;
+      }
+    }),
+  );
+
+  return completed;
+}
+
 function isViolationActive(violation, nowMs = Date.now()) {
   if (!violation?.expires_at) {
     return true;
@@ -142,6 +169,67 @@ async function loadViolationLevelMapByDiscordUserIds(discordUserIds) {
 
   for (const [userId, discordUserId] of discordUserIdByUserId.entries()) {
     const level = resolveViolationLevelFromCount(activeCountsByUserId.get(userId) || 0);
+    violationLevelByDiscordUserId.set(discordUserId, level);
+    writeViolationLevelCache(discordUserId, level);
+  }
+
+  return violationLevelByDiscordUserId;
+}
+
+async function loadActiveViolationLevelMap() {
+  const { data: violations, error } = await supabase
+    .from("account_violations")
+    .select("user_id, expires_at");
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  const now = Date.now();
+  const activeCountsByUserId = new Map();
+
+  for (const violation of violations || []) {
+    if (!Number.isFinite(violation?.user_id) || !isViolationActive(violation, now)) {
+      continue;
+    }
+
+    activeCountsByUserId.set(
+      violation.user_id,
+      (activeCountsByUserId.get(violation.user_id) || 0) + 1,
+    );
+  }
+
+  const activeUserIds = [...activeCountsByUserId.keys()];
+  const violationLevelByDiscordUserId = new Map();
+
+  if (!activeUserIds.length) {
+    return violationLevelByDiscordUserId;
+  }
+
+  const userRows = [];
+  for (const chunk of chunkArray(activeUserIds, 500)) {
+    const { data: users, error: usersError } = await supabase
+      .from("auth_users")
+      .select("id, discord_user_id")
+      .in("id", chunk);
+
+    if (usersError) {
+      throw new Error(usersError.message);
+    }
+
+    if (Array.isArray(users) && users.length) {
+      userRows.push(...users);
+    }
+  }
+
+  for (const row of userRows) {
+    const discordUserId =
+      typeof row?.discord_user_id === "string" ? row.discord_user_id.trim() : "";
+    if (!discordUserId) {
+      continue;
+    }
+
+    const level = resolveViolationLevelFromCount(activeCountsByUserId.get(row.id) || 0);
     violationLevelByDiscordUserId.set(discordUserId, level);
     writeViolationLevelCache(discordUserId, level);
   }
@@ -299,19 +387,54 @@ async function isDiscordUserAtRisk(discordUserId) {
   return level >= 3;
 }
 
-async function syncAllViolationRoles(client) {
-  console.log("[violationService] Starting full violation role sync...");
+async function syncAllViolationRoles(client, options = {}) {
+  const requestedMode =
+    typeof options.mode === "string" ? options.mode.trim().toLowerCase() : "full";
+  const mode = ["targeted", "full", "off"].includes(requestedMode)
+    ? requestedMode
+    : "full";
+
+  if (mode === "off") {
+    return { mode, synced: 0, candidateCount: 0 };
+  }
 
   try {
     const guild = await getOfficialGuild(client);
     if (!guild) {
-      console.warn("[violationService] Could not fetch official guild for full sync.");
-      return;
+      console.warn("[violationService] Could not fetch official guild for violation sync.");
+      return { mode, synced: 0, candidateCount: 0 };
     }
+
+    if (mode === "targeted") {
+      console.log("[violationService] Starting targeted violation role sync...");
+
+      const violationLevelByDiscordUserId = await loadActiveViolationLevelMap();
+      const candidates = [...violationLevelByDiscordUserId.entries()].map(
+        ([discordUserId, level]) => ({
+          discordUserId,
+          level,
+        }),
+      );
+
+      const synced = await runWithConcurrency(candidates, async (candidate) => {
+        await syncViolationRolesForDiscordUser(client, candidate.discordUserId, {
+          guild,
+          level: candidate.level,
+          log: false,
+        });
+      });
+
+      console.log(
+        `[violationService] Targeted sync completed: ${synced}/${candidates.length} member(s) processed.`,
+      );
+      return { mode, synced, candidateCount: candidates.length };
+    }
+
+    console.log("[violationService] Starting full violation role sync...");
 
     const allMembers = await guild.members.fetch().catch(() => null);
     if (!allMembers) {
-      return;
+      return { mode, synced: 0, candidateCount: 0 };
     }
 
     const targetMembers = [...allMembers.values()].filter(
@@ -321,23 +444,23 @@ async function syncAllViolationRoles(client) {
       targetMembers.map((member) => member.id),
     );
 
-    let synced = 0;
-    for (const member of targetMembers) {
+    const synced = await runWithConcurrency(targetMembers, async (member) => {
       await syncViolationRolesForDiscordUser(client, member.id, {
         guild,
         member,
         level: violationLevelByDiscordUserId.get(member.id) || 0,
         log: false,
       });
-      synced += 1;
-    }
+    });
 
     console.log(`[violationService] Full sync completed: ${synced} members checked.`);
+    return { mode, synced, candidateCount: targetMembers.length };
   } catch (error) {
     console.error(
-      "[violationService] Full sync error:",
+      "[violationService] Violation sync error:",
       error instanceof Error ? error.message : error,
     );
+    return { mode, synced: 0, candidateCount: 0 };
   }
 }
 
