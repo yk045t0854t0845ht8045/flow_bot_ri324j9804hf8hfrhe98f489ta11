@@ -14,35 +14,208 @@ const FAIL_OUTBOX_RPC = "system_status_fail_outbox_item";
 const RECONCILE_INCIDENTS_RPC = "system_status_reconcile_open_incidents";
 const MONITOR_LEASE_NAME = "status-heartbeat-primary";
 const MONITOR_WORKER_ID = `${os.hostname()}:${process.pid}:status-heartbeat`;
+const RPC_BACKOFF_SHORT_MS = 5 * 60 * 1000;
+const RPC_BACKOFF_LONG_MS = 30 * 60 * 1000;
+const FALLBACK_HEALTHY_PERSIST_INTERVAL_MS = 15 * 60 * 1000;
+const FALLBACK_DEGRADED_PERSIST_INTERVAL_MS = 5 * 60 * 1000;
+const FALLBACK_INCIDENT_PERSIST_INTERVAL_MS = 60 * 1000;
+const PERMANENT_RPC_ERROR_CODES = new Set(["42702", "42703", "42883", "42P01", "42501"]);
 
 const webhookCooldowns = {};
+const rpcBackoffState = new Map();
+const componentIdCache = new Map();
+const fallbackPersistState = new Map();
 let hasLoggedRpcFallback = false;
 let hasLoggedLeaseFallback = false;
 let hasLoggedOutboxFallback = false;
 let hasLoggedReconcileFallback = false;
 let heartbeatInFlight = false;
 
-async function withRetry(fn, retries = 2) {
+async function withRetry(fn, retries = 2, options = {}) {
+  const retryDelayMs = Number(options.retryDelayMs) || 2000;
+  const shouldRetryError =
+    typeof options.shouldRetryError === "function"
+      ? options.shouldRetryError
+      : () => true;
   let lastError = null;
-  for (let i = 0; i < retries; i += 1) {
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
-      const result = await fn();
-      if (result) return result;
+      return await fn();
     } catch (error) {
       lastError = error;
+      if (attempt >= retries || !shouldRetryError(error)) {
+        break;
+      }
     }
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
   }
 
-  try {
-    return await fn();
-  } catch (error) {
-    throw error || lastError || new Error("Falha apos retentativas");
-  }
+  throw lastError || new Error("Falha apos retentativas");
 }
 
 function normalizeStatusMessage(value, maxLength = 500) {
   return String(value || "").replace(/\s+/g, " ").trim().slice(0, maxLength);
+}
+
+function isPermanentRpcFailure(error) {
+  const code = String(error?.code || "").trim();
+  const message = String(error?.message || "").toLowerCase();
+
+  if (PERMANENT_RPC_ERROR_CODES.has(code)) {
+    return true;
+  }
+
+  return (
+    message.includes("is ambiguous") ||
+    message.includes("does not exist") ||
+    message.includes("undefined table") ||
+    message.includes("undefined column")
+  );
+}
+
+function shouldRetryRpcError(error) {
+  if (!error) {
+    return true;
+  }
+
+  if (error.code === "RPC_BACKOFF") {
+    return false;
+  }
+
+  return !isPermanentRpcFailure(error);
+}
+
+function getRpcBackoff(rpcName) {
+  const state = rpcBackoffState.get(rpcName);
+  if (!state) {
+    return null;
+  }
+
+  if (state.disabledUntil <= Date.now()) {
+    rpcBackoffState.delete(rpcName);
+    return null;
+  }
+
+  return state;
+}
+
+function buildRpcBackoffError(rpcName, state) {
+  const error = new Error(
+    state?.message
+      ? `RPC ${rpcName} em backoff temporario: ${state.message}`
+      : `RPC ${rpcName} em backoff temporario.`,
+  );
+  error.code = "RPC_BACKOFF";
+  error.rpcName = rpcName;
+  error.rpcBackoffUntil = state?.disabledUntil || null;
+  return error;
+}
+
+function markRpcFailure(rpcName, error) {
+  const permanent = isPermanentRpcFailure(error);
+  const state = {
+    disabledUntil: Date.now() + (permanent ? RPC_BACKOFF_LONG_MS : RPC_BACKOFF_SHORT_MS),
+    message: normalizeStatusMessage(error?.message || error, 240),
+    code: String(error?.code || "").trim() || null,
+    permanent,
+  };
+  rpcBackoffState.set(rpcName, state);
+  return state;
+}
+
+function clearRpcFailure(rpcName) {
+  rpcBackoffState.delete(rpcName);
+}
+
+async function callRpc(rpcName, payload = {}) {
+  const backoff = getRpcBackoff(rpcName);
+  if (backoff) {
+    throw buildRpcBackoffError(rpcName, backoff);
+  }
+
+  const response = await supabase.rpc(rpcName, payload);
+  if (response.error) {
+    const state = markRpcFailure(rpcName, response.error);
+    const error = new Error(response.error.message || `Falha ao executar RPC ${rpcName}.`);
+    error.code = response.error.code || null;
+    error.details = response.error.details || null;
+    error.hint = response.error.hint || null;
+    error.rpcName = rpcName;
+    error.rpcBackoffUntil = state.disabledUntil;
+    error.rpcPermanent = state.permanent;
+    throw error;
+  }
+
+  clearRpcFailure(rpcName);
+  return response.data;
+}
+
+function getFallbackPersistIntervalMs(status) {
+  if (status === "operational") {
+    return FALLBACK_HEALTHY_PERSIST_INTERVAL_MS;
+  }
+
+  if (status === "degraded_performance" || status === "under_maintenance") {
+    return FALLBACK_DEGRADED_PERSIST_INTERVAL_MS;
+  }
+
+  return FALLBACK_INCIDENT_PERSIST_INTERVAL_MS;
+}
+
+function buildFallbackFingerprint(result, payload) {
+  return JSON.stringify({
+    rawStatus: payload.p_raw_status,
+    stableStatus: result.status,
+    latencyMs: payload.p_latency_ms,
+    responseCode: payload.p_response_code,
+    sourceKey: payload.p_source_key,
+    message: payload.p_message || null,
+  });
+}
+
+function shouldPersistFallbackResult(result, payload, observedAt) {
+  const fingerprint = buildFallbackFingerprint(result, payload);
+  const previous = fallbackPersistState.get(result.name);
+  const intervalMs = getFallbackPersistIntervalMs(result.status);
+  const nowMs = observedAt.getTime();
+
+  if (!previous || previous.fingerprint !== fingerprint) {
+    return { shouldPersist: true, fingerprint };
+  }
+
+  if (nowMs - previous.persistedAt >= intervalMs) {
+    return { shouldPersist: true, fingerprint };
+  }
+
+  return { shouldPersist: false, fingerprint };
+}
+
+function rememberFallbackPersist(resultName, fingerprint, observedAt) {
+  fallbackPersistState.set(resultName, {
+    fingerprint,
+    persistedAt: observedAt.getTime(),
+  });
+}
+
+async function resolveComponentId(componentName) {
+  const cached = componentIdCache.get(componentName);
+  if (cached) {
+    return cached;
+  }
+
+  const { data, error } = await supabase
+    .from("system_components")
+    .select("id")
+    .eq("name", componentName)
+    .single();
+
+  if (error) {
+    throw error;
+  }
+
+  componentIdCache.set(componentName, data.id);
+  return data.id;
 }
 
 function statusWeight(status) {
@@ -214,14 +387,14 @@ async function persistStatusResult(result, observedAt) {
 
   try {
     const row = await withRetry(async () => {
-      const response = await supabase.rpc(STATUS_RPC_NAME, payload);
-      if (response.error) {
-        throw response.error;
-      }
-      return response.data?.[0] || null;
-    }, 1);
+      const data = await callRpc(STATUS_RPC_NAME, payload);
+      return data?.[0] || null;
+    }, 1, {
+      shouldRetryError: shouldRetryRpcError,
+    });
 
     if (row) {
+      hasLoggedRpcFallback = false;
       return {
         ...result,
         rawStatus: row.raw_status || payload.p_raw_status,
@@ -238,15 +411,15 @@ async function persistStatusResult(result, observedAt) {
     }
   }
 
-  const { data: component, error: componentError } = await supabase
-    .from("system_components")
-    .select("id")
-    .eq("name", result.name)
-    .single();
-
-  if (componentError) {
-    throw componentError;
+  const fallbackDecision = shouldPersistFallbackResult(result, payload, observedAt);
+  if (!fallbackDecision.shouldPersist) {
+    return {
+      ...result,
+      shouldAlert: false,
+    };
   }
+
+  const componentId = await resolveComponentId(result.name);
 
   await supabase
     .from("system_components")
@@ -260,16 +433,18 @@ async function persistStatusResult(result, observedAt) {
       last_raw_checked_at: payload.p_observed_at,
       updated_at: observedAt.toISOString(),
     })
-    .eq("id", component.id);
+    .eq("id", componentId);
 
   await supabase.from("system_status_history").upsert(
     {
-      component_id: component.id,
+      component_id: componentId,
       recorded_at: observedAt.toISOString().split("T")[0],
       status: result.status,
     },
     { onConflict: "component_id,recorded_at" },
   );
+
+  rememberFallbackPersist(result.name, fallbackDecision.fingerprint, observedAt);
 
   return {
     ...result,
@@ -279,7 +454,7 @@ async function persistStatusResult(result, observedAt) {
 
 async function acquireMonitorLease() {
   try {
-    const { data, error } = await supabase.rpc(MONITOR_LEASE_RPC, {
+    const data = await callRpc(MONITOR_LEASE_RPC, {
       p_lease_name: MONITOR_LEASE_NAME,
       p_holder_id: MONITOR_WORKER_ID,
       p_ttl_seconds: 110,
@@ -290,10 +465,7 @@ async function acquireMonitorLease() {
       },
     });
 
-    if (error) {
-      throw error;
-    }
-
+    hasLoggedLeaseFallback = false;
     return Boolean(data);
   } catch (error) {
     if (!hasLoggedLeaseFallback) {
@@ -308,16 +480,13 @@ async function acquireMonitorLease() {
 
 async function claimNotificationBatch(limit = 10) {
   try {
-    const { data, error } = await supabase.rpc(CLAIM_OUTBOX_RPC, {
+    const data = await callRpc(CLAIM_OUTBOX_RPC, {
       p_worker_id: MONITOR_WORKER_ID,
       p_limit: limit,
       p_visibility_timeout_seconds: 300,
     });
 
-    if (error) {
-      throw error;
-    }
-
+    hasLoggedOutboxFallback = false;
     return Array.isArray(data) ? data : [];
   } catch (error) {
     if (!hasLoggedOutboxFallback) {
@@ -331,36 +500,26 @@ async function claimNotificationBatch(limit = 10) {
 }
 
 async function completeNotification(id, metadata = {}) {
-  const { error } = await supabase.rpc(COMPLETE_OUTBOX_RPC, {
+  await callRpc(COMPLETE_OUTBOX_RPC, {
     p_notification_id: id,
     p_delivery_metadata: metadata,
   });
-
-  if (error) {
-    throw error;
-  }
 }
 
 async function failNotification(id, errorDetails, metadata = {}) {
-  const { error } = await supabase.rpc(FAIL_OUTBOX_RPC, {
+  await callRpc(FAIL_OUTBOX_RPC, {
     p_notification_id: id,
     p_error: normalizeStatusMessage(errorDetails, 500),
     p_retry_seconds: 300,
     p_max_attempts: 8,
     p_error_metadata: metadata,
   });
-
-  if (error) {
-    throw error;
-  }
 }
 
 async function reconcileOpenIncidents() {
   try {
-    const { error } = await supabase.rpc(RECONCILE_INCIDENTS_RPC);
-    if (error) {
-      throw error;
-    }
+    await callRpc(RECONCILE_INCIDENTS_RPC);
+    hasLoggedReconcileFallback = false;
   } catch (error) {
     if (!hasLoggedReconcileFallback) {
       hasLoggedReconcileFallback = true;

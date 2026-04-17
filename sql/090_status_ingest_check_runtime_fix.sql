@@ -342,7 +342,7 @@ begin
     v_next_stable,
     v_today
   )
-  on conflict (component_id, recorded_at) do update
+  on conflict on constraint system_status_history_component_id_recorded_at_key do update
   set status = case
     when public.get_status_severity_weight(excluded.status) > public.get_status_severity_weight(public.system_status_history.status)
     then excluded.status
@@ -599,7 +599,7 @@ begin
     v_next_stable,
     v_today
   )
-  on conflict (component_id, recorded_at) do update
+  on conflict on constraint system_status_history_component_id_recorded_at_key do update
   set status = case
     when public.get_status_severity_weight(excluded.status) > public.get_status_severity_weight(public.system_status_history.status)
     then excluded.status
