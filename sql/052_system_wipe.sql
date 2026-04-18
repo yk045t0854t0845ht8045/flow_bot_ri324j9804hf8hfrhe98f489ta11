@@ -36,6 +36,7 @@ truncate table
   public.payment_orders,
   public.payment_coupons,
   public.payment_gift_cards,
+  public.auth_user_trusted_devices,
   public.auth_sessions,
   public.auth_users
 restart identity cascade;

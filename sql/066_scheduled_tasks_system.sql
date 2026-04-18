@@ -101,7 +101,7 @@ RETURNS TRIGGER AS $$
 BEGIN
     -- Only create task if plan has an expiry date and is active
     IF NEW.expires_at IS NOT NULL AND NEW.status = 'active' THEN
-        INSERT INTO scheduled_tasks (task_type, user_id, plan_id, scheduled_at, priority, metadata)
+        INSERT INTO public.scheduled_tasks (task_type, user_id, plan_id, scheduled_at, priority, metadata)
         VALUES ('plan_expiry', NEW.user_id, NEW.id, NEW.expires_at, 10,
                 jsonb_build_object('plan_type', NEW.plan_type, 'expires_at', NEW.expires_at))
         ON CONFLICT DO NOTHING;
@@ -109,13 +109,14 @@ BEGIN
 
     -- Clean up old expiry tasks if expiry changed
     IF OLD.expires_at IS NOT NULL AND (OLD.expires_at != NEW.expires_at OR NEW.status != 'active') THEN
-        DELETE FROM scheduled_tasks
+        DELETE FROM public.scheduled_tasks
         WHERE plan_id = NEW.id AND task_type = 'plan_expiry' AND status = 'pending';
     END IF;
 
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql
+SET search_path = pg_catalog, public;
 
 -- Function to handle plan status changes
 CREATE OR REPLACE FUNCTION handle_plan_status_change()
@@ -123,7 +124,7 @@ RETURNS TRIGGER AS $$
 BEGIN
     -- If plan expired, create cleanup task
     IF NEW.status = 'expired' AND OLD.status = 'active' THEN
-        INSERT INTO scheduled_tasks (task_type, user_id, plan_id, scheduled_at, priority, metadata)
+        INSERT INTO public.scheduled_tasks (task_type, user_id, plan_id, scheduled_at, priority, metadata)
         VALUES ('account_cleanup', NEW.user_id, NEW.id, now() + interval '30 days', 5,
                 jsonb_build_object('reason', 'plan_expired', 'plan_type', NEW.plan_type))
         ON CONFLICT DO NOTHING;
@@ -131,14 +132,15 @@ BEGIN
 
     -- If plan was cancelled, cancel related tasks
     IF NEW.status = 'cancelled' AND OLD.status != 'cancelled' THEN
-        UPDATE scheduled_tasks
+        UPDATE public.scheduled_tasks
         SET status = 'cancelled', updated_at = now()
         WHERE plan_id = NEW.id AND status IN ('pending', 'processing');
     END IF;
 
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql
+SET search_path = pg_catalog, public;
 
 -- Create triggers (drop first to avoid conflicts)
 DROP TRIGGER IF EXISTS trigger_create_plan_expiry_task ON user_plans;
