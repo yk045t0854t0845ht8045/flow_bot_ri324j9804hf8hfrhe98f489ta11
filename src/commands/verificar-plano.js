@@ -23,6 +23,28 @@ function normalizeBaseAppUrl() {
   return candidate.replace(/\/+$/, "");
 }
 
+function normalizeDashboardUrl() {
+  const baseAppUrl = normalizeBaseAppUrl();
+
+  try {
+    const url = new URL(baseAppUrl);
+
+    if (url.hostname === "localhost" || url.hostname.endsWith(".localhost")) {
+      url.hostname = "fdesk.localhost";
+    } else if (url.hostname === "flwdesk.com" || url.hostname === "www.flwdesk.com") {
+      url.hostname = "fdesk.flwdesk.com";
+    }
+
+    url.pathname = "/";
+    url.search = "";
+    url.hash = "";
+
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return "https://fdesk.flwdesk.com";
+  }
+}
+
 function toDiscordTimestamp(value) {
   if (!value || typeof value !== "string") return "Nao informado";
   const parsed = Date.parse(value);
@@ -113,8 +135,7 @@ function buildNoPlanPayloads() {
 }
 
 function buildPlanPayloads(snapshot) {
-  const baseAppUrl = normalizeBaseAppUrl();
-  const dashboardUrl = `${baseAppUrl}/servers`;
+  const dashboardUrl = normalizeDashboardUrl();
   const statusLabel =
     snapshot.status === "active"
       ? "Licenca valida"

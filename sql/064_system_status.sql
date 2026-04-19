@@ -109,7 +109,7 @@ INSERT INTO system_components (name, description, display_order) VALUES
 ('Tarefas agendadas', 'Tarefas agendadas pelos clientes como pagamentos, Datas, Mudanças de plano, Downgrades etc.', 3),
 ('DISCORD BOT', 'Sistema do DISCORD BOT', 4),
 ('Notificações', 'Notificações de Segurança, Notificações de Atualizações, Logs ETC.', 5),
-('Painel de controle', 'Dashboard flwdesk.com/servers e * dentro desse mesmo esquema do dashboard', 6),
+('Painel de controle', 'Dashboard fdesk.flwdesk.com e areas internas vinculadas ao painel principal', 6),
 ('DNS', 'DNS do sistema', 7),
 ('CDN', 'CDN, imagens do sistema, carregamento ETC', 8),
 ('Registro de domínio', 'Registro de domínios, clientes, subdomínios dos transcripts dos clientes, nossos domínios e subdomínios oficiais tbm', 9),
