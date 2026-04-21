@@ -5,7 +5,7 @@ $gitSafeDirectory = $rootDir -replace "\\", "/"
 $repoUrl = if ($env:BOT_GITHUB_REMOTE) {
   $env:BOT_GITHUB_REMOTE
 } else {
-  "https://github.com/yk045t0854t0845ht8045/flow_bot_ri324j9804hf8hfrhe98f489ta11.git"
+  "https://github.com/Flowdesk-Brasil/flow_bot_ri324j9804hf8hfrhe98f489ta11.git"
 }
 $gitUserName = if ($env:BOT_GIT_NAME) {
   $env:BOT_GIT_NAME

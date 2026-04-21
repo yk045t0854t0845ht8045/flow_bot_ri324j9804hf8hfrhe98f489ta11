@@ -4,6 +4,10 @@ const path = require("node:path");
 const fs = require("node:fs");
 
 const rootDir = path.resolve(__dirname, "..");
+const DEFAULT_SITE_GITHUB_REMOTE =
+  "https://github.com/Flowdesk-Brasil/Fl0wD3sk_845983_wjcwf0328roifldvn_934320fn02rg0g89.git";
+const DEFAULT_BOT_GITHUB_REMOTE =
+  "https://github.com/Flowdesk-Brasil/flow_bot_ri324j9804hf8hfrhe98f489ta11.git";
 
 /**
  * Executa um comando e joga o output no terminal atual.
@@ -48,6 +52,31 @@ async function askCommitMessage(repoName, rl) {
   });
 }
 
+function ensureRemoteOrigin(targetDir, repoName, remoteUrl) {
+  if (!remoteUrl) {
+    return;
+  }
+
+  const currentOrigin = capture("git", ["remote", "get-url", "origin"], targetDir);
+  if (currentOrigin === remoteUrl) {
+    return;
+  }
+
+  const remoteList = capture("git", ["remote"], targetDir)
+    .split(/\r?\n/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  if (remoteList.includes("origin")) {
+    console.log(`\n🔁 Atualizando remote [${repoName}] para o repositorio novo...`);
+    run("git", ["remote", "set-url", "origin", remoteUrl], targetDir);
+    return;
+  }
+
+  console.log(`\n🔗 Configurando remote [${repoName}]...`);
+  run("git", ["remote", "add", "origin", remoteUrl], targetDir);
+}
+
 /**
  * Verifica se o repositório está em meio a um merge ou rebase (conflito).
  */
@@ -64,13 +93,14 @@ function isResolvingConflict(targetDir) {
 /**
  * Lógica principal de sincronização de um repositório git.
  */
-async function syncRepo(targetDir, repoName, rl) {
+async function syncRepo(targetDir, repoName, rl, options = {}) {
   if (!fs.existsSync(path.join(targetDir, ".git"))) {
     console.log(`\nℹ️  Pulando [${repoName}]: não é um repositório Git.`);
     return;
   }
 
   const relPath = path.relative(rootDir, targetDir) || ".";
+  ensureRemoteOrigin(targetDir, repoName, options.remoteUrl || null);
 
   // 0. Verificar se já existe um conflito pendente
   if (isResolvingConflict(targetDir)) {
@@ -168,10 +198,14 @@ async function main() {
   try {
     const siteDir = path.join(rootDir, "site");
     if (fs.existsSync(siteDir)) {
-      await syncRepo(siteDir, "SITE / DASHBOARD", rl);
+      await syncRepo(siteDir, "SITE / DASHBOARD", rl, {
+        remoteUrl: process.env.SITE_GITHUB_REMOTE || DEFAULT_SITE_GITHUB_REMOTE,
+      });
     }
 
-    await syncRepo(rootDir, "BOT / CORE", rl);
+    await syncRepo(rootDir, "BOT / CORE", rl, {
+      remoteUrl: process.env.BOT_GITHUB_REMOTE || DEFAULT_BOT_GITHUB_REMOTE,
+    });
 
     console.log("\n🎉 ==================================================");
     console.log("🎉 SUCESSO! Todo o seu código está no GitHub.");

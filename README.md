@@ -73,6 +73,8 @@ npm run site
 
 - O script usa por padrao:
   - `SITE_GITHUB_REMOTE` (url do repositorio)
+  - remoto padrao atual:
+    `https://github.com/Flowdesk-Brasil/Fl0wD3sk_845983_wjcwf0328roifldvn_934320fn02rg0g89.git`
   - `SITE_COMMIT_MESSAGE` (opcional para mensagem fixa)
   - `SITE_GIT_NAME` e `SITE_GIT_EMAIL` (identidade de commit no repo `/site`)
 
@@ -86,7 +88,7 @@ npm run bot
 
 - O script ignora `site/`, `tmp/` e `.env` automaticamente.
 - O repositorio remoto padrao do bot e:
-  - `https://github.com/yk045t0854t0845ht8045/flow_bot_ri324j9804hf8hfrhe98f489ta11.git`
+  - `https://github.com/Flowdesk-Brasil/flow_bot_ri324j9804hf8hfrhe98f489ta11.git`
 - Variaveis opcionais do publish:
   - `BOT_GITHUB_REMOTE`
   - `BOT_COMMIT_MESSAGE`
