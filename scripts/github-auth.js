@@ -1,7 +1,10 @@
 const { spawnSync } = require("node:child_process");
+const https = require("node:https");
 const path = require("node:path");
+const fs = require("node:fs");
 
 const rootDir = path.resolve(__dirname, "..");
+const siteDir = path.join(rootDir, "site");
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -49,6 +52,10 @@ function resolveAuthProvider() {
   }
 
   return null;
+}
+
+function isGitRepository(targetDir) {
+  return fs.existsSync(path.join(targetDir, ".git"));
 }
 
 function ensureGitCredentialManagerHelper() {
@@ -151,6 +158,120 @@ function logoutGitHubAccounts(accounts, provider) {
   });
 }
 
+function fetchJson(url) {
+  return new Promise((resolve, reject) => {
+    const request = https.get(
+      url,
+      {
+        headers: {
+          "User-Agent": "flowdesk-github-auth",
+          Accept: "application/vnd.github+json",
+        },
+      },
+      (response) => {
+        const chunks = [];
+
+        response.on("data", (chunk) => {
+          chunks.push(chunk);
+        });
+
+        response.on("end", () => {
+          const raw = Buffer.concat(chunks).toString("utf8");
+          if (response.statusCode && response.statusCode >= 400) {
+            reject(
+              new Error(
+                `GitHub API respondeu ${response.statusCode}: ${raw || "erro desconhecido"}`,
+              ),
+            );
+            return;
+          }
+
+          try {
+            resolve(JSON.parse(raw));
+          } catch (error) {
+            reject(error);
+          }
+        });
+      },
+    );
+
+    request.on("error", reject);
+  });
+}
+
+async function fetchGitHubUserProfile(username) {
+  return fetchJson(`https://api.github.com/users/${encodeURIComponent(username)}`);
+}
+
+function buildGitHubNoreplyEmail(profile) {
+  const login = typeof profile?.login === "string" ? profile.login.trim() : "";
+  const id = Number(profile?.id);
+
+  if (login && Number.isFinite(id) && id > 0) {
+    return `${id}+${login}@users.noreply.github.com`;
+  }
+
+  if (login) {
+    return `${login}@users.noreply.github.com`;
+  }
+
+  throw new Error("Nao foi possivel montar o email noreply do GitHub.");
+}
+
+function setGitIdentity(target, input) {
+  const args = target === "global"
+    ? ["config", "--global"]
+    : ["config"];
+
+  runOrThrow("git", [...args, "user.name", input.name], {
+    cwd: input.cwd || rootDir,
+  });
+  runOrThrow("git", [...args, "user.email", input.email], {
+    cwd: input.cwd || rootDir,
+  });
+}
+
+async function syncGitIdentityForGitHubAccount(account, options = {}) {
+  if (!account) {
+    throw new Error("Nenhuma conta GitHub foi informada para sincronizar a identidade.");
+  }
+
+  const profile = await fetchGitHubUserProfile(account);
+  const gitName = profile.login || account;
+  const gitEmail = buildGitHubNoreplyEmail(profile);
+
+  setGitIdentity("global", {
+    name: gitName,
+    email: gitEmail,
+  });
+
+  if (isGitRepository(rootDir)) {
+    setGitIdentity("local", {
+      cwd: rootDir,
+      name: gitName,
+      email: gitEmail,
+    });
+  }
+
+  if (isGitRepository(siteDir)) {
+    setGitIdentity("local", {
+      cwd: siteDir,
+      name: gitName,
+      email: gitEmail,
+    });
+  }
+
+  if (options.showStatus !== false) {
+    console.log(`Identidade Git sincronizada: ${gitName} <${gitEmail}>`);
+  }
+
+  return {
+    profile,
+    gitName,
+    gitEmail,
+  };
+}
+
 function ensureGitHubLogin(options = {}) {
   const provider = resolveAuthProvider();
   if (!provider) {
@@ -236,4 +357,5 @@ module.exports = {
   listGitHubAccounts,
   logoutAndPromptGitHubLogin,
   resolveAuthProvider,
+  syncGitIdentityForGitHubAccount,
 };

@@ -2,7 +2,10 @@ const { spawnSync } = require("node:child_process");
 const readline = require("node:readline");
 const path = require("node:path");
 const fs = require("node:fs");
-const { ensureGitHubLogin } = require("./github-auth");
+const {
+  ensureGitHubLogin,
+  syncGitIdentityForGitHubAccount,
+} = require("./github-auth");
 
 const rootDir = path.resolve(__dirname, "..");
 const DEFAULT_SITE_GITHUB_REMOTE =
@@ -290,6 +293,9 @@ async function main() {
 
   const authSession = ensureGitHubLogin({ showStatus: true });
   const primaryGitHubAccount = authSession.accounts[0] || null;
+  await syncGitIdentityForGitHubAccount(primaryGitHubAccount, {
+    showStatus: true,
+  });
 
   const rl = readline.createInterface({
     input: process.stdin,

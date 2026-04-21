@@ -1,13 +1,17 @@
-const { ensureGitHubLogin } = require("./github-auth");
+const {
+  ensureGitHubLogin,
+  syncGitIdentityForGitHubAccount,
+} = require("./github-auth");
 
-function main() {
+async function main() {
   console.log("\n=== Flowdesk GitHub Login ===\n");
-  ensureGitHubLogin({ showStatus: true });
+  const authSession = ensureGitHubLogin({ showStatus: true });
+  await syncGitIdentityForGitHubAccount(authSession.accounts[0], {
+    showStatus: true,
+  });
 }
 
-try {
-  main();
-} catch (error) {
+main().catch((error) => {
   console.error(`\nErro ao entrar no GitHub: ${error.message}`);
   process.exit(1);
-}
+});
