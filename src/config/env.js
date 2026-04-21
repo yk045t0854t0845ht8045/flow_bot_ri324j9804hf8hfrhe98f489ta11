@@ -116,12 +116,13 @@ const env = {
   discordToken: requireAnyEnv("DISCORD_TOKEN", "DISCORD_BOT_TOKEN"),
   discordClientId: requireEnv("DISCORD_CLIENT_ID"),
   discordGuildId: process.env.DISCORD_GUILD_ID || null,
-  officialSupportGuildId:
-    process.env.OFFICIAL_SUPPORT_GUILD_ID || "1353259338759671838",
-  officialLinkChannelId:
-    process.env.OFFICIAL_LINK_CHANNEL_ID || "1358209486363295885",
-  officialLinkedRoleId:
-    process.env.OFFICIAL_LINKED_ROLE_ID || "1358203612672692495",
+  officialSupportGuildId: optionalEnv("OFFICIAL_SUPPORT_GUILD_ID"),
+  officialLinkChannelId: optionalEnv("OFFICIAL_LINK_CHANNEL_ID"),
+  officialLinkedRoleId: optionalEnv("OFFICIAL_LINKED_ROLE_ID"),
+  officialViolationRoleLevel1Id: optionalEnv("OFFICIAL_VIOLATION_ROLE_LEVEL_1_ID"),
+  officialViolationRoleLevel2Id: optionalEnv("OFFICIAL_VIOLATION_ROLE_LEVEL_2_ID"),
+  officialViolationRoleLevel3Id: optionalEnv("OFFICIAL_VIOLATION_ROLE_LEVEL_3_ID"),
+  officialViolationRoleLevel4Id: optionalEnv("OFFICIAL_VIOLATION_ROLE_LEVEL_4_ID"),
   officialAccountLinkUrl:
     process.env.OFFICIAL_ACCOUNT_LINK_URL ||
     `${DEFAULT_PUBLIC_APP_URL}/discord/link/start`,
@@ -224,14 +225,13 @@ const env = {
     process.env.REALTIME_BROADCAST_SUBSCRIBE_TIMEOUT_MS,
     8_000,
   ),
-  aiMentionLogChannelId:
-    optionalEnv("AI_MENTION_LOG_CHANNEL_ID") || "1490014859344085242",
+  aiMentionLogChannelId: optionalEnv("AI_MENTION_LOG_CHANNEL_ID"),
   botHealthHost: optionalEnv("BOT_HEALTH_HOST") || process.env.HOST || "0.0.0.0",
   botHealthPort: parseNumber(process.env.PORT, parseNumber(process.env.BOT_HEALTH_PORT, 3210)),
+  statusCriticalWebhookUrl: optionalEnv("STATUS_CRITICAL_WEBHOOK_URL"),
   botHealthToken: optionalEnv("BOT_HEALTH_TOKEN"),
   autoJoinVoiceChannelIds: parseListEnv(
-    process.env.DISCORD_AUTO_JOIN_VOICE_CHANNEL_IDS ||
-      "1491968642492010548,1486467867380682852",
+    process.env.DISCORD_AUTO_JOIN_VOICE_CHANNEL_IDS,
   ),
 };
 

@@ -1533,7 +1533,7 @@ function buildAiLogPayload({ message, prompt, response, source, model, handlingM
 
 async function sendAiInteractionLog(client, message, payload) {
   try {
-    if (!client?.channels?.fetch) return;
+    if (!client?.channels?.fetch || !env.aiMentionLogChannelId) return;
 
     const logChannel = await client.channels
       .fetch(env.aiMentionLogChannelId)

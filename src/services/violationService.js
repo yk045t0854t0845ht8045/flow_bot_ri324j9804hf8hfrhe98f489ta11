@@ -1,17 +1,16 @@
 const { createClient } = require("@supabase/supabase-js");
 const { env } = require("../config/env");
 
-const OFFICIAL_GUILD_ID = "1353259338759671838";
 const VIOLATION_CACHE_TTL_MS = 15 * 1000;
 
 const VIOLATION_ROLE_IDS = {
-  1: "1493281297039097958",
-  2: "1493281298352181350",
-  3: "1493281190566957187",
-  4: "1493281297945334022",
+  1: env.officialViolationRoleLevel1Id,
+  2: env.officialViolationRoleLevel2Id,
+  3: env.officialViolationRoleLevel3Id,
+  4: env.officialViolationRoleLevel4Id,
 };
 
-const ALL_VIOLATION_ROLE_IDS = Object.values(VIOLATION_ROLE_IDS);
+const ALL_VIOLATION_ROLE_IDS = Object.values(VIOLATION_ROLE_IDS).filter(Boolean);
 
 const violationLevelCache = new Map();
 
@@ -97,7 +96,11 @@ async function getOfficialGuild(client, providedGuild = null) {
     return providedGuild;
   }
 
-  return await client.guilds.fetch(OFFICIAL_GUILD_ID).catch(() => null);
+  if (!env.officialSupportGuildId) {
+    return null;
+  }
+
+  return await client.guilds.fetch(env.officialSupportGuildId).catch(() => null);
 }
 
 async function loadViolationLevelMapByDiscordUserIds(discordUserIds) {
@@ -264,6 +267,9 @@ async function applyViolationRolesForMember(member, level, options = {}) {
 
   if (level >= 4) {
     const suspensionRoleId = VIOLATION_ROLE_IDS[4];
+    if (!suspensionRoleId) {
+      return level;
+    }
     const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
     const botHighestPosition = me?.roles?.highest?.position || 0;
 
@@ -313,7 +319,7 @@ async function applyViolationRolesForMember(member, level, options = {}) {
 
   if (level > 0) {
     const newRoleId = VIOLATION_ROLE_IDS[level];
-    if (!member.roles.cache.has(newRoleId)) {
+    if (newRoleId && !member.roles.cache.has(newRoleId)) {
       await member.roles.add(
         newRoleId,
         `Flowdesk - Nivel de violacao: ${level}`,

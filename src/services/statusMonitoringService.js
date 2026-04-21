@@ -531,9 +531,13 @@ async function reconcileOpenIncidents() {
 }
 
 async function sendCriticalWebhook(systemName, errorDetails, options = {}) {
-  const WEBHOOK_URL =
-    "https://ptb.discord.com/api/webhooks/1494175603396579378/GwwNok_2Wh0AFsZJf4W6kn-Egwnr_oWiVzoIzabCtuV2wt3R-r7HpzZQb56r541Gmvsh";
+  const WEBHOOK_URL = env.statusCriticalWebhookUrl;
   const { bypassCooldown = false } = options;
+
+  if (!WEBHOOK_URL) {
+    return false;
+  }
+
   const now = Date.now();
   const lastSent = webhookCooldowns[systemName] || 0;
 

@@ -146,6 +146,20 @@ async function fetchExistingPanelMessage(channel) {
 }
 
 async function ensureOfficialLinkPanel(client) {
+  if (
+    !env.officialSupportGuildId ||
+    !env.officialLinkChannelId ||
+    !env.officialLinkedRoleId
+  ) {
+    console.warn(
+      "[official-link-panel] ignorado: OFFICIAL_SUPPORT_GUILD_ID, OFFICIAL_LINK_CHANNEL_ID ou OFFICIAL_LINKED_ROLE_ID nao configurados.",
+    );
+    return {
+      mode: "skipped",
+      messageId: "not-configured",
+    };
+  }
+
   const channel = await client.channels.fetch(env.officialLinkChannelId);
 
   if (!channel || !channel.isTextBased()) {
