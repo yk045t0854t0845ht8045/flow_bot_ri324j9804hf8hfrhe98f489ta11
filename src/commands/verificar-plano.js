@@ -31,7 +31,11 @@ function normalizeDashboardUrl() {
 
     if (url.hostname === "localhost" || url.hostname.endsWith(".localhost")) {
       url.hostname = "fdesk.localhost";
-    } else if (url.hostname === "flwdesk.com" || url.hostname === "www.flwdesk.com") {
+    } else if (
+      url.hostname === "flwdesk.com" ||
+      url.hostname === "www.flwdesk.com" ||
+      url.hostname.endsWith(".flwdesk.com")
+    ) {
       url.hostname = "fdesk.flwdesk.com";
     }
 
