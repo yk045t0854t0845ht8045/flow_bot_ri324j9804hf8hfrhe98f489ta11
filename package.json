@@ -8,6 +8,8 @@
     "bot": "powershell -ExecutionPolicy Bypass -File ./scripts/bot-publish.ps1",
     "dev": "node --watch src/main.js",
     "deploy:commands": "node src/deploy-commands.js",
+    "login": "node scripts/login.js",
+    "logout": "node scripts/logout.js",
     "site:dev": "npm --prefix site run dev",
     "site:build": "npm --prefix site run build",
     "now": "node scripts/now.js",

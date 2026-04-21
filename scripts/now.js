@@ -2,6 +2,7 @@ const { spawnSync } = require("node:child_process");
 const readline = require("node:readline");
 const path = require("node:path");
 const fs = require("node:fs");
+const { ensureGitHubLogin } = require("./github-auth");
 
 const rootDir = path.resolve(__dirname, "..");
 const DEFAULT_SITE_GITHUB_REMOTE =
@@ -9,47 +10,102 @@ const DEFAULT_SITE_GITHUB_REMOTE =
 const DEFAULT_BOT_GITHUB_REMOTE =
   "https://github.com/Flowdesk-Brasil/flow_bot_ri324j9804hf8hfrhe98f489ta11.git";
 
-/**
- * Executa um comando e joga o output no terminal atual.
- */
-function run(command, args, cwd = rootDir) {
+function execute(command, args, cwd = rootDir, options = {}) {
   const relPath = path.relative(rootDir, cwd) || ".";
   const printable = `${command} ${args.join(" ")}`;
-  console.log(`\n[${relPath}] > ${printable}`);
 
-  const result = spawnSync(command, args, {
-    cwd,
-    stdio: "inherit",
-    shell: true,
-  });
-
-  if (result.status !== 0) {
-    throw new Error(`Falha ao executar em ${relPath}: ${printable}`);
+  if (options.printCommand !== false) {
+    console.log(`\n[${relPath}] > ${printable}`);
   }
-}
 
-/**
- * Executa um comando e captura o output sem falhar o script.
- */
-function capture(command, args, cwd = rootDir) {
   const result = spawnSync(command, args, {
     cwd,
     stdio: "pipe",
     encoding: "utf8",
-    shell: true,
+  });
+
+  const stdout = result.stdout || "";
+  const stderr = result.stderr || "";
+
+  if (options.printOutput !== false) {
+    if (stdout) process.stdout.write(stdout);
+    if (stderr) process.stderr.write(stderr);
+  }
+
+  return {
+    status: typeof result.status === "number" ? result.status : 1,
+    stdout,
+    stderr,
+    printable,
+    relPath,
+  };
+}
+
+function run(command, args, cwd = rootDir, options = {}) {
+  const result = execute(command, args, cwd, options);
+  if (result.status === 0) {
+    return result;
+  }
+
+  const details = `${result.stdout}${result.stderr}`.trim();
+  throw new Error(
+    `Falha ao executar em ${result.relPath}: ${result.printable}${details ? `\n${details}` : ""}`,
+  );
+}
+
+function capture(command, args, cwd = rootDir) {
+  const result = execute(command, args, cwd, {
+    printCommand: false,
+    printOutput: false,
   });
   return (result.stdout || "").trim();
 }
 
-/**
- * Pergunta ao usuário uma mensagem de commit.
- */
 async function askCommitMessage(repoName, rl) {
   return new Promise((resolve) => {
-    rl.question(`\n📦 Mudanças detectadas em [${repoName}].\n> O que você alterou? (Mensagem de commit): `, (answer) => {
-      resolve(answer.trim());
-    });
+    rl.question(
+      `\nMudancas detectadas em [${repoName}].\n> O que voce alterou? (Mensagem de commit): `,
+      (answer) => {
+        resolve(answer.trim());
+      },
+    );
   });
+}
+
+function sanitizeBranchSegment(value) {
+  return (value || "sync")
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || "sync";
+}
+
+function buildProtectedPublishBranch(repoName, githubAccount) {
+  const repoSegment = sanitizeBranchSegment(repoName);
+  const accountSegment = sanitizeBranchSegment(githubAccount || "github");
+  return `pr/${accountSegment}/${repoSegment}`;
+}
+
+function normalizeGitHubRepoWebUrl(remoteUrl) {
+  if (!remoteUrl) return null;
+
+  const normalized = remoteUrl.trim().replace(/\.git$/i, "");
+  if (normalized.startsWith("https://github.com/")) {
+    return normalized;
+  }
+
+  const sshMatch = normalized.match(/^git@github\.com:(.+)$/i);
+  if (sshMatch) {
+    return `https://github.com/${sshMatch[1]}`;
+  }
+
+  return null;
+}
+
+function buildPullRequestCompareUrl(remoteUrl, baseBranch, publishBranch) {
+  const repoWebUrl = normalizeGitHubRepoWebUrl(remoteUrl);
+  if (!repoWebUrl) return null;
+  return `${repoWebUrl}/compare/${encodeURIComponent(baseBranch)}...${encodeURIComponent(publishBranch)}?expand=1`;
 }
 
 function ensureRemoteOrigin(targetDir, repoName, remoteUrl) {
@@ -68,18 +124,15 @@ function ensureRemoteOrigin(targetDir, repoName, remoteUrl) {
     .filter(Boolean);
 
   if (remoteList.includes("origin")) {
-    console.log(`\n🔁 Atualizando remote [${repoName}] para o repositorio novo...`);
+    console.log(`\nAtualizando remote [${repoName}] para o repositorio novo...`);
     run("git", ["remote", "set-url", "origin", remoteUrl], targetDir);
     return;
   }
 
-  console.log(`\n🔗 Configurando remote [${repoName}]...`);
+  console.log(`\nConfigurando remote [${repoName}]...`);
   run("git", ["remote", "add", "origin", remoteUrl], targetDir);
 }
 
-/**
- * Verifica se o repositório está em meio a um merge ou rebase (conflito).
- */
 function isResolvingConflict(targetDir) {
   const gitDir = path.join(targetDir, ".git");
   return (
@@ -90,38 +143,91 @@ function isResolvingConflict(targetDir) {
   );
 }
 
-/**
- * Lógica principal de sincronização de um repositório git.
- */
+function isProtectedBranchPushFailure(result) {
+  const combined = `${result.stdout}\n${result.stderr}`.toLowerCase();
+  return (
+    combined.includes("gh013") ||
+    combined.includes("cannot update this protected ref") ||
+    combined.includes("changes must be made through a pull request")
+  );
+}
+
+function pushWithProtectedBranchFallback(input) {
+  const directPush = execute(
+    "git",
+    ["push", "origin", input.baseBranch],
+    input.targetDir,
+  );
+
+  if (directPush.status === 0) {
+    console.log(`\n[${input.repoName}] sincronizado e salvo com sucesso.`);
+    return;
+  }
+
+  if (!isProtectedBranchPushFailure(directPush)) {
+    throw new Error(
+      `Falha ao executar em ${path.relative(rootDir, input.targetDir) || "."}: git push origin ${input.baseBranch}`,
+    );
+  }
+
+  const publishBranch = buildProtectedPublishBranch(
+    input.repoName,
+    input.githubAccount,
+  );
+
+  console.log(`\n[${input.repoName}] usa branch protegida em '${input.baseBranch}'.`);
+  console.log(`Enviando automaticamente para a branch de PR '${publishBranch}'...`);
+
+  const branchPush = execute(
+    "git",
+    ["push", "origin", `HEAD:refs/heads/${publishBranch}`],
+    input.targetDir,
+  );
+
+  if (branchPush.status !== 0) {
+    throw new Error(
+      `Falha ao executar em ${path.relative(rootDir, input.targetDir) || "."}: git push -u origin HEAD:refs/heads/${publishBranch}`,
+    );
+  }
+
+  const compareUrl = buildPullRequestCompareUrl(
+    input.remoteUrl,
+    input.baseBranch,
+    publishBranch,
+  );
+
+  console.log(`\n[${input.repoName}] enviado para a branch de PR com sucesso.`);
+  if (compareUrl) {
+    console.log("Abra este link para criar o pull request:");
+    console.log(compareUrl);
+  }
+}
+
 async function syncRepo(targetDir, repoName, rl, options = {}) {
   if (!fs.existsSync(path.join(targetDir, ".git"))) {
-    console.log(`\nℹ️  Pulando [${repoName}]: não é um repositório Git.`);
+    console.log(`\nPulando [${repoName}]: nao e um repositorio Git.`);
     return;
   }
 
   const relPath = path.relative(rootDir, targetDir) || ".";
   ensureRemoteOrigin(targetDir, repoName, options.remoteUrl || null);
 
-  // 0. Verificar se já existe um conflito pendente
   if (isResolvingConflict(targetDir)) {
-    console.log(`\n⚠️  [${repoName}] já está com um conflito pendente!`);
-    console.log(`   Por favor, resolva os conflitos no VS Code, dê um 'git add .' e depois:`);
-    console.log(`   - 'git rebase --continue' ou 'git commit'`);
+    console.log(`\n[${repoName}] ja esta com um conflito pendente.`);
+    console.log("Resolva os conflitos, rode 'git add .' e finalize o rebase ou commit.");
     throw new Error(`Conflito pendente em ${repoName}`);
   }
 
-  // 1. Pre-flight Check: Fetch remote
-  console.log(`\n📡 Verificando atualizações no GitHub para [${repoName}]...`);
+  console.log(`\nVerificando atualizacoes no GitHub para [${repoName}]...`);
   try {
     run("git", ["fetch", "origin"], targetDir);
-  } catch (err) {
-    console.warn(`\n⚠️  Aviso: Não foi possível conectar ao GitHub para [${repoName}]. Tentando continuar...`);
+  } catch {
+    console.warn(`\nAviso: nao foi possivel conectar ao GitHub para [${repoName}]. Tentando continuar...`);
   }
 
   const branch = capture("git", ["rev-parse", "--abbrev-ref", "HEAD"], targetDir) || "main";
 
-  // 2. Verificar mudanças locais
-  console.log(`\n🔍 Verificando mudanças locais em [${repoName}]...`);
+  console.log(`\nVerificando mudancas locais em [${repoName}]...`);
   const status = capture("git", ["status", "--porcelain"], targetDir);
   const hasChanges = status.length > 0;
 
@@ -131,64 +237,59 @@ async function syncRepo(targetDir, repoName, rl, options = {}) {
 
     try {
       run("git", ["add", "."], targetDir);
-      run("git", ["commit", "-m", `"${finalMessage}"`], targetDir);
+      run("git", ["commit", "-m", finalMessage], targetDir);
     } catch (error) {
-      console.error(`\n❌ Erro ao salvar mudanças em [${repoName}].`);
+      console.error(`\nErro ao salvar mudancas em [${repoName}].`);
       throw error;
     }
   } else {
-    console.log(`\n✅ Nenhuma mudança local em [${repoName}].`);
+    console.log(`\nNenhuma mudanca local em [${repoName}].`);
   }
 
-  // 3. Puxar atualizações (REBASE SEGURO)
-  console.log(`\n📡 Sincronizando com o GitHub [${repoName}]...`);
-  try {
-    // Usamos pull --rebase para manter o histórico limpo.
-    // Mas envolvemos em um try/catch para fazer o abort automático se falhar.
-    const pullResult = spawnSync("git", ["pull", "--rebase", "origin", branch], {
-      cwd: targetDir,
-      stdio: "inherit",
-      shell: true,
+  console.log(`\nSincronizando com o GitHub [${repoName}]...`);
+  const pullResult = execute(
+    "git",
+    ["pull", "--rebase", "origin", branch],
+    targetDir,
+  );
+
+  if (pullResult.status !== 0) {
+    console.warn(`\nConflito detectado ao sincronizar [${repoName}].`);
+    console.log("Revertendo para o estado seguro anterior (git rebase --abort)...");
+    execute("git", ["rebase", "--abort"], targetDir, {
+      printCommand: false,
     });
 
-    if (pullResult.status !== 0) {
-      console.warn(`\n⚠️  CONFLITO DETECTADO ao sincronizar [${repoName}]!`);
-      console.log(`   Revertendo para o estado seguro anterior (git rebase --abort)...`);
-      
-      spawnSync("git", ["rebase", "--abort"], { cwd: targetDir });
-      
-      console.log(`\n❌ A sincronização de [${repoName}] foi cancelada.`);
-      console.log(`   MOTIVO: Alguém alterou o mesmo arquivo que você no GitHub.`);
-      console.log(`   COMO RESOLVER:`);
-      console.log(`   1. Vá na pasta '${relPath}'`);
-      console.log(`   2. Digite: git pull --rebase origin ${branch}`);
-      console.log(`   3. Resolva os conflitos que o Git marcar nos arquivos.`);
-      console.log(`   4. Digite: git add .`);
-      console.log(`   5. Digite: git rebase --continue`);
-      console.log(`   6. Rode o 'npm run now' de novo.`);
-      
-      throw new Error(`Conflito de sincronização em ${repoName}`);
-    }
-  } catch (error) {
-    throw error;
+    console.log(`\nA sincronizacao de [${repoName}] foi cancelada.`);
+    console.log("Motivo: alguem alterou o mesmo arquivo no GitHub.");
+    console.log("Como resolver:");
+    console.log(`1. Va na pasta '${relPath}'`);
+    console.log(`2. Rode: git pull --rebase origin ${branch}`);
+    console.log("3. Resolva os conflitos que o Git marcar.");
+    console.log("4. Rode: git add .");
+    console.log("5. Rode: git rebase --continue");
+    console.log("6. Rode o 'npm run now' de novo.");
+
+    throw new Error(`Conflito de sincronizacao em ${repoName}`);
   }
 
-  // 4. Subir para o servidor
-  console.log(`\n⬆️  Subindo [${repoName}] para o GitHub...`);
-  try {
-    run("git", ["push", "origin", branch], targetDir);
-    console.log(`\n✨ [${repoName}] sincronizado e salvo com sucesso!`);
-  } catch (error) {
-    console.error(`\n❌ Erro ao enviar código de [${repoName}] para o servidor.`);
-    console.log(`   Isso pode ser falta de internet ou permissão.`);
-    throw error;
-  }
+  console.log(`\nSubindo [${repoName}] para o GitHub...`);
+  pushWithProtectedBranchFallback({
+    targetDir,
+    repoName,
+    baseBranch: branch,
+    remoteUrl: options.remoteUrl || null,
+    githubAccount: options.githubAccount || null,
+  });
 }
 
 async function main() {
-  console.log("\n🚀 ==================================================");
-  console.log("🚀 BULLTEPROOF SYNC (npm run now)");
-  console.log("🚀 ==================================================\n");
+  console.log("\n==================================================");
+  console.log("BULLTEPROOF SYNC (npm run now)");
+  console.log("==================================================\n");
+
+  const authSession = ensureGitHubLogin({ showStatus: true });
+  const primaryGitHubAccount = authSession.accounts[0] || null;
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -200,28 +301,30 @@ async function main() {
     if (fs.existsSync(siteDir)) {
       await syncRepo(siteDir, "SITE / DASHBOARD", rl, {
         remoteUrl: process.env.SITE_GITHUB_REMOTE || DEFAULT_SITE_GITHUB_REMOTE,
+        githubAccount: primaryGitHubAccount,
       });
     }
 
     await syncRepo(rootDir, "BOT / CORE", rl, {
       remoteUrl: process.env.BOT_GITHUB_REMOTE || DEFAULT_BOT_GITHUB_REMOTE,
+      githubAccount: primaryGitHubAccount,
     });
 
-    console.log("\n🎉 ==================================================");
-    console.log("🎉 SUCESSO! Todo o seu código está no GitHub.");
-    console.log("🎉 ==================================================\n");
+    console.log("\n==================================================");
+    console.log("SUCESSO! Todo o seu codigo foi sincronizado.");
+    console.log("==================================================\n");
   } catch (error) {
-    if (!error.message.includes("Conflito de sincronização")) {
-      console.error(`\n💥 ERRO CRÍTICO: ${error.message}`);
+    if (!String(error.message || "").includes("Conflito de sincronizacao")) {
+      console.error(`\nERRO CRITICO: ${error.message}`);
     }
-    console.log("\n⚠️ A sincronização foi interrompida com segurança.");
+    console.log("\nA sincronizacao foi interrompida com seguranca.");
     process.exit(1);
   } finally {
     rl.close();
   }
 }
 
-main().catch((err) => {
-  console.error(`\n💥 Erro inesperado: ${err.message}`);
+main().catch((error) => {
+  console.error(`\nErro inesperado: ${error.message}`);
   process.exit(1);
 });

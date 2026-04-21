@@ -36,6 +36,10 @@ npm start
 - `/ticket-painel` publica o painel de abertura.
 - `/assumir` marca staff responsavel no ticket atual.
 - `/fechar` fecha ticket, gera transcript HTML e envia no log.
+- `npm run login` verifica o login GitHub atual e abre o launcher se necessario.
+- `npm run logout` remove o login GitHub atual e abre o launcher para entrar de novo.
+- `npm run now` agora usa o login local do GitHub e nunca depende de credencial fixa no codigo.
+- Se a branch `main` do repo estiver protegida, `npm run now` envia automaticamente para uma branch de PR e mostra o link para abrir o pull request.
 
 ## 4) Permissoes recomendadas para o bot
 
