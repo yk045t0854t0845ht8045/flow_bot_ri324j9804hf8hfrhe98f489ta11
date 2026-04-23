@@ -1398,6 +1398,20 @@ async function getUserPlanSnapshotByDiscordUserId(discordUserId) {
   };
 }
 
+async function getAuthUserContactByDiscordUserId(discordUserId) {
+  const normalizedDiscordUserId =
+    typeof discordUserId === "string" ? discordUserId.trim() : "";
+  if (!normalizedDiscordUserId) return null;
+
+  const result = await supabase
+    .from("auth_users")
+    .select("id, discord_user_id, email, display_name, username")
+    .eq("discord_user_id", normalizedDiscordUserId)
+    .maybeSingle();
+
+  return unwrap(result, "getAuthUserContactByDiscordUserId") || null;
+}
+
 async function getApprovedPaymentOrdersForGuildIds(guildIds) {
   const uniqueGuildIds = [...new Set((guildIds || []).filter(Boolean))];
   if (!uniqueGuildIds.length) {
@@ -1670,6 +1684,7 @@ module.exports = {
   getAllOpenTickets,
   getTicketTranscriptByProtocol,
   getGuildWelcomeSettings,
+  getAuthUserContactByDiscordUserId,
   claimTicket,
   closeTicket,
   getPendingGuildAutoRoleSyncSettings,

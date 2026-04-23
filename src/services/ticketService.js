@@ -65,6 +65,9 @@ const {
   generateAiSuggestion,
   sendTicketAiInteractionLog,
 } = require("./ticketAiService");
+const {
+  sendSupportTicketOpenedEmail,
+} = require("./emailNotificationService");
 
 const pendingTicketReasons = new Map();
 
@@ -935,6 +938,14 @@ async function openTicketFromInteraction(interaction, openedReason = "", aiSugge
         userId: user.id,
       });
     }
+
+    void sendSupportTicketOpenedEmail({
+      discordUserId: user.id,
+      protocol: ticket.protocol,
+      guildName: guild.name,
+      channelUrl: `https://discord.com/channels/${guild.id}/${channel.id}`,
+      reason: normalizedOpenedReason,
+    });
 
     try {
       const introMessage = await channel.send(buildTicketIntroPayload({ ticket }));
