@@ -1577,7 +1577,7 @@ async function loadConfiguredTicketGuildRuntimes() {
     supabase
       .from(TICKET_SETTINGS_TABLE)
       .select(
-        "guild_id, enabled, menu_channel_id, tickets_category_id, logs_created_channel_id, logs_closed_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, ai_rules, updated_at",
+        "guild_id, enabled, menu_channel_id, tickets_category_id, logs_created_channel_id, logs_closed_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, ai_rules, ai_enabled, ai_company_name, ai_company_bio, ai_tone, updated_at",
       ),
     supabase
       .from(TICKET_STAFF_SETTINGS_TABLE)

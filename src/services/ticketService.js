@@ -60,6 +60,7 @@ const {
   processDirectMessageQueue,
 } = require("./directMessageQueueService");
 const {
+  isTicketAiEnabledForRuntime,
   markTicketAiHandoff,
   sendInitialTicketAiMessage,
   generateAiSuggestion,
@@ -1069,15 +1070,19 @@ async function openTicketFromModalSubmit(interaction) {
       accentColor: env.accentColor,
     };
 
-    // Use AI suggestion if OpenAI is configured
-    // Trigger even if ai_rules is empty (General Triage Mode)
-    if (env.openaiApiKey) {
+    if (!runtime.licenseUsable || runtime.settings.enabled !== true) {
+      await interaction.editReply(buildTicketDisabledInteractionPayload(guildRuntime));
+      return;
+    }
+
+    if (isTicketAiEnabledForRuntime(guildRuntime)) {
       try {
         const suggestion = await generateAiSuggestion(
           openedReason,
-          guildRuntime.settings, // Full settings for dynamic triage identity
+          guildRuntime.settings,
           interaction.user.id,
           {
+            guildId: interaction.guild.id,
             guildName: interaction.guild.name,
             userName: interaction.user.displayName || interaction.user.username,
           },
@@ -1187,6 +1192,14 @@ async function handleAiSuggestionContinue(interaction) {
     return;
   }
 
+  const runtime = interaction.inGuild()
+    ? await getGuildTicketRuntime(interaction.guild.id).catch(() => null)
+    : null;
+  const shouldReuseAiSuggestion = isTicketAiEnabledForRuntime(runtime);
+  const suggestionForTicket = shouldReuseAiSuggestion
+    ? restoredSession.suggestion
+    : null;
+
   await sendTicketAiInteractionLog(interaction.client, {
     ticket: { guild_id: interaction.guild.id, protocol: "N/A (Pre-ticket)" },
     userId: interaction.user.id,
@@ -1198,12 +1211,14 @@ async function handleAiSuggestionContinue(interaction) {
 
   await replaceAiSuggestionReply(interaction, {
     title: "Abrindo ticket",
-    message: "Estou usando essa triagem para abrir seu atendimento agora.",
+    message: shouldReuseAiSuggestion
+      ? "Estou usando essa triagem para abrir seu atendimento agora."
+      : "O FlowAI esta desligado neste servidor agora, entao vou abrir seu atendimento direto.",
     hint: "Se algo impedir a abertura, eu aviso logo abaixo.",
     tone: "neutral",
   }).catch(() => null);
 
-  await openTicketFromInteraction(interaction, restoredSession.reason, restoredSession.suggestion);
+  await openTicketFromInteraction(interaction, restoredSession.reason, suggestionForTicket);
   return;
 
   const pendingKey = buildPendingReasonKey(interaction.guild.id, interaction.user.id);

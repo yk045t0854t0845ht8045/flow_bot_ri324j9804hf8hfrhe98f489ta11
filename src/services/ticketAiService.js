@@ -100,24 +100,29 @@ function buildDynamicSystemPrompt(runtime) {
   const name = settings?.ai_company_name || "Assistente AI";
   const bio = settings?.ai_company_bio || "Assistente oficial do servidor do Discord.";
   const rules = settings?.ai_rules || "";
-  const tone = settings?.ai_tone || "professional";
+  const tone = resolveTicketAiTone(settings);
 
   const toneInstruction = tone === "friendly"
     ? "Use um tom humano, leve, carismatico e amigavel, como um bot de comunidade proximo."
     : "Use um tom profissional, sobrio, polido e seguro, focado em eficiencia e seguranca.";
 
   const identity = [
-    `Voce e o ${name}, ${bio}.`,
+    `Voce e o ${name}.`,
+    `Contexto da empresa e operacao: ${bio}.`,
     toneInstruction,
+    "O modulo FlowAI deste servidor esta ativo para conduzir a triagem e a resposta dentro do ticket.",
+    "Priorize resolver no primeiro retorno com diagnostico objetivo, verificacoes praticas e proximo passo claro.",
+    "Quando o problema for de configuracao do Flowdesk ou do Discord, use o contexto salvo do servidor antes de responder.",
+    "Se faltar uma informacao critica, faca no maximo uma pergunta complementar e ela deve ser especifica.",
   ];
 
   if (rules) {
-    identity.push(`\nRegras e diretrizes especificas da empresa para seguir:\n${rules}`);
+    identity.push(`Regras e diretrizes especificas da empresa para seguir:\n${rules}`);
   }
 
   return [
     identity.join("\n"),
-    "\nInstrucoes de comportamento funcional:",
+    "Instrucoes de comportamento funcional:",
     TICKET_AI_CORE_BEHAVIOR
   ].join("\n");
 }
@@ -166,8 +171,145 @@ function inlineMemoryText(value, maxLength = 220) {
   return normalizeText(value, maxLength).replace(/\n+/g, " / ");
 }
 
-function isOfficialTicketGuild(guildId) {
-  return guildId === env.officialSupportGuildId;
+function resolveTicketAiTone(settings) {
+  return settings?.ai_tone === "friendly" ? "friendly" : "formal";
+}
+
+function isTicketAiEnabledForRuntime(runtime) {
+  return Boolean(
+    runtime?.settings &&
+      runtime.settings.enabled === true &&
+      runtime.settings.ai_enabled === true &&
+      runtime.licenseUsable !== false,
+  );
+}
+
+function hasTicketAiModelTransport() {
+  return Boolean(
+    env.flowAiApiUrl &&
+      (env.flowAiApiToken ||
+        env.flowAiSigningSecret ||
+        process.env.NODE_ENV !== "production"),
+  );
+}
+
+function detectTicketSupportTopic(input) {
+  const normalized = normalizeIntentText(input);
+  if (!normalized) return "general";
+
+  if (
+    includesAny(normalized, [
+      "reembolso",
+      "estorno",
+      "chargeback",
+      "cobranca",
+      "pagamento",
+      "licenca",
+      "assinatura",
+      "fatura",
+      "pix",
+      "cartao",
+      "renovacao",
+    ])
+  ) {
+    return "billing";
+  }
+
+  if (
+    includesAny(normalized, [
+      "quero comprar",
+      "tenho interesse",
+      "quero adquirir",
+      "quero contratar",
+      "upgrade",
+      "downgrade",
+      "plano",
+    ])
+  ) {
+    return "sales";
+  }
+
+  if (includesAny(normalized, ["parceir", "partnership"])) {
+    return "partnership";
+  }
+
+  if (includesAny(normalized, ["transcript", "transcri", "historico do ticket"])) {
+    return "transcript";
+  }
+
+  if (
+    includesAny(normalized, [
+      "flowai",
+      "triagem",
+      "sugestao",
+      "ia",
+      "inteligencia artificial",
+    ])
+  ) {
+    return "flowai";
+  }
+
+  if (
+    includesAny(normalized, [
+      "embed",
+      "painel",
+      "botao",
+      "ticket",
+      "categoria",
+      "staff",
+      "claim",
+      "fechar ticket",
+      "abrir ticket",
+    ])
+  ) {
+    return "ticket_config";
+  }
+
+  if (
+    includesAny(normalized, [
+      "cargo",
+      "cargos",
+      "role",
+      "roles",
+      "permiss",
+      "admin",
+      "notificar",
+    ])
+  ) {
+    return "roles";
+  }
+
+  if (
+    includesAny(normalized, [
+      "site",
+      "dashboard",
+      "painel web",
+      "login",
+      "conta",
+      "api",
+      "acesso",
+    ])
+  ) {
+    return "platform";
+  }
+
+  if (
+    includesAny(normalized, [
+      "erro",
+      "bug",
+      "falha",
+      "nao funciona",
+      "travou",
+      "carrega",
+      "salva",
+      "salvar",
+      "quebrou",
+    ])
+  ) {
+    return "bug";
+  }
+
+  return "general";
 }
 
 function includesAny(text, hints) {
@@ -204,20 +346,36 @@ function buildTicketToneGuidance(ticket, historyRows) {
           .map((row) => row.content || "")
       : []),
   ].join(" "));
+  const topic = detectTicketSupportTopic(sourceText);
+  const guidance = [];
 
   if (includesAny(sourceText, SENSITIVE_TICKET_HINTS)) {
-    return [
+    guidance.push([
       "Assunto sensivel detectado no ticket.",
       "Use tom mais profissional, sobrio e cuidadoso.",
       "Evite excesso de entusiasmo e foque em seguranca, clareza e direcionamento.",
-    ].join(" ");
+    ].join(" "));
+  } else {
+    guidance.push([
+      "Assunto geral de suporte detectado.",
+      "Pode soar mais humano, proximo e acolhedor, com leve carisma de comunidade.",
+      "Ainda assim, mantenha resposta curta, clara e util.",
+    ].join(" "));
   }
 
-  return [
-    "Assunto geral de suporte detectado.",
-    "Pode soar mais humano, proximo e acolhedor, com leve carisma de comunidade.",
-    "Ainda assim, mantenha resposta curta, clara e util.",
-  ].join(" ");
+  if (topic === "ticket_config" || topic === "roles" || topic === "transcript" || topic === "flowai") {
+    guidance.push(
+      "Tema operacional do Flowdesk detectado. Entregue checklist objetivo e use canais, cargos e configuracoes reais do contexto quando eles estiverem disponiveis.",
+    );
+  }
+
+  if (topic === "billing" || topic === "sales" || topic === "partnership") {
+    guidance.push(
+      "Tema comercial ou financeiro detectado. Separe o que ja pode ser orientado agora do que depende de validacao humana.",
+    );
+  }
+
+  return guidance.join(" ");
 }
 
 function buildTicketResumeState(session, ticket) {
@@ -446,6 +604,16 @@ function buildTicketServerContext(runtime, ticket) {
           `- Log de fechamento: ${formatChannel(settings.logs_closed_channel_id)}`,
           `- Botao do painel: ${settings.panel_button_label || "Abrir ticket"}`,
           `- Titulo do painel: ${settings.panel_title || env.panelTitle}`,
+        ].join("\n")
+      : "",
+    settings
+      ? [
+          "Contexto do FlowAI:",
+          `- FlowAI ativo: ${settings.ai_enabled === true ? "sim" : "nao"}`,
+          `- Empresa: ${settings.ai_company_name || "nao configurado"}`,
+          `- Bio: ${inlineMemoryText(settings.ai_company_bio || "", 200) || "nao configurado"}`,
+          `- Tom: ${resolveTicketAiTone(settings) === "friendly" ? "amigavel" : "formal"}`,
+          `- Regras: ${inlineMemoryText(settings.ai_rules || "", 300) || "nao configurado"}`,
         ].join("\n")
       : "",
     staffSettings
@@ -821,13 +989,47 @@ function buildInitialReasonGuidance(reason) {
   return "Entendi. Pode me mandar mais um pouco de contexto que eu te ajudo a seguir por aqui.";
 }
 
-function buildTicketWelcomeMessage(ticket) {
+function buildTicketWelcomeMessage(ticket, runtime) {
   const reason = normalizeText(ticket.opened_reason || "", 500);
+  const topic = detectTicketSupportTopic(reason);
+
+  if (topic === "ticket_config") {
+    const panelChannel = formatChannel(runtime?.settings?.menu_channel_id);
+    const category = formatChannel(runtime?.settings?.tickets_category_id);
+    const buttonLabel = runtime?.settings?.panel_button_label || "Abrir ticket";
+
+    return [
+      "Ja peguei a abertura deste ticket.",
+      "",
+      `Se o problema for no fluxo de tickets, hoje o painel principal esta em ${panelChannel}, a categoria esta em ${category} e o botao principal e \`${buttonLabel}\`.`,
+      "Me manda o passo exato que quebra que eu sigo do ponto certo com voce.",
+    ].join("\n");
+  }
+
+  if (topic === "flowai") {
+    const companyName = runtime?.settings?.ai_company_name || "FlowAI";
+    return [
+      "Ja peguei seu ticket por aqui.",
+      "",
+      `Se a duvida for no ${companyName}, eu consigo seguir com base nas configuracoes salvas deste servidor.`,
+      "Me fala qual comportamento saiu do esperado que eu fecho o diagnostico com voce.",
+    ].join("\n");
+  }
+
   return buildInitialReasonGuidance(reason);
 }
 
 function buildTicketRuleBasedReply(ticket, runtime, content) {
+  const cleanContent = normalizeText(content, 600);
+  if (cleanContent.length > 260) {
+    return null;
+  }
+
   const normalized = normalizeIntentText(content);
+  const topic = detectTicketSupportTopic([
+    ticket?.opened_reason || "",
+    content || "",
+  ].join(" "));
 
   if (
     normalized.includes("quero comprar") ||
@@ -845,19 +1047,230 @@ function buildTicketRuleBasedReply(ticket, runtime, content) {
     return "Beleza. Se for parceria, me manda o link da sua comunidade ou projeto e o que voce imagina para essa parceria.";
   }
 
-  if (
-    normalized.includes("ticket") &&
-    (normalized.includes("painel") || normalized.includes("abrir") || normalized.includes("abre"))
-  ) {
-    const panelChannel = runtime?.settings?.menu_channel_id
-      ? `<#${runtime.settings.menu_channel_id}>`
-      : "o canal configurado de tickets";
+  if (topic === "ticket_config") {
+    const panelChannel = formatChannel(runtime?.settings?.menu_channel_id);
+    const category = formatChannel(runtime?.settings?.tickets_category_id);
     const buttonLabel = runtime?.settings?.panel_button_label || "Abrir ticket";
 
-    return `Se a duvida for no fluxo de ticket, o painel principal fica em ${panelChannel} e o botao usado hoje e \`${buttonLabel}\`. Se quiser, eu posso te ajudar a revisar onde exatamente esta travando.`;
+    return [
+      `Se a duvida for no fluxo de ticket, o painel principal fica em ${panelChannel}, a categoria atual e ${category} e o botao usado hoje e \`${buttonLabel}\`.`,
+      "Se quiser acelerar, me manda o ponto exato que trava: publicar painel, salvar embed, criar canal ou acionar staff.",
+    ].join(" ");
+  }
+
+  if (topic === "roles") {
+    return [
+      `Hoje o staff principal configurado e ${formatRole(runtime?.staffSettings?.admin_role_id)}.`,
+      `Quem pode assumir: ${formatRoleList(runtime?.staffSettings?.claim_role_ids)}.`,
+      `Quem pode fechar: ${formatRoleList(runtime?.staffSettings?.close_role_ids)}.`,
+      "Se o problema for permissao, eu consigo revisar com voce qual etapa ou botao ficou sem acesso.",
+    ].join(" ");
+  }
+
+  if (topic === "transcript") {
+    return "Se o problema for transcript, me diz se a falha esta em gerar, salvar ou abrir o transcript final. Com isso eu sigo no ponto certo e separo rapido se o problema esta no fechamento do ticket ou no acesso ao historico.";
+  }
+
+  if (topic === "flowai") {
+    const companyName = runtime?.settings?.ai_company_name || "FlowAI";
+    const tone = resolveTicketAiTone(runtime?.settings) === "friendly" ? "amigavel" : "formal";
+    const rulesReady = normalizeText(runtime?.settings?.ai_rules || "", 300).length > 0;
+
+    return [
+      `Hoje o ${companyName} deste servidor esta ativo com tom ${tone}.`,
+      `Empresa configurada: ${runtime?.settings?.ai_company_name || "nao configurada"}.`,
+      `Diretrizes salvas: ${rulesReady ? "sim" : "nao"}.`,
+      "Se o problema for a triagem ou a resposta dentro do ticket, me fala qual comportamento saiu errado que eu sigo em cima disso.",
+    ].join(" ");
   }
 
   return null;
+}
+
+function buildTicketFailSafeReply(ticket, runtime, content) {
+  const topic = detectTicketSupportTopic([
+    ticket?.opened_reason || "",
+    content || "",
+  ].join(" "));
+  const panelChannel = formatChannel(runtime?.settings?.menu_channel_id);
+  const category = formatChannel(runtime?.settings?.tickets_category_id);
+  const buttonLabel = runtime?.settings?.panel_button_label || "Abrir ticket";
+  const companyName = runtime?.settings?.ai_company_name || "FlowAI";
+  const tone = resolveTicketAiTone(runtime?.settings) === "friendly" ? "amigavel" : "formal";
+  const rulesReady = normalizeText(runtime?.settings?.ai_rules || "", 300).length > 0;
+
+  switch (topic) {
+    case "billing":
+      return [
+        "Ja consigo adiantar essa triagem por aqui.",
+        "",
+        "Se isso envolve pagamento, licenca, renovacao ou reembolso, me manda o email da compra e, se existir, o numero do pedido ou a cobranca que apareceu.",
+        "Se houve duplicidade, chargeback ou cancelamento, eu separo com voce o que ja da para validar agora e o que precisa do financeiro.",
+      ].join("\n");
+    case "sales":
+      return [
+        "Posso acelerar isso agora.",
+        "",
+        "Me diz qual recurso ou resultado voce quer liberar com o plano, porque assim eu separo rapido se o melhor caminho e compra, upgrade ou ajuste no que voce ja tem.",
+      ].join("\n");
+    case "partnership":
+      return [
+        "Fechado.",
+        "",
+        "Para parceria, ja me manda o link da sua comunidade ou projeto, o tamanho aproximado do publico e o formato de parceria que voce imagina.",
+      ].join("\n");
+    case "ticket_config":
+      return [
+        "Vou te adiantar um checklist do fluxo de ticket.",
+        "",
+        `- Painel principal: ${panelChannel}`,
+        `- Categoria atual: ${category}`,
+        `- Botao principal: \`${buttonLabel}\``,
+        `- Admin do staff: ${formatRole(runtime?.staffSettings?.admin_role_id)}`,
+        `- Cargos que assumem: ${formatRoleList(runtime?.staffSettings?.claim_role_ids)}`,
+        "",
+        "Me manda agora a mensagem exata do erro ou a etapa que quebra, porque eu sigo desse ponto com voce.",
+      ].join("\n");
+    case "roles":
+      return [
+        "Vamos revisar a permissao sem perder tempo.",
+        "",
+        `- Admin: ${formatRole(runtime?.staffSettings?.admin_role_id)}`,
+        `- Assume: ${formatRoleList(runtime?.staffSettings?.claim_role_ids)}`,
+        `- Fecha: ${formatRoleList(runtime?.staffSettings?.close_role_ids)}`,
+        `- Notificados: ${formatRoleList(runtime?.staffSettings?.notify_role_ids)}`,
+        "",
+        "Se voce me disser qual acao ficou bloqueada, eu fecho o diagnostico dessa parte com voce.",
+      ].join("\n");
+    case "transcript":
+      return [
+        "Se o problema for transcript, eu sigo com voce por etapa.",
+        "",
+        "Me confirma se a falha esta em gerar o transcript, salvar o fechamento ou abrir o link final. Com isso eu separo o ponto exato do fluxo.",
+      ].join("\n");
+    case "flowai":
+      return [
+        "Consigo te orientar nessa parte agora.",
+        "",
+        "- Modulo FlowAI: ativo",
+        `- Empresa salva: ${runtime?.settings?.ai_company_name || "nao configurada"}`,
+        `- Tom atual: ${tone}`,
+        `- Diretrizes salvas: ${rulesReady ? "sim" : "nao"}`,
+        `- Nome operacional: ${companyName}`,
+        "",
+        "Se o comportamento errado aconteceu na sugestao antes do ticket ou na resposta aqui dentro, me diz exatamente o que saiu do esperado.",
+      ].join("\n");
+    case "bug":
+    case "platform":
+      return [
+        "Vamos fechar o diagnostico sem enrolacao.",
+        "",
+        "Me manda a mensagem exata do erro e diz se ele acontece no site, no painel do bot ou dentro do Discord.",
+        "Se voce acabou de testar alguma acao, me fala qual foi que eu sigo desse ponto.",
+      ].join("\n");
+    default:
+      return [
+        "Eu sigo com voce por aqui.",
+        "",
+        "Me manda o ponto exato que travou e, se existir, a mensagem do erro ou o resultado que voce esperava ver.",
+      ].join("\n");
+  }
+}
+
+function buildTicketSuggestionCacheKey(reason, settings, options = {}) {
+  const guildKey =
+    normalizeIntentText(options.guildId || options.guildName || "guild").slice(0, 48) ||
+    "guild";
+  const companyKey =
+    normalizeIntentText(settings?.ai_company_name || "").slice(0, 32) ||
+    "company";
+  const toneKey = resolveTicketAiTone(settings);
+  const rulesKey =
+    normalizeIntentText(settings?.ai_rules || "").slice(0, 72) || "no-rules";
+
+  return [
+    "ticket-suggestion",
+    guildKey,
+    String(options.userId || "user"),
+    companyKey,
+    toneKey,
+    rulesKey,
+    normalizeIntentText(reason).slice(0, 160),
+  ].join(":");
+}
+
+function buildTicketSuggestionFallback(reason, settings, options = {}) {
+  const topic = detectTicketSupportTopic(reason);
+  const panelChannel = formatChannel(settings?.menu_channel_id);
+  const category = formatChannel(settings?.tickets_category_id);
+  const buttonLabel = settings?.panel_button_label || "Abrir ticket";
+  const companyName = settings?.ai_company_name || options.guildName || "FlowAI";
+
+  switch (topic) {
+    case "billing":
+      return [
+        "Pelo que voce descreveu, vale adiantar tres pontos antes de seguir com o ticket:",
+        "- separe o email da compra, numero do pedido ou a cobranca envolvida",
+        "- se houve duplicidade, chargeback, cancelamento ou estorno, diga isso logo na abertura",
+        "- se for licenca ou plano, diga qual recurso deveria estar liberado",
+        "",
+        "Se isso nao resolver agora, clique em **Continuar com ticket** que eu sigo com a triagem dentro do atendimento.",
+      ].join("\n");
+    case "sales":
+      return [
+        "Ja da para acelerar essa triagem agora:",
+        "- diga qual recurso ou resultado voce quer liberar com o plano",
+        "- se a duvida for compra, upgrade ou downgrade, deixe isso explicito",
+        "- se houver urgencia comercial, cite isso na abertura do ticket",
+        "",
+        "Se ainda precisar, clique em **Continuar com ticket** que eu levo essa triagem junto.",
+      ].join("\n");
+    case "partnership":
+      return [
+        "Para parceria, o melhor proximo passo e entrar ja com o contexto certo:",
+        "- link da sua comunidade, projeto ou produto",
+        "- tamanho aproximado do publico",
+        "- o formato de parceria que voce imagina",
+        "",
+        "Se quiser seguir, clique em **Continuar com ticket** e eu organizo essa triagem na abertura.",
+      ].join("\n");
+    case "ticket_config":
+      return [
+        "Pelo que voce descreveu, o melhor primeiro checklist e este:",
+        `- confirme se o painel principal ainda esta em ${panelChannel}`,
+        `- valide se a categoria ${category} continua acessivel pelo bot`,
+        `- revise se o botao principal continua publicado como \`${buttonLabel}\``,
+        "- se o erro for ao salvar embed ou botao, valide titulo, descricao e componentes antes de publicar de novo",
+        "",
+        "Se isso nao resolver agora, clique em **Continuar com ticket** que eu sigo com a triagem completa por la.",
+      ].join("\n");
+    case "flowai":
+      return [
+        `Se a duvida for no ${companyName}, o ponto principal e revisar a base que alimenta a triagem:`,
+        "- modulo FlowAI ativo no painel",
+        "- nome da empresa e bio preenchidos",
+        "- diretrizes e tom configurados",
+        "- comportamento exato que saiu do esperado na sugestao ou na resposta",
+        "",
+        "Se quiser seguir, clique em **Continuar com ticket** que eu continuo essa triagem dentro do atendimento.",
+      ].join("\n");
+    case "bug":
+    case "platform":
+      return [
+        "Para esse tipo de falha, o que mais acelera a triagem e separar:",
+        "- onde o problema acontece: site, painel do bot ou Discord",
+        "- a mensagem exata do erro, se apareceu alguma",
+        "- o que voce tentou fazer e o que deveria ter acontecido",
+        "",
+        "Se ainda precisar, clique em **Continuar com ticket** que eu sigo com voce por la.",
+      ].join("\n");
+    default:
+      return [
+        "Ja organizei a direcao inicial do seu atendimento.",
+        "",
+        "Se quiser aprofundar ou seguir com a equipe, clique em **Continuar com ticket** que eu continuo a triagem dentro do atendimento.",
+      ].join("\n");
+  }
 }
 
 function buildHandoffReply(reason) {
@@ -1027,7 +1440,12 @@ async function maybeSendHandoffReply({ client, channel, ticket, reason, userId }
 }
 
 async function sendInitialTicketAiMessage(client, ticket) {
-  if (!client?.user || !ticket || !isOfficialTicketGuild(ticket.guild_id)) {
+  if (!client?.user || !ticket) {
+    return false;
+  }
+
+  const runtime = await getGuildTicketRuntime(ticket.guild_id).catch(() => null);
+  if (!isTicketAiEnabledForRuntime(runtime)) {
     return false;
   }
 
@@ -1046,7 +1464,7 @@ async function sendInitialTicketAiMessage(client, ticket) {
   const channel = guild.channels.cache.get(ticket.channel_id) || await guild.channels.fetch(ticket.channel_id).catch(() => null);
   if (!channel || typeof channel.send !== "function") return false;
 
-  const content = buildTicketWelcomeMessage(ticket);
+  const content = buildTicketWelcomeMessage(ticket, runtime);
 
   await sendTicketChannelMessage(channel, content);
   await persistTicketAiMessage(ticket, {
@@ -1093,16 +1511,16 @@ async function handleTicketAiMessage(message, client) {
     return false;
   }
 
-  if (!isOfficialTicketGuild(message.guildId)) {
-    return false;
-  }
-
   const ticket = await getOpenTicketByChannel(message.guildId, message.channelId).catch(() => null);
   if (!ticket) {
     return false;
   }
 
   const runtime = await getGuildTicketRuntime(ticket.guild_id).catch(() => null);
+  if (!isTicketAiEnabledForRuntime(runtime)) {
+    return true;
+  }
+
   const content = extractMessageContent(message);
   const currentIso = nowIso();
   const session = await ensureTicketAiSession(ticket);
@@ -1301,8 +1719,21 @@ async function handleTicketAiMessage(message, client) {
 
     const historyRows = await getRecentTicketAiMessages(ticket.id, MAX_TICKET_AI_MESSAGES).catch(() => []);
     const promptMessages = buildModelPromptMessages(ticket, runtime, historyRows, resumeState);
-    const result = await callOpenAI(promptMessages, message.author.id);
-    const parsed = parseAssistantOutcome(result.content);
+    let parsed = null;
+    let modelName = null;
+
+    if (hasTicketAiModelTransport()) {
+      const result = await callOpenAI(promptMessages, message.author.id);
+      parsed = parseAssistantOutcome(result.content);
+      modelName = result.model;
+    } else {
+      parsed = {
+        content: buildTicketFailSafeReply(ticket, runtime, content),
+        handoff: false,
+      };
+      modelName = "rule-based";
+    }
+
     const finalReply = applyTicketResumeLeadIn(parsed.content, resumeState);
 
     if (!finalReply) {
@@ -1316,7 +1747,7 @@ async function handleTicketAiMessage(message, client) {
       source: parsed.handoff ? "ticket_ai_handoff" : "ticket_ai_reply",
       content: finalReply,
       metadata: {
-        model: result.model,
+        model: modelName,
         handoff: parsed.handoff,
         handoff_resume: Boolean(
           resumeState.staleClaimHandoff || resumeState.staleStaffHandoff,
@@ -1354,13 +1785,56 @@ async function handleTicketAiMessage(message, client) {
       prompt: content,
       response: finalReply,
       source: parsed.handoff ? "ticket_ai_handoff" : "ticket_ai_reply",
-      model: result.model,
+      model: modelName,
       status: parsed.handoff ? "handoff" : "active",
     });
 
     return true;
   } catch (error) {
     console.error("[ticket-ai] falha ao responder ticket:", error);
+    const fallbackReply = applyTicketResumeLeadIn(
+      buildTicketFailSafeReply(ticket, runtime, content),
+      resumeState,
+    );
+
+    if (fallbackReply) {
+      await replyToTicketMessage(message, fallbackReply).catch(() => null);
+      await persistTicketAiMessage(ticket, {
+        authorId: client.user.id,
+        authorType: "assistant",
+        source: "ticket_ai_fallback",
+        content: fallbackReply,
+        metadata: {
+          reason: "ai_unavailable",
+          error: error instanceof Error ? error.message : String(error),
+        },
+      });
+
+      await safeUpsertTicketAiSession({
+        ticketId: ticket.id,
+        protocol: ticket.protocol,
+        guildId: ticket.guild_id,
+        channelId: ticket.channel_id,
+        userId: ticket.user_id,
+        status: "active",
+        lastAiReplyAt: nowIso(),
+        lastUserMessageAt: currentIso,
+        lastStaffMessageAt: session?.last_staff_message_at || null,
+      });
+
+      await sendTicketAiInteractionLog(client, {
+        ticket,
+        userId: message.author.id,
+        prompt: content,
+        response: fallbackReply,
+        source: "ticket_ai_fallback",
+        model: "rule-based",
+        status: "active",
+      });
+
+      return true;
+    }
+
     const handoffReply = buildHandoffReply("ai_unavailable");
 
     await replyToTicketMessage(message, handoffReply).catch(() => null);
@@ -1403,15 +1877,16 @@ async function handleTicketAiMessage(message, client) {
   }
 }
 
-async function generateAiSuggestion(reason, settings, userId, { guildName, userName } = {}) {
-  if (!env.openaiApiKey && !env.flowAiApiToken) {
+async function generateAiSuggestion(reason, settings, userId, options = {}) {
+  const { guildId, guildName, userName } = options;
+  if (!reason && !settings) {
     throw new Error("OpenAI API Key não configurada.");
   }
 
   const name = settings?.ai_company_name || "Assistente Oficial";
   const bio = settings?.ai_company_bio || "Assistente de IA de alto nível.";
   const rules = settings?.ai_rules || "";
-  const tone = settings?.ai_tone || "professional";
+  const tone = resolveTicketAiTone(settings);
 
   const toneInstruction = tone === "friendly"
     ? "TOM DE VOZ: Use um tom humano, leve, carismático e amigável. Fale de forma próxima e acolhedora."
@@ -1447,26 +1922,73 @@ ${reason}
 </USER_INPUT>
   `.trim();
 
+  const enhancedSystemPrompt = [
+    `Voce e o ${name}.`,
+    `Contexto da empresa e operacao: ${settings?.ai_company_bio || "Assistente oficial do servidor."}.`,
+    guildName ? `Voce esta operando no servidor ${guildName}.` : "",
+    tone === "friendly"
+      ? "Use um tom humano, leve, carismatico e amigavel. Fale de forma proxima e acolhedora."
+      : "Use um tom profissional, sobrio, polido e seguro. Priorize eficiencia e clareza absoluta.",
+    "Sua funcao nesta etapa e fazer a triagem antes da abertura do ticket.",
+    "Entregue a melhor resposta possivel com base no texto do usuario e no contexto da empresa.",
+    "Se o caso parecer de configuracao do Flowdesk ou do Discord, forneca um mini-checklist pratico.",
+    "Se o caso depender de validacao humana, diga isso com naturalidade e oriente o que a pessoa ja pode separar para agilizar o ticket.",
+    "Nao invente dados internos, nao repita o motivo do usuario em outras palavras e nao faca promessas que dependem de acao manual.",
+    "Se precisar perguntar algo, faca no maximo uma pergunta curta e objetiva no final.",
+    rules ? `Diretrizes obrigatorias da empresa:\n${rules}` : "",
+  ].filter(Boolean).join(" ");
+
+  const enhancedContextPrompt = `
+Usuario: ${userName || "Desconhecido"} (${userId})
+Servidor: ${guildName || "Desconhecido"}
+
+${
+  rules
+    ? `Regras de atendimento do servidor:\n${rules}`
+    : "O servidor ainda nao cadastrou regras especificas de atendimento."
+}
+
+<USER_INPUT>
+${reason}
+</USER_INPUT>
+  `.trim();
+
   const messages = [
-    { role: "system", content: systemPrompt },
-    { role: "user", content: contextPrompt },
+    { role: "system", content: enhancedSystemPrompt || systemPrompt },
+    { role: "user", content: enhancedContextPrompt || contextPrompt },
   ];
 
-  const result = await requestFlowAiChat({
-    taskKey: "ticket_suggestion",
-    messages,
-    userId,
-    temperature: 0.45,
-    maxTokens: 420,
-    cacheKey: `ticket-suggestion:${userId}:${normalizeIntentText(reason)}`,
-    cacheTtlMs: 1000 * 60 * 5,
-  });
+  try {
+    const result = await requestFlowAiChat({
+      taskKey: "ticket_suggestion",
+      messages,
+      userId,
+      temperature: 0.45,
+      maxTokens: 420,
+      cacheKey: buildTicketSuggestionCacheKey(reason, settings, {
+        guildId,
+        guildName,
+        userId,
+      }),
+      cacheTtlMs: 1000 * 60 * 5,
+    });
 
-  return result.content;
+    const cleanResult = normalizeText(result?.content || "", 3500);
+    if (cleanResult) {
+      return cleanResult;
+    }
+  } catch (error) {
+    console.warn("[ticket-ai] fallback da sugestao pre-ticket acionado:", error);
+  }
+
+  return buildTicketSuggestionFallback(reason, settings, {
+    guildName,
+  });
 }
 
 module.exports = {
   handleTicketAiMessage,
+  isTicketAiEnabledForRuntime,
   markTicketAiClosed,
   markTicketAiHandoff,
   sendInitialTicketAiMessage,
