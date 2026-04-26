@@ -136,6 +136,58 @@ function ensureRemoteOrigin(targetDir, repoName, remoteUrl) {
   run("git", ["remote", "add", "origin", remoteUrl], targetDir);
 }
 
+function getFetchedBaseBranch(targetDir) {
+  const candidates = ["main", "master"];
+
+  for (const branch of candidates) {
+    const result = execute(
+      "git",
+      ["rev-parse", "--verify", `origin/${branch}`],
+      targetDir,
+      {
+        printCommand: false,
+        printOutput: false,
+      },
+    );
+
+    if (result.status === 0) {
+      return branch;
+    }
+  }
+
+  const originHead = capture("git", ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], targetDir);
+  if (originHead.startsWith("origin/")) {
+    return originHead.slice("origin/".length);
+  }
+
+  return null;
+}
+
+function ensureGitRepository(targetDir, repoName, remoteUrl) {
+  const gitDir = path.join(targetDir, ".git");
+  if (fs.existsSync(gitDir)) {
+    ensureRemoteOrigin(targetDir, repoName, remoteUrl);
+    return;
+  }
+
+  console.log(`\nPreparando Git em [${repoName}]...`);
+  run("git", ["init"], targetDir);
+  ensureRemoteOrigin(targetDir, repoName, remoteUrl);
+
+  console.log(`\nLigando [${repoName}] ao historico do GitHub...`);
+  const fetchResult = execute("git", ["fetch", "origin"], targetDir);
+  const baseBranch = fetchResult.status === 0 ? getFetchedBaseBranch(targetDir) : null;
+
+  if (baseBranch) {
+    run("git", ["branch", "-M", baseBranch], targetDir);
+    run("git", ["reset", "--mixed", `origin/${baseBranch}`], targetDir);
+    return;
+  }
+
+  console.warn(`\nAviso: nao encontrei branch remota para [${repoName}]. Usando 'main'.`);
+  run("git", ["branch", "-M", "main"], targetDir);
+}
+
 function isResolvingConflict(targetDir) {
   const gitDir = path.join(targetDir, ".git");
   return (
@@ -207,13 +259,8 @@ function pushWithProtectedBranchFallback(input) {
 }
 
 async function syncRepo(targetDir, repoName, rl, options = {}) {
-  if (!fs.existsSync(path.join(targetDir, ".git"))) {
-    console.log(`\nPulando [${repoName}]: nao e um repositorio Git.`);
-    return;
-  }
-
   const relPath = path.relative(rootDir, targetDir) || ".";
-  ensureRemoteOrigin(targetDir, repoName, options.remoteUrl || null);
+  ensureGitRepository(targetDir, repoName, options.remoteUrl || null);
 
   if (isResolvingConflict(targetDir)) {
     console.log(`\n[${repoName}] ja esta com um conflito pendente.`);

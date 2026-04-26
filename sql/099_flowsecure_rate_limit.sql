@@ -93,7 +93,7 @@ create or replace function public.apply_flowsecure_rate_limit(
   p_user_agent text default null,
   p_window_seconds integer default 60,
   p_penalty_seconds integer default 60,
-  p_duplicate_threshold integer default 10,
+  p_duplicate_threshold integer default 8,
   p_scope_threshold integer default 40,
   p_site_threshold integer default 160,
   p_metadata jsonb default '{}'::jsonb
@@ -107,7 +107,7 @@ declare
   v_now timestamptz := timezone('utc', now());
   v_window_seconds integer := greatest(1, coalesce(p_window_seconds, 60));
   v_penalty_seconds integer := greatest(1, coalesce(p_penalty_seconds, 60));
-  v_duplicate_threshold integer := greatest(1, coalesce(p_duplicate_threshold, 10));
+  v_duplicate_threshold integer := greatest(1, coalesce(p_duplicate_threshold, 8));
   v_scope_threshold integer := greatest(1, coalesce(p_scope_threshold, 40));
   v_site_threshold integer := greatest(1, coalesce(p_site_threshold, 160));
   v_window_start timestamptz := v_now - make_interval(secs => v_window_seconds);
@@ -268,10 +268,10 @@ begin
   where ip_fingerprint = p_ip_fingerprint
     and created_at >= v_window_start;
 
-  if v_duplicate_hits >= v_duplicate_threshold then
-    v_reason := 'duplicate_signature';
-  elsif v_traffic_scope = 'page' and v_route_hits >= v_duplicate_threshold then
+  if v_traffic_scope = 'page' and v_route_hits >= v_duplicate_threshold then
     v_reason := 'page_reload_burst';
+  elsif v_duplicate_hits >= v_duplicate_threshold then
+    v_reason := 'duplicate_signature';
   elsif v_scope_hits >= v_scope_threshold then
     v_reason := 'scope_burst';
   elsif v_site_hits >= v_site_threshold then
