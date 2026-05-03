@@ -1,23 +1,8 @@
--- Runtime compatibility fixes for admin dashboard.
+-- Discord publication fields for sales products.
 -- Safe to run more than once.
 
 do $$
 begin
-  if to_regtype('public.ticket_status') is not null then
-    alter type public.ticket_status add value if not exists 'pending';
-    alter type public.ticket_status add value if not exists 'review';
-    alter type public.ticket_status add value if not exists 'resolved';
-  else
-    raise notice 'Skipping missing enum: public.ticket_status';
-  end if;
-
-  if to_regclass('public.tickets') is not null then
-    alter table public.tickets
-      add column if not exists opened_reason text not null default '';
-  else
-    raise notice 'Skipping missing table: public.tickets';
-  end if;
-
   if to_regclass('public.guild_sales_products') is not null then
     alter table public.guild_sales_products
       add column if not exists discord_publication_mode text not null default 'online_only',
@@ -77,12 +62,6 @@ begin
   else
     raise notice 'Skipping missing table: public.guild_sales_products';
   end if;
-
-  if to_regclass('public.admin_sessions') is not null then
-    create unique index if not exists admin_sessions_auth_session_id_key
-      on public.admin_sessions (auth_session_id);
-  else
-    raise notice 'Skipping missing table: public.admin_sessions';
-  end if;
 end
 $$;
+
