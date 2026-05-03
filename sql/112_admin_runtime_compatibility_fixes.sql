@@ -3,6 +3,14 @@
 
 do $$
 begin
+  if to_regtype('public.ticket_status') is not null then
+    alter type public.ticket_status add value if not exists 'pending';
+    alter type public.ticket_status add value if not exists 'review';
+    alter type public.ticket_status add value if not exists 'resolved';
+  else
+    raise notice 'Skipping missing enum: public.ticket_status';
+  end if;
+
   if to_regclass('public.tickets') is not null then
     alter table public.tickets
       add column if not exists opened_reason text not null default '';
