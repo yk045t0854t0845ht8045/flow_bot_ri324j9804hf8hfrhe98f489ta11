@@ -78,6 +78,40 @@ begin
     raise notice 'Skipping missing table: public.guild_sales_products';
   end if;
 
+  if to_regclass('public.guild_sales_categories') is not null then
+    alter table public.guild_sales_categories
+      add column if not exists discord_publication_mode text not null default 'online_only',
+      add column if not exists discord_channel_id text null;
+
+    if not exists (
+      select 1
+      from pg_constraint
+      where conname = 'guild_sales_categories_discord_publication_mode_check'
+        and conrelid = 'public.guild_sales_categories'::regclass
+    ) then
+      alter table public.guild_sales_categories
+        add constraint guild_sales_categories_discord_publication_mode_check
+        check (discord_publication_mode in ('online_only', 'channel'));
+    end if;
+
+    if not exists (
+      select 1
+      from pg_constraint
+      where conname = 'guild_sales_categories_discord_channel_id_check'
+        and conrelid = 'public.guild_sales_categories'::regclass
+    ) then
+      alter table public.guild_sales_categories
+        add constraint guild_sales_categories_discord_channel_id_check
+        check (discord_channel_id is null or discord_channel_id ~ '^[0-9]{10,25}$');
+    end if;
+
+    create index if not exists idx_guild_sales_categories_discord_channel
+      on public.guild_sales_categories (guild_id, discord_channel_id)
+      where discord_channel_id is not null;
+  else
+    raise notice 'Skipping missing table: public.guild_sales_categories';
+  end if;
+
   if to_regclass('public.admin_sessions') is not null then
     create unique index if not exists admin_sessions_auth_session_id_key
       on public.admin_sessions (auth_session_id);
