@@ -1107,8 +1107,8 @@ function startPaymentAutoSync(interaction, cartId, paymentMessage) {
     }
 
     const status = payload.cart?.status || payload.payment?.status || "payment_pending";
-    await paymentMessage?.edit(buildPaymentStatusPayload(cartId, payload.payment, status)).catch(() => null);
     if (status === "delivered" || status === "delivery_failed") {
+      await paymentMessage?.edit(buildPaymentStatusPayload(cartId, payload.payment, status)).catch(() => null);
       await deliverApprovedCart(interaction, payload);
       return;
     }

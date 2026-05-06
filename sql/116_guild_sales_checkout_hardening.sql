@@ -196,6 +196,30 @@ begin
 end;
 $$;
 
+create or replace function public.tr_normalize_guild_sales_stock_item_status()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if new.quantity > 0 and new.status = 'delivered' then
+    new.status = 'available';
+  elsif new.quantity = 0 and new.status = 'available' then
+    new.status = 'delivered';
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists tr_guild_sales_stock_items_normalize_status
+on public.guild_sales_stock_items;
+create trigger tr_guild_sales_stock_items_normalize_status
+before insert or update of quantity, status on public.guild_sales_stock_items
+for each row
+execute function public.tr_normalize_guild_sales_stock_item_status();
+
 drop trigger if exists tr_guild_sales_stock_items_sync_product_quantity
 on public.guild_sales_stock_items;
 create trigger tr_guild_sales_stock_items_sync_product_quantity
@@ -245,4 +269,5 @@ from (
 comment on table public.guild_sales_order_events is 'Auditoria de eventos do pedido de venda Discord: pagamento, entrega, recibo e falhas operacionais.';
 comment on function public.claim_guild_sales_stock_item(text, uuid, text) is 'Reserva atomicamente uma unidade disponivel de estoque digital para entrega.';
 comment on function public.sync_guild_sales_product_stock_quantity(text, uuid) is 'Recalcula o estoque publicado do produto a partir das unidades digitais disponiveis.';
+comment on function public.tr_normalize_guild_sales_stock_item_status() is 'Mantem status e quantidade do estoque digital coerentes antes de recalcular o estoque do produto.';
 comment on function public.acquire_guild_sales_cart_delivery_lock(uuid) is 'Adquire trava idempotente para impedir entrega duplicada do mesmo carrinho.';
