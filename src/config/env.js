@@ -191,6 +191,20 @@ const env = {
     process.env.FLOWAI_API_CLOCK_SKEW_MS,
     300_000,
   ),
+  salesInternalApiUrl:
+    optionalEnv("SALES_INTERNAL_API_URL") ||
+    buildUrl(
+      process.env.NEXT_PUBLIC_APP_URL ||
+        process.env.APP_URL ||
+        process.env.SITE_URL ||
+        DEFAULT_PUBLIC_APP_URL,
+      "/api/internal/sales/discord",
+    ),
+  salesInternalApiToken:
+    optionalEnv("SALES_INTERNAL_API_TOKEN") ||
+    optionalEnv("FLOWAI_INTERNAL_API_TOKEN") ||
+    optionalEnv("CRON_SECRET") ||
+    null,
   statusHeartbeatIntervalMs: parseNumber(
     process.env.STATUS_HEARTBEAT_INTERVAL_MS,
     180_000,

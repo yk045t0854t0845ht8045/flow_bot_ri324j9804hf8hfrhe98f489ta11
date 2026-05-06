@@ -19,6 +19,10 @@ const {
   handleSecurityLogButtonInteraction,
   isSecurityLogButtonInteraction,
 } = require("../services/securityLogsService");
+const {
+  handleSalesInteraction,
+  isSalesComponentInteraction,
+} = require("../services/salesService");
 const { isDiscordUserSuspended, isDiscordUserAtRisk } = require("../services/violationService");
 
 function isTicketButtonInteraction(interaction) {
@@ -86,6 +90,11 @@ module.exports = {
         if (interaction.customId === CUSTOM_IDS.openTicketReasonModal) {
           await openTicketFromModalSubmit(interaction);
         }
+        return;
+      }
+
+      if (isSalesComponentInteraction(interaction)) {
+        await handleSalesInteraction(interaction, client);
         return;
       }
 
