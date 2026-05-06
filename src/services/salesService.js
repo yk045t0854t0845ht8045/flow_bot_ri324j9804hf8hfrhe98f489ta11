@@ -209,7 +209,8 @@ async function getAvailableStockQuantity(guildId, productId, fallbackQuantity = 
     .select("quantity")
     .eq("guild_id", guildId)
     .eq("product_id", productId)
-    .eq("status", "available");
+    .eq("status", "available")
+    .gt("quantity", 0);
 
   if (result.error) {
     const message = String(result.error.message || "").toLowerCase();
@@ -235,17 +236,64 @@ async function getAvailableStockQuantity(guildId, productId, fallbackQuantity = 
   };
 }
 
-async function productHasEffectiveStock(product, quantity = 1) {
-  if (product?.inventory_tracked === false) return true;
+function isMissingStockSyncRpcError(error) {
+  const code = String(error?.code || "");
+  const message = String(error?.message || "").toLowerCase();
+  return code === "42883" || message.includes("sync_guild_sales_product_stock_quantity");
+}
+
+async function getCanonicalAvailableStockQuantity(product) {
   const storedQuantity = Number(product?.stock_quantity || 0);
+  if (!product?.guild_id || !product?.id) {
+    return { quantity: storedQuantity, reliable: false };
+  }
+
+  const rpcResult = await supabase
+    .rpc("sync_guild_sales_product_stock_quantity", {
+      p_guild_id: product.guild_id,
+      p_product_id: product.id,
+    });
+  if (!rpcResult.error && Number.isFinite(Number(rpcResult.data))) {
+    return { quantity: Math.max(0, Number(rpcResult.data || 0)), reliable: true };
+  }
+  if (rpcResult.error && !isMissingStockSyncRpcError(rpcResult.error)) {
+    console.warn("[salesService] Falha ao sincronizar estoque via RPC.", {
+      guildId: product.guild_id,
+      productId: product.id,
+      error: rpcResult.error.message,
+    });
+  }
+
   const availableQuantity = await getAvailableStockQuantity(
     product.guild_id,
     product.id,
     storedQuantity,
   );
-  const effectiveQuantity = availableQuantity.reliable
-    ? availableQuantity.quantity
-    : storedQuantity;
+  if (availableQuantity.reliable) {
+    return availableQuantity;
+  }
+
+  const freshProduct = await supabase
+    .from("guild_sales_products")
+    .select("stock_quantity")
+    .eq("guild_id", product.guild_id)
+    .eq("id", product.id)
+    .maybeSingle();
+  if (!freshProduct.error && freshProduct.data) {
+    return {
+      quantity: Math.max(0, Number(freshProduct.data.stock_quantity || 0)),
+      reliable: false,
+    };
+  }
+
+  return availableQuantity;
+}
+
+async function productHasEffectiveStock(product, quantity = 1) {
+  if (product?.inventory_tracked === false) return true;
+  const storedQuantity = Number(product?.stock_quantity || 0);
+  const availableQuantity = await getCanonicalAvailableStockQuantity(product);
+  const effectiveQuantity = availableQuantity.quantity;
   if (availableQuantity.reliable && availableQuantity.quantity !== storedQuantity) {
     const repairResult = await supabase
       .from("guild_sales_products")
@@ -614,6 +662,10 @@ async function addProductToCart(cart, product) {
   const existing = items.find((item) => item.product_id === product.id);
   const currentQuantity = Math.max(0, Number(existing?.quantity || 0));
   if (!(await productHasEffectiveStock(product, currentQuantity + 1))) {
+    if (existing) {
+      const updatedCart = await updateCartTotals(cart.id, items);
+      return { cart: updatedCart, added: false, maxStockReached: true };
+    }
     throw new Error("Produto sem estoque disponivel para adicionar outra unidade.");
   }
 
@@ -645,7 +697,8 @@ async function addProductToCart(cart, product) {
   }
 
   const updatedItems = await getCartItems(cart.id);
-  return updateCartTotals(cart.id, updatedItems);
+  const updatedCart = await updateCartTotals(cart.id, updatedItems);
+  return { cart: updatedCart, added: true, maxStockReached: false };
 }
 
 async function callSalesInternalApi(action, cartId) {
@@ -713,7 +766,8 @@ async function handleAddToCartInteraction(interaction) {
 
   const existingCart = await getOpenCartForUser(guildId, interaction.user.id);
   if (existingCart) {
-    const updatedCart = await addProductToCart(existingCart, product);
+    const addResult = await addProductToCart(existingCart, product);
+    const updatedCart = addResult.cart;
     let channel = interaction.guild.channels.cache.get(existingCart.discord_channel_id);
     if (!channel && existingCart.discord_channel_id) {
       channel = await interaction.guild.channels.fetch(existingCart.discord_channel_id).catch(() => null);
@@ -732,7 +786,11 @@ async function handleAddToCartInteraction(interaction) {
     await replaceCartChannelMessage(channel, updatedCart, {
       linkUrl: token ? checkoutUrl(token) : null,
     });
-    await interaction.editReply(`Produto adicionado ao carrinho aberto: ${channel}`);
+    await interaction.editReply(
+      addResult.added
+        ? `Produto adicionado ao carrinho aberto: ${channel}`
+        : `Este produto ja esta no carrinho aberto: ${channel}`,
+    );
     return true;
   }
 
