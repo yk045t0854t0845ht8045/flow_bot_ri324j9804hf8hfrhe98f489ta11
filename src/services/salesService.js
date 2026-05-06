@@ -132,6 +132,58 @@ function productHasStock(product, quantity = 1) {
   return Number(product?.stock_quantity || 0) >= Math.max(1, Number(quantity || 1));
 }
 
+async function getAvailableStockQuantity(guildId, productId, fallbackQuantity = 0) {
+  const result = await supabase
+    .from("guild_sales_stock_items")
+    .select("quantity")
+    .eq("guild_id", guildId)
+    .eq("product_id", productId)
+    .eq("status", "available");
+
+  if (result.error) {
+    const message = String(result.error.message || "").toLowerCase();
+    if (
+      result.error.code === "42P01" ||
+      result.error.code === "PGRST205" ||
+      message.includes("guild_sales_stock_items")
+    ) {
+      return Math.max(0, Number(fallbackQuantity || 0));
+    }
+    throw new Error(`[Supabase] Falha em "getAvailableStockQuantity": ${result.error.message}`);
+  }
+
+  return (result.data || []).reduce(
+    (sum, item) => sum + Math.max(0, Number(item.quantity || 0)),
+    0,
+  );
+}
+
+async function productHasEffectiveStock(product, quantity = 1) {
+  if (product?.inventory_tracked === false) return true;
+  const storedQuantity = Number(product?.stock_quantity || 0);
+  const availableQuantity = await getAvailableStockQuantity(
+    product.guild_id,
+    product.id,
+    storedQuantity,
+  );
+  const effectiveQuantity = Math.max(storedQuantity, availableQuantity);
+  if (availableQuantity !== storedQuantity) {
+    const repairResult = await supabase
+      .from("guild_sales_products")
+      .update({ stock_quantity: availableQuantity })
+      .eq("guild_id", product.guild_id)
+      .eq("id", product.id);
+    if (repairResult.error) {
+      console.warn("[salesService] Falha ao sincronizar estoque do produto.", {
+        guildId: product.guild_id,
+        productId: product.id,
+        error: repairResult.error.message,
+      });
+    }
+  }
+  return effectiveQuantity >= Math.max(1, Number(quantity || 1));
+}
+
 async function getProductByCode(guildId, productCode) {
   const result = await supabase
     .from("guild_sales_products")
@@ -459,7 +511,7 @@ async function handleAddToCartInteraction(interaction) {
     await interaction.editReply("Produto indisponivel.");
     return true;
   }
-  if (!productHasStock(product, 1)) {
+  if (!(await productHasEffectiveStock(product, 1))) {
     await interaction.editReply("Produto sem estoque disponivel.");
     return true;
   }
@@ -531,7 +583,10 @@ async function handleQuantityButton(interaction, cartId, direction) {
   const product = unwrap(productResult, "handleQuantityButton.product");
   const stock = product?.inventory_tracked === false
     ? 999
-    : Math.max(1, Number(product?.stock_quantity || 1));
+    : Math.max(
+        1,
+        await getAvailableStockQuantity(cart.guild_id, item.product_id, product?.stock_quantity || 1),
+      );
   const current = Math.max(1, Number(item.quantity || 1));
   const nextQuantity =
     direction === "inc" ? Math.min(stock, current + 1) : Math.max(1, current - 1);

@@ -120,5 +120,67 @@ begin
 end;
 $$;
 
+create or replace function public.sync_guild_sales_product_stock_quantity(
+  p_guild_id text,
+  p_product_id uuid
+)
+returns integer
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_quantity integer;
+begin
+  select coalesce(sum(gssi.quantity), 0)::integer
+  into v_quantity
+  from public.guild_sales_stock_items gssi
+  where gssi.guild_id = p_guild_id
+    and gssi.product_id = p_product_id
+    and gssi.status = 'available';
+
+  update public.guild_sales_products
+  set stock_quantity = greatest(0, v_quantity)
+  where guild_id = p_guild_id
+    and id = p_product_id
+    and inventory_tracked is not false;
+
+  return greatest(0, v_quantity);
+end;
+$$;
+
+create or replace function public.tr_sync_guild_sales_product_stock_quantity()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if tg_op in ('UPDATE', 'DELETE') then
+    perform public.sync_guild_sales_product_stock_quantity(old.guild_id, old.product_id);
+  end if;
+
+  if tg_op in ('INSERT', 'UPDATE') then
+    perform public.sync_guild_sales_product_stock_quantity(new.guild_id, new.product_id);
+  end if;
+
+  return coalesce(new, old);
+end;
+$$;
+
+drop trigger if exists tr_guild_sales_stock_items_sync_product_quantity
+on public.guild_sales_stock_items;
+create trigger tr_guild_sales_stock_items_sync_product_quantity
+after insert or update or delete on public.guild_sales_stock_items
+for each row
+execute function public.tr_sync_guild_sales_product_stock_quantity();
+
+select public.sync_guild_sales_product_stock_quantity(product.guild_id, product.product_id)
+from (
+  select distinct guild_id, product_id
+  from public.guild_sales_stock_items
+) product;
+
 comment on table public.guild_sales_order_events is 'Auditoria de eventos do pedido de venda Discord: pagamento, entrega, recibo e falhas operacionais.';
 comment on function public.claim_guild_sales_stock_item(text, uuid, text) is 'Reserva atomicamente uma unidade disponivel de estoque digital para entrega.';
+comment on function public.sync_guild_sales_product_stock_quantity(text, uuid) is 'Recalcula o estoque publicado do produto a partir das unidades digitais disponiveis.';
