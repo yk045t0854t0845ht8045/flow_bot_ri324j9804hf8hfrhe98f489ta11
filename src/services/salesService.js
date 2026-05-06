@@ -21,7 +21,7 @@ const supabase = createClient(env.supabaseUrl, env.supabaseServiceRoleKey, {
 });
 
 const PRODUCT_SELECT =
-  "id, guild_id, title, description, media_urls, price_amount, stock_quantity, sku, status, active, published_point_of_sale, published_virtual_store";
+  "id, guild_id, title, description, media_urls, price_amount, inventory_tracked, stock_quantity, sku, status, active, published_point_of_sale, published_virtual_store";
 const CART_SELECT =
   "id, guild_id, discord_user_id, discord_channel_id, auth_user_id, status, subtotal_amount, total_amount, provider_payment_id, provider_status, provider_ticket_url, provider_qr_code, provider_qr_base64";
 
@@ -105,11 +105,31 @@ async function getSalesSettings(guildId) {
 async function getActivePaymentMethods(guildId) {
   const result = await supabase
     .from("guild_sales_payment_methods")
-    .select("method_key, display_name, payment_rail, status, credentials_configured")
+    .select("method_key, provider, display_name, payment_rail, status, credentials_configured, last_health_status")
     .eq("guild_id", guildId)
-    .eq("status", "active")
-    .eq("credentials_configured", true);
+    .eq("status", "active");
   return unwrap(result, "getActivePaymentMethods") || [];
+}
+
+function isMercadoPagoPixReady(method) {
+  if (!method || method.method_key !== "mercado_pago") return false;
+  const provider = String(method.provider || "").trim();
+  const rail = String(method.payment_rail || "").trim();
+  return (
+    method.status === "active" &&
+    (method.credentials_configured === true || method.last_health_status !== "failed") &&
+    (!provider || provider === "mercado_pago") &&
+    (!rail || rail === "pix")
+  );
+}
+
+function getReadyMercadoPagoMethods(methods) {
+  return methods.filter(isMercadoPagoPixReady);
+}
+
+function productHasStock(product, quantity = 1) {
+  if (product?.inventory_tracked === false) return true;
+  return Number(product?.stock_quantity || 0) >= Math.max(1, Number(quantity || 1));
 }
 
 async function getProductByCode(guildId, productCode) {
@@ -402,11 +422,13 @@ async function callSalesInternalApi(action, cartId) {
 }
 
 async function handleMissingPayment(interaction) {
-  await interaction.reply({
-    flags: MessageFlags.Ephemeral,
-    content:
-      "Este servidor ainda nao ativou PIX via Mercado Pago. Peça para um administrador configurar em Vendas > Metodos de pagamento.",
-  });
+  const content =
+    "Este servidor ainda nao ativou PIX via Mercado Pago. Peca para um administrador configurar em Vendas > Metodos de pagamento.";
+  if (interaction.deferred || interaction.replied) {
+    await interaction.editReply(content).catch(() => null);
+    return;
+  }
+  await interaction.reply({ flags: MessageFlags.Ephemeral, content });
 }
 
 async function handleAddToCartInteraction(interaction) {
@@ -414,11 +436,6 @@ async function handleAddToCartInteraction(interaction) {
   const mode = parts?.[2];
   const productCode = normalizeProductCode(parts?.[3]);
   if (!productCode || (mode !== "add" && mode !== "missing_payment")) return false;
-
-  if (mode === "missing_payment") {
-    await handleMissingPayment(interaction);
-    return true;
-  }
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
@@ -432,8 +449,8 @@ async function handleAddToCartInteraction(interaction) {
   }
 
   const methods = await getActivePaymentMethods(guildId);
-  if (!methods.some((method) => method.method_key === "mercado_pago")) {
-    await interaction.editReply("PIX via Mercado Pago ainda nao esta ativo neste servidor.");
+  if (!getReadyMercadoPagoMethods(methods).length) {
+    await handleMissingPayment(interaction);
     return true;
   }
 
@@ -442,7 +459,7 @@ async function handleAddToCartInteraction(interaction) {
     await interaction.editReply("Produto indisponivel.");
     return true;
   }
-  if (Number(product.stock_quantity || 0) <= 0) {
+  if (!productHasStock(product, 1)) {
     await interaction.editReply("Produto sem estoque disponivel.");
     return true;
   }
@@ -508,11 +525,13 @@ async function handleQuantityButton(interaction, cartId, direction) {
   }
   const productResult = await supabase
     .from("guild_sales_products")
-    .select("stock_quantity")
+    .select("inventory_tracked, stock_quantity")
     .eq("id", item.product_id)
     .maybeSingle();
   const product = unwrap(productResult, "handleQuantityButton.product");
-  const stock = Math.max(1, Number(product?.stock_quantity || 1));
+  const stock = product?.inventory_tracked === false
+    ? 999
+    : Math.max(1, Number(product?.stock_quantity || 1));
   const current = Math.max(1, Number(item.quantity || 1));
   const nextQuantity =
     direction === "inc" ? Math.min(stock, current + 1) : Math.max(1, current - 1);
@@ -543,9 +562,9 @@ async function handleCheckoutButton(interaction, cartId) {
     return;
   }
   const methods = await getActivePaymentMethods(cart.guild_id);
-  const available = methods.filter((method) => method.method_key === "mercado_pago");
+  const available = getReadyMercadoPagoMethods(methods);
   if (!available.length) {
-    await interaction.reply({ flags: MessageFlags.Ephemeral, content: "Nenhum metodo de pagamento ativo." });
+    await interaction.reply({ flags: MessageFlags.Ephemeral, content: "Nenhum metodo de pagamento ativo com credenciais validas." });
     return;
   }
 
@@ -605,10 +624,15 @@ async function deliverApprovedCart(interaction, payload) {
   const deliveries = Array.isArray(payload.deliveries) ? payload.deliveries : [];
   const orderUrl = deliveryUrl(payload.cart.id);
   const user = interaction.user;
+  const receiptEmail =
+    typeof payload.user?.email === "string" && payload.user.email.trim()
+      ? payload.user.email.trim()
+      : null;
   const dmLines = [
     `Compra aprovada no servidor ${interaction.guild?.name || "Discord"}.`,
     `Entrega no site: ${orderUrl}`,
-  ];
+    receiptEmail ? `Comprovante enviado para: ${receiptEmail}` : null,
+  ].filter(Boolean);
 
   for (const delivery of deliveries) {
     if (delivery.deliveryMethod === "discord_dm" && delivery.message) {
@@ -660,7 +684,16 @@ async function handlePaymentSelect(interaction) {
   if (!cartId || interaction.values?.[0] !== "mercado_pago") return false;
 
   await interaction.deferUpdate();
-  const payload = await callSalesInternalApi("create_pix_payment", cartId);
+  let payload;
+  try {
+    payload = await callSalesInternalApi("create_pix_payment", cartId);
+  } catch (error) {
+    await interaction.followUp({
+      flags: MessageFlags.Ephemeral,
+      content: error instanceof Error ? error.message : "Nao foi possivel gerar o pagamento.",
+    }).catch(() => null);
+    return true;
+  }
   if (payload.cart?.status === "delivered" || payload.cart?.status === "delivery_failed") {
     await deliverApprovedCart(interaction, payload);
     return true;
