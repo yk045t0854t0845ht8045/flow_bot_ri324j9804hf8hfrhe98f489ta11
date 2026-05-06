@@ -4,6 +4,8 @@
 alter table public.guild_sales_carts
 add column if not exists customer_email text null,
 add column if not exists customer_name text null,
+add column if not exists delivery_started_at timestamptz null,
+add column if not exists delivery_lock_error text not null default '',
 add column if not exists receipt_email_sent_at timestamptz null,
 add column if not exists receipt_email_error text not null default '',
 add column if not exists discord_notification_sent_at timestamptz null,
@@ -12,6 +14,32 @@ add column if not exists discord_notification_error text not null default '';
 create index if not exists idx_guild_sales_carts_receipt_pending
 on public.guild_sales_carts (status, paid_at)
 where receipt_email_sent_at is null;
+
+create index if not exists idx_guild_sales_carts_delivery_pending
+on public.guild_sales_carts (status, paid_at)
+where delivery_started_at is null;
+
+with ranked_open_carts as (
+  select
+    id,
+    row_number() over (
+      partition by guild_id, discord_user_id
+      order by created_at desc, id desc
+    ) as rn
+  from public.guild_sales_carts
+  where status in ('link_required', 'open')
+)
+update public.guild_sales_carts cart
+set
+  status = 'cancelled',
+  cancelled_at = coalesce(cart.cancelled_at, timezone('utc', now()))
+from ranked_open_carts ranked
+where cart.id = ranked.id
+  and ranked.rn > 1;
+
+create unique index if not exists idx_guild_sales_carts_one_open_per_user
+on public.guild_sales_carts (guild_id, discord_user_id)
+where status in ('link_required', 'open');
 
 alter table public.guild_sales_order_deliveries
 add column if not exists cart_item_id uuid null references public.guild_sales_cart_items(id) on delete set null,
@@ -175,6 +203,39 @@ after insert or update or delete on public.guild_sales_stock_items
 for each row
 execute function public.tr_sync_guild_sales_product_stock_quantity();
 
+create or replace function public.acquire_guild_sales_cart_delivery_lock(
+  p_cart_id uuid
+)
+returns public.guild_sales_carts
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_cart public.guild_sales_carts%rowtype;
+begin
+  update public.guild_sales_carts
+  set
+    delivery_started_at = timezone('utc', now()),
+    delivery_lock_error = ''
+  where id = p_cart_id
+    and (
+      delivery_started_at is null
+      or delivery_started_at < timezone('utc', now()) - interval '10 minutes'
+    )
+    and delivered_at is null
+    and status in ('paid', 'payment_pending')
+  returning *
+  into v_cart;
+
+  if not found then
+    return null;
+  end if;
+
+  return v_cart;
+end;
+$$;
+
 select public.sync_guild_sales_product_stock_quantity(product.guild_id, product.product_id)
 from (
   select distinct guild_id, product_id
@@ -184,3 +245,4 @@ from (
 comment on table public.guild_sales_order_events is 'Auditoria de eventos do pedido de venda Discord: pagamento, entrega, recibo e falhas operacionais.';
 comment on function public.claim_guild_sales_stock_item(text, uuid, text) is 'Reserva atomicamente uma unidade disponivel de estoque digital para entrega.';
 comment on function public.sync_guild_sales_product_stock_quantity(text, uuid) is 'Recalcula o estoque publicado do produto a partir das unidades digitais disponiveis.';
+comment on function public.acquire_guild_sales_cart_delivery_lock(uuid) is 'Adquire trava idempotente para impedir entrega duplicada do mesmo carrinho.';

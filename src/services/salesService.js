@@ -23,7 +23,20 @@ const supabase = createClient(env.supabaseUrl, env.supabaseServiceRoleKey, {
 const PRODUCT_SELECT =
   "id, guild_id, title, description, media_urls, price_amount, inventory_tracked, stock_quantity, sku, status, active, published_point_of_sale, published_virtual_store";
 const CART_SELECT =
-  "id, guild_id, discord_user_id, discord_channel_id, auth_user_id, status, subtotal_amount, total_amount, provider_payment_id, provider_status, provider_ticket_url, provider_qr_code, provider_qr_base64";
+  "id, guild_id, discord_user_id, discord_channel_id, auth_user_id, status, subtotal_amount, total_amount, provider_payment_id, provider_status, provider_ticket_url, provider_qr_code, provider_qr_base64, discord_notification_sent_at";
+
+const COMPONENT_TYPE = {
+  ACTION_ROW: 1,
+  BUTTON: 2,
+  STRING_SELECT: 3,
+  SECTION: 9,
+  TEXT_DISPLAY: 10,
+  THUMBNAIL: 11,
+  MEDIA_GALLERY: 12,
+  SEPARATOR: 14,
+  CONTAINER: 17,
+};
+const COMPONENTS_V2_FLAG = MessageFlags.IsComponentsV2 || 32768;
 
 function unwrap(result, operation) {
   if (result.error) {
@@ -59,6 +72,64 @@ function formatMoney(value) {
     style: "currency",
     currency: "BRL",
   }).format(Number(value || 0));
+}
+
+function truncateText(value, maxLength) {
+  const text = String(value || "").trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+}
+
+function textDisplay(content) {
+  return {
+    type: COMPONENT_TYPE.TEXT_DISPLAY,
+    content: truncateText(content, 3900),
+  };
+}
+
+function separator() {
+  return {
+    type: COMPONENT_TYPE.SEPARATOR,
+    divider: true,
+    spacing: 1,
+  };
+}
+
+function actionRow(components) {
+  return {
+    type: COMPONENT_TYPE.ACTION_ROW,
+    components,
+  };
+}
+
+function button({ customId, label, style = ButtonStyle.Secondary, url, disabled = false }) {
+  return {
+    type: COMPONENT_TYPE.BUTTON,
+    style,
+    label: truncateText(label, 80),
+    disabled,
+    ...(url ? { url } : { custom_id: customId }),
+  };
+}
+
+function selectMenu({ customId, placeholder, options }) {
+  return {
+    type: COMPONENT_TYPE.STRING_SELECT,
+    custom_id: customId,
+    placeholder,
+    min_values: 1,
+    max_values: 1,
+    options,
+  };
+}
+
+function v2Message(components, extra = {}) {
+  return {
+    flags: COMPONENTS_V2_FLAG,
+    allowedMentions: { parse: [] },
+    components,
+    ...extra,
+  };
 }
 
 function sanitizeChannelName(value) {
@@ -147,15 +218,21 @@ async function getAvailableStockQuantity(guildId, productId, fallbackQuantity = 
       result.error.code === "PGRST205" ||
       message.includes("guild_sales_stock_items")
     ) {
-      return Math.max(0, Number(fallbackQuantity || 0));
+      return {
+        quantity: Math.max(0, Number(fallbackQuantity || 0)),
+        reliable: false,
+      };
     }
     throw new Error(`[Supabase] Falha em "getAvailableStockQuantity": ${result.error.message}`);
   }
 
-  return (result.data || []).reduce(
-    (sum, item) => sum + Math.max(0, Number(item.quantity || 0)),
-    0,
-  );
+  return {
+    quantity: (result.data || []).reduce(
+      (sum, item) => sum + Math.max(0, Number(item.quantity || 0)),
+      0,
+    ),
+    reliable: true,
+  };
 }
 
 async function productHasEffectiveStock(product, quantity = 1) {
@@ -166,11 +243,13 @@ async function productHasEffectiveStock(product, quantity = 1) {
     product.id,
     storedQuantity,
   );
-  const effectiveQuantity = Math.max(storedQuantity, availableQuantity);
-  if (availableQuantity !== storedQuantity) {
+  const effectiveQuantity = availableQuantity.reliable
+    ? availableQuantity.quantity
+    : storedQuantity;
+  if (availableQuantity.reliable && availableQuantity.quantity !== storedQuantity) {
     const repairResult = await supabase
       .from("guild_sales_products")
-      .update({ stock_quantity: availableQuantity })
+      .update({ stock_quantity: availableQuantity.quantity })
       .eq("guild_id", product.guild_id)
       .eq("id", product.id);
     if (repairResult.error) {
@@ -203,6 +282,50 @@ async function getCart(cartId) {
   return unwrap(result, "getCart") || null;
 }
 
+async function getOpenCartForUser(guildId, discordUserId) {
+  const result = await supabase
+    .from("guild_sales_carts")
+    .select(CART_SELECT)
+    .eq("guild_id", guildId)
+    .eq("discord_user_id", discordUserId)
+    .in("status", ["link_required", "open"])
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  return unwrap(result, "getOpenCartForUser") || null;
+}
+
+function cartMessageCustomIdExists(components, cartId) {
+  if (!Array.isArray(components)) return false;
+  for (const component of components) {
+    if (!component || typeof component !== "object") continue;
+    const customId = component.customId || component.custom_id;
+    if (typeof customId === "string" && customId.includes(`:${cartId}`)) return true;
+    if (cartMessageCustomIdExists(component.components, cartId)) return true;
+    if (component.accessory && cartMessageCustomIdExists([component.accessory], cartId)) return true;
+  }
+  return false;
+}
+
+async function replaceCartChannelMessage(channel, cart, options = {}) {
+  if (!channel?.send) return null;
+  const items = await getCartItems(cart.id);
+  const messages = await channel.messages?.fetch({ limit: 25 }).catch(() => null);
+  if (messages) {
+    await Promise.all(
+      Array.from(messages.values())
+        .filter((message) => message.author?.bot && cartMessageCustomIdExists(message.components, cart.id))
+        .map((message) => message.delete().catch(() => null)),
+    );
+  }
+  return channel.send(buildCartMessagePayload({
+    cart,
+    items,
+    linked: Boolean(cart.auth_user_id),
+    linkUrl: options.linkUrl,
+  }));
+}
+
 async function getCartItems(cartId) {
   const result = await supabase
     .from("guild_sales_cart_items")
@@ -231,8 +354,7 @@ async function updateCartTotals(cartId, items) {
   return unwrap(result, "updateCartTotals");
 }
 
-function resolveFirstItemProduct(items) {
-  const item = items[0] || null;
+function resolveItemProduct(item) {
   const snapshot = item?.product_snapshot && typeof item.product_snapshot === "object"
     ? item.product_snapshot
     : {};
@@ -245,83 +367,77 @@ function resolveFirstItemProduct(items) {
   };
 }
 
-function buildCartEmbed({ cart, items, linked }) {
-  const product = resolveFirstItemProduct(items);
-  const quantity = Math.max(1, Math.floor(Number(items[0]?.quantity || 1)));
-  const total = Number(cart.total_amount || quantity * product.priceAmount);
-  return new EmbedBuilder()
-    .setColor(linked ? 0x7ce2a0 : 0xf1f1f1)
-    .setTitle(linked ? "Carrinho vinculado" : "Vincule sua compra")
-    .setDescription(
-      linked
-        ? "A conta Flowdesk foi confirmada. Ajuste a quantidade e prossiga para o PIX."
-        : "Antes do pagamento, confirme no site que este carrinho pertence a sua conta Flowdesk.",
-    )
-    .addFields(
-      {
-        name: "Produto",
-        value: `${product.title}\n${product.sku || "SKU automatico"} - ${formatMoney(product.priceAmount)}`,
-      },
-      {
-        name: "Quantidade",
-        value: `${quantity} un.`,
-        inline: true,
-      },
-      {
-        name: "Total",
-        value: formatMoney(total),
-        inline: true,
-      },
-    )
-    .setFooter({ text: "Flowdesk Vendas" });
+function buildCartItemsMarkdown(items) {
+  if (!items.length) return "Carrinho vazio.";
+  return items
+    .map((item, index) => {
+      const product = resolveItemProduct(item);
+      const quantity = Math.max(1, Math.floor(Number(item.quantity || 1)));
+      const total = Number(item.total_amount || quantity * product.priceAmount);
+      return [
+        `**${index + 1}. ${truncateText(product.title, 80)}**`,
+        `${product.sku || product.code || "SKU automatico"} - ${quantity} un. x ${formatMoney(product.priceAmount)} = **${formatMoney(total)}**`,
+      ].join("\n");
+    })
+    .join("\n\n");
 }
 
-function buildLinkComponents(cartId, linkUrl) {
-  return [
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setStyle(ButtonStyle.Link)
-        .setLabel("Vincular compra")
-        .setURL(linkUrl),
-      new ButtonBuilder()
-        .setStyle(ButtonStyle.Secondary)
-        .setCustomId(`sales:cart:linked:${cartId}`)
-        .setLabel("Ja vinculei"),
-    ),
+function buildCartMessagePayload({ cart, items, linked, linkUrl }) {
+  const title = linked ? "## Carrinho vinculado" : "## Vincule sua compra";
+  const subtitle = linked
+    ? "A conta Flowdesk foi confirmada. Ajuste as quantidades e prossiga para o pagamento."
+    : "Antes do pagamento, confirme no site que este carrinho pertence a sua conta Flowdesk.";
+  const controlsDisabled = ["payment_pending", "paid", "delivered", "delivery_failed"].includes(cart.status);
+  const components = [
+    {
+      type: COMPONENT_TYPE.CONTAINER,
+      accent_color: linked ? 0x7ce2a0 : 0xf1f1f1,
+      components: [
+        textDisplay(`${title}\n${subtitle}`),
+        separator(),
+        textDisplay(buildCartItemsMarkdown(items)),
+        separator(),
+        textDisplay(`**Total:** ${formatMoney(cart.total_amount)}`),
+      ],
+    },
   ];
-}
 
-function buildCartControlComponents(cartId, paymentPending = false) {
-  if (paymentPending) {
-    return [
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setStyle(ButtonStyle.Primary)
-          .setCustomId(`sales:cart:check:${cartId}`)
-          .setLabel("Verificar pagamento"),
-      ),
-    ];
+  if (!linked && linkUrl) {
+    components.push(actionRow([
+      button({ label: "Vincular compra", style: ButtonStyle.Link, url: linkUrl }),
+      button({ customId: `sales:cart:linked:${cart.id}`, label: "Ja vinculei" }),
+    ]));
+    return v2Message(components);
   }
 
-  return [
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setStyle(ButtonStyle.Secondary)
-        .setCustomId(`sales:cart:qty_dec:${cartId}`)
-        .setLabel("-"),
-      new ButtonBuilder()
-        .setStyle(ButtonStyle.Secondary)
-        .setCustomId(`sales:cart:qty_inc:${cartId}`)
-        .setLabel("+"),
-      new ButtonBuilder()
-        .setStyle(ButtonStyle.Success)
-        .setCustomId(`sales:cart:checkout:${cartId}`)
-        .setLabel("Prosseguir"),
-    ),
-  ];
+  if (linked && !controlsDisabled) {
+    for (const item of items.slice(0, 5)) {
+      const product = resolveItemProduct(item);
+      components.push(actionRow([
+        button({ customId: `sales:cart:qty_dec:${cart.id}:${item.id}`, label: "-" }),
+        button({
+          customId: `sales:cart:item:${cart.id}:${item.id}`,
+          label: `${truncateText(product.title, 36)} (${Math.max(1, Number(item.quantity || 1))})`,
+          disabled: true,
+        }),
+        button({ customId: `sales:cart:qty_inc:${cart.id}:${item.id}`, label: "+" }),
+      ]));
+    }
+    components.push(actionRow([
+      button({ customId: `sales:cart:checkout:${cart.id}`, label: "Prosseguir", style: ButtonStyle.Success }),
+    ]));
+  }
+
+  if (cart.status === "payment_pending") {
+    components.push(actionRow([
+      button({ customId: `sales:cart:check:${cart.id}`, label: "Atualizar status", style: ButtonStyle.Primary }),
+    ]));
+  }
+
+  return v2Message(components);
 }
 
-function buildPaymentSelectComponents(cartId, methods) {
+function buildPaymentSelectionPayload(cart, items, methods) {
   const options = methods
     .filter((method) => method.method_key === "mercado_pago")
     .map((method) => ({
@@ -330,14 +446,27 @@ function buildPaymentSelectComponents(cartId, methods) {
       value: method.method_key,
     }));
 
-  return [
-    new ActionRowBuilder().addComponents(
-      new StringSelectMenuBuilder()
-        .setCustomId(`sales:cart:payment:${cartId}`)
-        .setPlaceholder("Selecione o metodo de pagamento")
-        .addOptions(options),
-    ),
-  ];
+  return v2Message([
+    {
+      type: COMPONENT_TYPE.CONTAINER,
+      accent_color: 0x8fdbff,
+      components: [
+        textDisplay("## Escolha o metodo de pagamento\nAs quantidades foram bloqueadas para evitar alteracoes enquanto voce escolhe o pagamento."),
+        separator(),
+        textDisplay(`${buildCartItemsMarkdown(items)}\n\n**Total:** ${formatMoney(cart.total_amount)}`),
+      ],
+    },
+    actionRow([
+      selectMenu({
+        customId: `sales:cart:payment:${cart.id}`,
+        placeholder: "Selecione o metodo de pagamento",
+        options,
+      }),
+    ]),
+    actionRow([
+      button({ customId: `sales:cart:back:${cart.id}`, label: "Voltar" }),
+    ]),
+  ]);
 }
 
 async function refreshCartMessage(message, cartId, options = {}) {
@@ -345,15 +474,12 @@ async function refreshCartMessage(message, cartId, options = {}) {
   if (!cart) return;
   const items = await getCartItems(cartId);
   const linked = Boolean(cart.auth_user_id);
-  const paymentPending = cart.status === "payment_pending";
-  await message.edit({
-    embeds: [buildCartEmbed({ cart, items, linked })],
-    components: linked
-      ? buildCartControlComponents(cart.id, paymentPending)
-      : options.linkUrl
-        ? buildLinkComponents(cart.id, options.linkUrl)
-        : [],
-  }).catch(() => null);
+  await message.edit(buildCartMessagePayload({
+    cart,
+    items,
+    linked,
+    linkUrl: options.linkUrl,
+  })).catch(() => null);
 }
 
 async function createCartChannel(interaction, settings) {
@@ -453,6 +579,75 @@ async function createCartRecord({ guildId, discordUserId, channelId, product }) 
   return { cart, token };
 }
 
+async function createCheckoutLinkToken(cart) {
+  const token = createCheckoutToken();
+  const linkResult = await supabase
+    .from("guild_sales_checkout_links")
+    .insert({
+      cart_id: cart.id,
+      guild_id: cart.guild_id,
+      discord_user_id: cart.discord_user_id,
+      token_hash: hashCheckoutToken(token),
+      status: "pending",
+      expires_at: new Date(Date.now() + 30 * 60_000).toISOString(),
+    })
+    .select("id")
+    .single();
+  unwrap(linkResult, "createCheckoutLinkToken");
+  return token;
+}
+
+function buildProductSnapshot(product, amount) {
+  return {
+    code: buildProductCode(product.id),
+    title: product.title,
+    sku: product.sku || "",
+    priceAmount: amount,
+    stockQuantity: Number(product.stock_quantity || 0),
+    mediaUrls: Array.isArray(product.media_urls) ? product.media_urls : [],
+  };
+}
+
+async function addProductToCart(cart, product) {
+  const amount = Number(product.price_amount || 0);
+  const items = await getCartItems(cart.id);
+  const existing = items.find((item) => item.product_id === product.id);
+  const currentQuantity = Math.max(0, Number(existing?.quantity || 0));
+  if (!(await productHasEffectiveStock(product, currentQuantity + 1))) {
+    throw new Error("Produto sem estoque disponivel para adicionar outra unidade.");
+  }
+
+  if (existing) {
+    const nextQuantity = currentQuantity + 1;
+    const updateResult = await supabase
+      .from("guild_sales_cart_items")
+      .update({
+        quantity: nextQuantity,
+        unit_price_amount: amount,
+        total_amount: Number((nextQuantity * amount).toFixed(2)),
+        product_snapshot: buildProductSnapshot(product, amount),
+      })
+      .eq("id", existing.id);
+    unwrap(updateResult, "addProductToCart.updateItem");
+  } else {
+    const insertResult = await supabase
+      .from("guild_sales_cart_items")
+      .insert({
+        cart_id: cart.id,
+        guild_id: cart.guild_id,
+        product_id: product.id,
+        quantity: 1,
+        unit_price_amount: amount,
+        total_amount: amount,
+        product_snapshot: buildProductSnapshot(product, amount),
+      });
+    unwrap(insertResult, "addProductToCart.insertItem");
+  }
+
+  const updatedItems = await getCartItems(cart.id);
+  return updateCartTotals(cart.id, updatedItems);
+}
+
 async function callSalesInternalApi(action, cartId) {
   if (!env.salesInternalApiToken) {
     throw new Error("SALES_INTERNAL_API_TOKEN/CRON_SECRET nao configurado para o bot.");
@@ -516,6 +711,31 @@ async function handleAddToCartInteraction(interaction) {
     return true;
   }
 
+  const existingCart = await getOpenCartForUser(guildId, interaction.user.id);
+  if (existingCart) {
+    const updatedCart = await addProductToCart(existingCart, product);
+    let channel = interaction.guild.channels.cache.get(existingCart.discord_channel_id);
+    if (!channel && existingCart.discord_channel_id) {
+      channel = await interaction.guild.channels.fetch(existingCart.discord_channel_id).catch(() => null);
+    }
+    if (!channel) {
+      channel = await createCartChannel(interaction, settings);
+      const updateResult = await supabase
+        .from("guild_sales_carts")
+        .update({ discord_channel_id: channel.id })
+        .eq("id", existingCart.id)
+        .select(CART_SELECT)
+        .single();
+      Object.assign(updatedCart, unwrap(updateResult, "handleAddToCartInteraction.repairChannel"));
+    }
+    const token = updatedCart.auth_user_id ? null : await createCheckoutLinkToken(updatedCart);
+    await replaceCartChannelMessage(channel, updatedCart, {
+      linkUrl: token ? checkoutUrl(token) : null,
+    });
+    await interaction.editReply(`Produto adicionado ao carrinho aberto: ${channel}`);
+    return true;
+  }
+
   const channel = await createCartChannel(interaction, settings);
   const { cart, token } = await createCartRecord({
     guildId,
@@ -527,9 +747,7 @@ async function handleAddToCartInteraction(interaction) {
   const linkUrl = checkoutUrl(token);
 
   await channel.send({
-    content: `<@${interaction.user.id}>`,
-    embeds: [buildCartEmbed({ cart, items, linked: false })],
-    components: buildLinkComponents(cart.id, linkUrl),
+    ...buildCartMessagePayload({ cart, items, linked: false, linkUrl }),
     allowedMentions: { users: [interaction.user.id] },
   });
 
@@ -554,7 +772,7 @@ async function handleLinkedButton(interaction, cartId) {
   await refreshCartMessage(interaction.message, cartId);
 }
 
-async function handleQuantityButton(interaction, cartId, direction) {
+async function handleQuantityButton(interaction, cartId, direction, itemId = null) {
   const cart = await getCart(cartId);
   if (!cart || cart.discord_user_id !== interaction.user.id) {
     await interaction.reply({ flags: MessageFlags.Ephemeral, content: "Carrinho nao encontrado." });
@@ -570,26 +788,32 @@ async function handleQuantityButton(interaction, cartId, direction) {
   }
 
   const items = await getCartItems(cartId);
-  const item = items[0];
+  const item = itemId
+    ? items.find((entry) => entry.id === itemId)
+    : items[0];
   if (!item) {
     await interaction.reply({ flags: MessageFlags.Ephemeral, content: "Carrinho vazio." });
     return;
   }
   const productResult = await supabase
     .from("guild_sales_products")
-    .select("inventory_tracked, stock_quantity")
+    .select(PRODUCT_SELECT)
     .eq("id", item.product_id)
     .maybeSingle();
   const product = unwrap(productResult, "handleQuantityButton.product");
+  const availableStock = product?.inventory_tracked === false
+    ? { quantity: 999, reliable: true }
+    : await getAvailableStockQuantity(cart.guild_id, item.product_id, product?.stock_quantity || 1);
   const stock = product?.inventory_tracked === false
     ? 999
-    : Math.max(
-        1,
-        await getAvailableStockQuantity(cart.guild_id, item.product_id, product?.stock_quantity || 1),
-      );
+    : Math.max(1, availableStock.quantity);
   const current = Math.max(1, Number(item.quantity || 1));
   const nextQuantity =
     direction === "inc" ? Math.min(stock, current + 1) : Math.max(1, current - 1);
+  if (direction === "inc" && !(await productHasEffectiveStock(product, nextQuantity))) {
+    await interaction.reply({ flags: MessageFlags.Ephemeral, content: "Estoque maximo atingido para este produto." });
+    return;
+  }
   const unit = Number(item.unit_price_amount || 0);
 
   await supabase
@@ -623,114 +847,217 @@ async function handleCheckoutButton(interaction, cartId) {
     return;
   }
 
-  await interaction.reply({
-    flags: MessageFlags.Ephemeral,
-    content: "Escolha o metodo ativo para gerar o pagamento.",
-    components: buildPaymentSelectComponents(cartId, available),
-  });
+  const items = await getCartItems(cartId);
+  if (!items.length) {
+    await interaction.reply({ flags: MessageFlags.Ephemeral, content: "Carrinho vazio." });
+    return;
+  }
+
+  await interaction.update(buildPaymentSelectionPayload(cart, items, available));
 }
 
 function buildPixPaymentMessage(cartId, payment) {
-  const components = [
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setStyle(ButtonStyle.Primary)
-        .setCustomId(`sales:cart:check:${cartId}`)
-        .setLabel("Verificar pagamento"),
-      ...(payment.ticketUrl
-        ? [
-            new ButtonBuilder()
-              .setStyle(ButtonStyle.Link)
-              .setLabel("Abrir Mercado Pago")
-              .setURL(payment.ticketUrl),
-          ]
-        : []),
-    ),
-  ];
-
-  const embed = new EmbedBuilder()
-    .setColor(0x8fdbff)
-    .setTitle("PIX gerado")
-    .setDescription("Pague com o QR Code ou copia e cola. Depois clique em Verificar pagamento.")
-    .addFields(
-      { name: "Valor", value: formatMoney(payment.amount), inline: true },
-      { name: "Status", value: payment.status || "pending", inline: true },
-    );
-
   const files = [];
+  const body = [
+    "## PIX gerado",
+    "Pague com o QR Code ou copia e cola. O status sera atualizado automaticamente aqui no carrinho.",
+    "",
+    `**Valor:** ${formatMoney(payment.amount)}`,
+    `**Status:** ${payment.status || "pending"}`,
+  ];
   if (payment.qrBase64) {
     const raw = String(payment.qrBase64).replace(/^data:image\/png;base64,/i, "");
     const buffer = Buffer.from(raw, "base64");
     files.push(new AttachmentBuilder(buffer, { name: "pix.png" }));
-    embed.setImage("attachment://pix.png");
   }
 
   if (payment.qrCode) {
-    embed.addFields({
-      name: "PIX copia e cola",
-      value: `\`\`\`${String(payment.qrCode).slice(0, 990)}\`\`\``,
+    body.push("", "**PIX copia e cola**", `\`\`\`${String(payment.qrCode).slice(0, 990)}\`\`\``);
+  }
+
+  const containerComponents = [textDisplay(body.join("\n"))];
+  if (payment.qrBase64) {
+    containerComponents.push({
+      type: COMPONENT_TYPE.MEDIA_GALLERY,
+      items: [{ media: { url: "attachment://pix.png" } }],
     });
   }
 
-  return { embeds: [embed], components, files };
+  const components = [
+    {
+      type: COMPONENT_TYPE.CONTAINER,
+      accent_color: 0x8fdbff,
+      components: containerComponents,
+    },
+    actionRow([
+      button({ customId: `sales:cart:check:${cartId}`, label: "Atualizar status", style: ButtonStyle.Primary }),
+      ...(payment.ticketUrl
+        ? [button({ label: "Abrir Mercado Pago", style: ButtonStyle.Link, url: payment.ticketUrl })]
+        : []),
+    ]),
+  ];
+
+  return v2Message(components, { files });
 }
 
 async function deliverApprovedCart(interaction, payload) {
   const deliveries = Array.isArray(payload.deliveries) ? payload.deliveries : [];
   const orderUrl = deliveryUrl(payload.cart.id);
   const user = interaction.user;
+  const lockResult = await supabase
+    .from("guild_sales_carts")
+    .update({
+      discord_notification_sent_at: new Date().toISOString(),
+      discord_notification_error: "",
+    })
+    .eq("id", payload.cart.id)
+    .is("discord_notification_sent_at", null)
+    .select("id")
+    .maybeSingle();
+  if (lockResult.error) {
+    console.warn("[salesService] Falha ao travar notificacao de entrega.", lockResult.error.message);
+  }
+  if (!lockResult.data && !lockResult.error) {
+    return false;
+  }
+
   const receiptEmail =
     typeof payload.user?.email === "string" && payload.user.email.trim()
       ? payload.user.email.trim()
       : null;
-  const dmLines = [
-    `Compra aprovada no servidor ${interaction.guild?.name || "Discord"}.`,
-    `Entrega no site: ${orderUrl}`,
-    receiptEmail ? `Comprovante enviado para: ${receiptEmail}` : null,
-  ].filter(Boolean);
+  const emailDeliveryCount = deliveries.filter(
+    (delivery) => delivery.deliveryMethod === "email" && delivery.status !== "failed",
+  ).length;
+  const discordDeliveryCount = deliveries.filter(
+    (delivery) => delivery.deliveryMethod !== "email" || delivery.status === "failed",
+  ).length;
+  await user.send(v2Message([
+    {
+      type: COMPONENT_TYPE.CONTAINER,
+      accent_color: 0x7ce2a0,
+      components: [
+        textDisplay([
+          "## Pagamento aprovado",
+          `Compra aprovada no servidor ${interaction.guild?.name || "Discord"}.`,
+          receiptEmail ? `Comprovante enviado para: ${receiptEmail}.` : null,
+          emailDeliveryCount
+            ? `${emailDeliveryCount} entrega(s) por email foram enviadas para o email cadastrado.`
+            : null,
+          discordDeliveryCount
+            ? `${discordDeliveryCount} entrega(s) seguem abaixo em mensagens separadas.`
+            : null,
+        ].filter(Boolean).join("\n")),
+      ],
+    },
+    actionRow([
+      button({ label: "Abrir pedido", style: ButtonStyle.Link, url: orderUrl }),
+    ]),
+  ])).catch(() => null);
 
-  for (const delivery of deliveries) {
-    if (delivery.deliveryMethod === "discord_dm" && delivery.message) {
-      dmLines.push("", delivery.message);
+  for (const [index, delivery] of deliveries.entries()) {
+    if (delivery.deliveryMethod === "email" && delivery.status !== "failed") {
+      continue;
     }
+    await user.send(v2Message([
+      {
+        type: COMPONENT_TYPE.CONTAINER,
+        accent_color: delivery.status === "failed" ? 0xffb86b : 0x7ce2a0,
+        components: [
+          textDisplay([
+            `## Entrega ${index + 1}/${deliveries.length}`,
+            `**${delivery.productTitle || "Produto"}**`,
+            delivery.status === "failed"
+              ? (delivery.message || "Entrega pendente. Abra um ticket com o comprovante.")
+              : (delivery.message || "Entrega disponivel pelo link do pedido."),
+          ].join("\n").slice(0, 3900)),
+        ],
+      },
+      actionRow([
+        button({ label: "Abrir pedido", style: ButtonStyle.Link, url: orderUrl }),
+      ]),
+    ])).catch(() => null);
   }
 
-  await user.send({
-    embeds: [
-      new EmbedBuilder()
-        .setColor(0x7ce2a0)
-        .setTitle("Pagamento aprovado")
-        .setDescription(dmLines.join("\n").slice(0, 3900)),
-    ],
-    components: [
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setStyle(ButtonStyle.Link)
-          .setLabel("Abrir entrega")
-          .setURL(orderUrl),
-      ),
-    ],
-  }).catch(() => null);
-
-  await interaction.channel?.send({
-    embeds: [
-      new EmbedBuilder()
-        .setColor(0x7ce2a0)
-        .setTitle("Pagamento aprovado")
-        .setDescription(
-          `Entrega liberada para <@${user.id}>. Tambem enviei o link por DM quando possivel.`,
+  await interaction.channel?.send(v2Message([
+    {
+      type: COMPONENT_TYPE.CONTAINER,
+      accent_color: 0x7ce2a0,
+      components: [
+        textDisplay(
+          `## Pagamento aprovado\nEntrega liberada para <@${user.id}>. Enviei ${deliveries.length || "as"} entrega(s) em mensagens separadas por DM quando possivel.`,
         ),
-    ],
-    components: [
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setStyle(ButtonStyle.Link)
-          .setLabel("Ver entrega")
-          .setURL(orderUrl),
-      ),
-    ],
+      ],
+    },
+    actionRow([
+      button({ label: "Ver entrega", style: ButtonStyle.Link, url: orderUrl }),
+    ]),
+  ], {
     allowedMentions: { users: [user.id] },
-  }).catch(() => null);
+  })).catch(() => null);
+
+  setTimeout(() => {
+    interaction.channel?.delete("Carrinho Flowdesk finalizado").catch(() => null);
+  }, 10_000);
+
+  return true;
+}
+
+function buildPaymentStatusPayload(cartId, payment, status) {
+  return v2Message([
+    {
+      type: COMPONENT_TYPE.CONTAINER,
+      accent_color: status === "delivered" || status === "delivery_failed" ? 0x7ce2a0 : 0x8fdbff,
+      components: [
+        textDisplay([
+          status === "delivered" || status === "delivery_failed"
+            ? "## Pagamento aprovado"
+            : "## Aguardando pagamento",
+          `**Valor:** ${formatMoney(payment?.amount || 0)}`,
+          `**Status:** ${status || payment?.status || "payment_pending"}`,
+          status === "delivered" || status === "delivery_failed"
+            ? "Entrega liberada. Este canal sera removido em alguns segundos."
+            : "Assim que o Mercado Pago aprovar, eu atualizo automaticamente.",
+        ].join("\n")),
+      ],
+    },
+    actionRow([
+      button({ customId: `sales:cart:check:${cartId}`, label: "Atualizar status", style: ButtonStyle.Primary }),
+      ...(payment?.ticketUrl
+        ? [button({ label: "Abrir Mercado Pago", style: ButtonStyle.Link, url: payment.ticketUrl })]
+        : []),
+    ]),
+  ]);
+}
+
+function startPaymentAutoSync(interaction, cartId, paymentMessage) {
+  const startedAt = Date.now();
+  const maxDurationMs = 30 * 60_000;
+  const intervalMs = 7_500;
+
+  const tick = async () => {
+    if (Date.now() - startedAt > maxDurationMs) return;
+    let payload;
+    try {
+      payload = await callSalesInternalApi("sync_payment", cartId);
+    } catch (error) {
+      console.warn("[salesService] Falha no auto sync do pagamento.", {
+        cartId,
+        error: error instanceof Error ? error.message : error,
+      });
+      setTimeout(tick, intervalMs);
+      return;
+    }
+
+    const status = payload.cart?.status || payload.payment?.status || "payment_pending";
+    await paymentMessage?.edit(buildPaymentStatusPayload(cartId, payload.payment, status)).catch(() => null);
+    if (status === "delivered" || status === "delivery_failed") {
+      await deliverApprovedCart(interaction, payload);
+      return;
+    }
+    setTimeout(tick, intervalMs);
+  };
+
+  setTimeout(tick, intervalMs);
 }
 
 async function handlePaymentSelect(interaction) {
@@ -754,8 +1081,17 @@ async function handlePaymentSelect(interaction) {
     return true;
   }
 
-  await interaction.channel?.send(buildPixPaymentMessage(cartId, payload.payment));
-  await refreshCartMessage(interaction.message, cartId);
+  await interaction.message?.edit(v2Message([
+    {
+      type: COMPONENT_TYPE.CONTAINER,
+      accent_color: 0x8fdbff,
+      components: [
+        textDisplay("## Pagamento gerado\nAs quantidades foram bloqueadas. Use o QR Code abaixo para pagar."),
+      ],
+    },
+  ])).catch(() => null);
+  const paymentMessage = await interaction.channel?.send(buildPixPaymentMessage(cartId, payload.payment));
+  startPaymentAutoSync(interaction, cartId, paymentMessage);
   return true;
 }
 
@@ -764,8 +1100,12 @@ async function handleCheckPaymentButton(interaction, cartId) {
   const payload = await callSalesInternalApi("sync_payment", cartId);
   const status = payload.cart?.status || payload.payment?.status || "payment_pending";
   if (status === "delivered" || status === "delivery_failed") {
-    await interaction.editReply("Pagamento aprovado. Entrega liberada.");
-    await deliverApprovedCart(interaction, payload);
+    const sent = await deliverApprovedCart(interaction, payload);
+    await interaction.editReply(
+      sent
+        ? "Pagamento aprovado. Entrega liberada."
+        : "Pagamento ja aprovado e entrega ja processada.",
+    );
     return;
   }
   await interaction.editReply(`Pagamento ainda nao aprovado. Status atual: ${status}.`);
@@ -783,15 +1123,20 @@ async function handleCartButtonInteraction(interaction) {
     return true;
   }
   if (action === "qty_dec") {
-    await handleQuantityButton(interaction, cartId, "dec");
+    await handleQuantityButton(interaction, cartId, "dec", parts[4]);
     return true;
   }
   if (action === "qty_inc") {
-    await handleQuantityButton(interaction, cartId, "inc");
+    await handleQuantityButton(interaction, cartId, "inc", parts[4]);
     return true;
   }
   if (action === "checkout") {
     await handleCheckoutButton(interaction, cartId);
+    return true;
+  }
+  if (action === "back") {
+    await interaction.deferUpdate();
+    await refreshCartMessage(interaction.message, cartId);
     return true;
   }
   if (action === "check") {
