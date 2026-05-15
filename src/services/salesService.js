@@ -7,8 +7,11 @@ const {
   ChannelType,
   EmbedBuilder,
   MessageFlags,
+  ModalBuilder,
   PermissionFlagsBits,
   StringSelectMenuBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } = require("discord.js");
 const { createClient } = require("@supabase/supabase-js");
 const { env } = require("../config/env");
@@ -23,7 +26,7 @@ const supabase = createClient(env.supabaseUrl, env.supabaseServiceRoleKey, {
 const PRODUCT_SELECT =
   "id, guild_id, title, description, media_urls, price_amount, inventory_tracked, stock_quantity, sku, status, active, published_point_of_sale, published_virtual_store";
 const CART_SELECT =
-  "id, guild_id, discord_user_id, discord_channel_id, auth_user_id, status, subtotal_amount, total_amount, provider_payment_id, provider_status, provider_ticket_url, provider_qr_code, provider_qr_base64, discord_notification_sent_at";
+  "id, guild_id, discord_user_id, discord_channel_id, auth_user_id, status, subtotal_amount, total_amount, discount_id, discount_code, discount_kind, discount_amount, discount_snapshot, provider_payment_id, provider_status, provider_ticket_url, provider_qr_code, provider_qr_base64, discord_notification_sent_at";
 
 const COMPONENT_TYPE = {
   ACTION_ROW: 1,
@@ -72,6 +75,21 @@ function formatMoney(value) {
     style: "currency",
     currency: "BRL",
   }).format(Number(value || 0));
+}
+
+function roundMoney(value) {
+  return Number(Math.max(0, Number(value || 0)).toFixed(2));
+}
+
+function normalizeDiscountCode(value) {
+  return String(value || "")
+    .trim()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
 }
 
 function truncateText(value, maxLength) {
@@ -159,7 +177,7 @@ function parseSalesCustomId(customId) {
 
 function isSalesComponentInteraction(interaction) {
   return (
-    (interaction.isButton?.() || interaction.isStringSelectMenu?.()) &&
+    (interaction.isButton?.() || interaction.isStringSelectMenu?.() || interaction.isModalSubmit?.()) &&
     String(interaction.customId || "").startsWith("sales:")
   );
 }
@@ -383,18 +401,81 @@ async function getCartItems(cartId) {
   return unwrap(result, "getCartItems") || [];
 }
 
-async function updateCartTotals(cartId, items) {
-  const total = items.reduce((sum, item) => {
+async function loadDiscountById(discountId) {
+  if (!discountId) return null;
+  const result = await supabase
+    .from("guild_sales_discounts")
+    .select("id, guild_id, kind, code, title, status, discount_type, discount_value, remaining_amount, minimum_order_amount, applies_to_all_products, product_ids, starts_at, expires_at")
+    .eq("id", discountId)
+    .maybeSingle();
+  if (result.error) return null;
+  return result.data || null;
+}
+
+function isDateWindowActive(startsAt, expiresAt) {
+  const now = Date.now();
+  if (startsAt) {
+    const starts = new Date(startsAt).getTime();
+    if (Number.isFinite(starts) && starts > now) return false;
+  }
+  if (expiresAt) {
+    const expires = new Date(expiresAt).getTime();
+    if (Number.isFinite(expires) && expires < now) return false;
+  }
+  return true;
+}
+
+function calculateItemsSubtotal(items) {
+  return roundMoney(items.reduce((sum, item) => {
     const quantity = Math.max(1, Math.floor(Number(item.quantity || 1)));
-    const unit = Number(item.unit_price_amount || 0);
-    return sum + quantity * unit;
-  }, 0);
-  const amount = Number(total.toFixed(2));
+    return sum + quantity * Number(item.unit_price_amount || 0);
+  }, 0));
+}
+
+function calculateDiscountAmount(items, discount) {
+  if (!discount || discount.status !== "active") return 0;
+  if (!isDateWindowActive(discount.starts_at, discount.expires_at)) return 0;
+  const subtotal = calculateItemsSubtotal(items);
+  if (subtotal < Number(discount.minimum_order_amount || 0)) return 0;
+  const eligibleProductIds = new Set(Array.isArray(discount.product_ids) ? discount.product_ids : []);
+  const eligibleSubtotal = discount.applies_to_all_products
+    ? subtotal
+    : roundMoney(items.reduce((sum, item) => {
+        if (!eligibleProductIds.has(item.product_id)) return sum;
+        const quantity = Math.max(1, Math.floor(Number(item.quantity || 1)));
+        return sum + quantity * Number(item.unit_price_amount || 0);
+      }, 0));
+  if (eligibleSubtotal <= 0) return 0;
+  if (discount.kind === "gift_card") {
+    return roundMoney(Math.min(eligibleSubtotal, Number(discount.remaining_amount || 0)));
+  }
+  if (discount.discount_type === "percent") {
+    return roundMoney(eligibleSubtotal * Math.min(100, Number(discount.discount_value || 0)) / 100);
+  }
+  return roundMoney(Math.min(eligibleSubtotal, Number(discount.discount_value || 0)));
+}
+
+async function updateCartTotals(cartId, items) {
+  const subtotal = calculateItemsSubtotal(items);
+  const currentCart = await getCart(cartId);
+  const discount = await loadDiscountById(currentCart?.discount_id);
+  const discountAmount = calculateDiscountAmount(items, discount);
+  const total = roundMoney(subtotal - discountAmount);
   const result = await supabase
     .from("guild_sales_carts")
     .update({
-      subtotal_amount: amount,
-      total_amount: amount,
+      subtotal_amount: subtotal,
+      total_amount: total,
+      discount_id: discountAmount > 0 ? discount.id : null,
+      discount_code: discountAmount > 0 ? discount.code : "",
+      discount_kind: discountAmount > 0 ? discount.kind : "",
+      discount_amount: discountAmount,
+      discount_snapshot: discountAmount > 0 ? {
+        id: discount.id,
+        code: discount.code,
+        title: discount.title,
+        kind: discount.kind,
+      } : {},
     })
     .eq("id", cartId)
     .select(CART_SELECT)
@@ -430,6 +511,19 @@ function buildCartItemsMarkdown(items) {
     .join("\n\n");
 }
 
+function buildCartTotalsMarkdown(cart) {
+  const subtotal = Number(cart.subtotal_amount || cart.total_amount || 0);
+  const discountAmount = Number(cart.discount_amount || 0);
+  if (discountAmount > 0) {
+    return [
+      `**Subtotal:** ${formatMoney(subtotal)}`,
+      `**Desconto (${cart.discount_code || "cupom/gift"}):** -${formatMoney(discountAmount)}`,
+      `**Total:** ${formatMoney(cart.total_amount)}`,
+    ].join("\n");
+  }
+  return `**Total:** ${formatMoney(cart.total_amount)}`;
+}
+
 function buildCartMessagePayload({ cart, items, linked, linkUrl }) {
   const title = linked ? "## Carrinho vinculado" : "## Vincule sua compra";
   const subtitle = linked
@@ -445,7 +539,7 @@ function buildCartMessagePayload({ cart, items, linked, linkUrl }) {
         separator(),
         textDisplay(buildCartItemsMarkdown(items)),
         separator(),
-        textDisplay(`**Total:** ${formatMoney(cart.total_amount)}`),
+        textDisplay(buildCartTotalsMarkdown(cart)),
       ],
     },
   ];
@@ -472,6 +566,7 @@ function buildCartMessagePayload({ cart, items, linked, linkUrl }) {
       ]));
     }
     components.push(actionRow([
+      button({ customId: `sales:cart:discount:${cart.id}`, label: "Adicionar Cupom ou Gift", style: ButtonStyle.Secondary }),
       button({ customId: `sales:cart:checkout:${cart.id}`, label: "Prosseguir", style: ButtonStyle.Success }),
     ]));
   }
@@ -501,7 +596,7 @@ function buildPaymentSelectionPayload(cart, items, methods) {
       components: [
         textDisplay("## Escolha o metodo de pagamento\nAs quantidades foram bloqueadas para evitar alteracoes enquanto voce escolhe o pagamento."),
         separator(),
-        textDisplay(`${buildCartItemsMarkdown(items)}\n\n**Total:** ${formatMoney(cart.total_amount)}`),
+        textDisplay(`${buildCartItemsMarkdown(items)}\n\n${buildCartTotalsMarkdown(cart)}`),
       ],
     },
     actionRow([
@@ -701,7 +796,7 @@ async function addProductToCart(cart, product) {
   return { cart: updatedCart, added: true, maxStockReached: false };
 }
 
-async function callSalesInternalApi(action, cartId) {
+async function callSalesInternalApi(action, cartId, extra = {}) {
   if (!env.salesInternalApiToken) {
     throw new Error("SALES_INTERNAL_API_TOKEN/CRON_SECRET nao configurado para o bot.");
   }
@@ -712,13 +807,65 @@ async function callSalesInternalApi(action, cartId) {
       "Content-Type": "application/json",
       Authorization: `Bearer ${env.salesInternalApiToken}`,
     },
-    body: JSON.stringify({ action, cartId }),
+    body: JSON.stringify({ action, cartId, ...extra }),
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok || !payload.ok) {
     throw new Error(payload.message || "Falha ao comunicar com checkout interno.");
   }
   return payload;
+}
+
+async function showDiscountModal(interaction, cartId) {
+  const cart = await getCart(cartId);
+  if (!cart || cart.discord_user_id !== interaction.user.id) {
+    await interaction.reply({ flags: MessageFlags.Ephemeral, content: "Carrinho nao encontrado." });
+    return;
+  }
+  if (!cart.auth_user_id) {
+    await interaction.reply({ flags: MessageFlags.Ephemeral, content: "Vincule a compra antes de adicionar cupom ou gift." });
+    return;
+  }
+  if (cart.provider_payment_id || cart.status === "payment_pending") {
+    await interaction.reply({ flags: MessageFlags.Ephemeral, content: "PIX ja foi gerado para este carrinho." });
+    return;
+  }
+
+  const modal = new ModalBuilder()
+    .setCustomId(`sales:cart:discount_submit:${cartId}`)
+    .setTitle("Adicionar cupom ou gift");
+  const codeInput = new TextInputBuilder()
+    .setCustomId("discount_code")
+    .setLabel("Codigo do cupom ou gift")
+    .setPlaceholder("Ex.: BEMVINDO10")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setMaxLength(64);
+  modal.addComponents(new ActionRowBuilder().addComponents(codeInput));
+  await interaction.showModal(modal);
+}
+
+async function handleDiscountModalSubmit(interaction, cartId) {
+  const code = normalizeDiscountCode(interaction.fields?.getTextInputValue("discount_code"));
+  if (!code) {
+    await interaction.reply({ flags: MessageFlags.Ephemeral, content: "Informe um codigo valido." });
+    return;
+  }
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  try {
+    await callSalesInternalApi("apply_discount", cartId, { code });
+    const cart = await getCart(cartId);
+    await interaction.editReply(
+      `Cupom/gift aplicado. Desconto: ${formatMoney(cart?.discount_amount || 0)}. Total: ${formatMoney(cart?.total_amount || 0)}.`,
+    );
+    const messages = await interaction.channel?.messages?.fetch({ limit: 10 }).catch(() => null);
+    const cartMessage = messages
+      ? Array.from(messages.values()).find((message) => message.author?.bot && cartMessageCustomIdExists(message.components, cartId))
+      : null;
+    if (cartMessage) await refreshCartMessage(cartMessage, cartId);
+  } catch (error) {
+    await interaction.editReply(error instanceof Error ? error.message : "Nao foi possivel aplicar cupom ou gift.");
+  }
 }
 
 async function handleMissingPayment(interaction) {
@@ -1192,6 +1339,14 @@ async function handleCartButtonInteraction(interaction) {
     await handleCheckoutButton(interaction, cartId);
     return true;
   }
+  if (action === "discount") {
+    await showDiscountModal(interaction, cartId);
+    return true;
+  }
+  if (action === "discount_submit") {
+    await handleDiscountModalSubmit(interaction, cartId);
+    return true;
+  }
   if (action === "back") {
     await interaction.deferUpdate();
     await refreshCartMessage(interaction.message, cartId);
@@ -1207,6 +1362,10 @@ async function handleCartButtonInteraction(interaction) {
 
 async function handleSalesInteraction(interaction) {
   if (!isSalesComponentInteraction(interaction)) return false;
+
+  if (interaction.isModalSubmit?.()) {
+    if (await handleCartButtonInteraction(interaction)) return true;
+  }
 
   if (interaction.isButton()) {
     if (await handleAddToCartInteraction(interaction)) return true;

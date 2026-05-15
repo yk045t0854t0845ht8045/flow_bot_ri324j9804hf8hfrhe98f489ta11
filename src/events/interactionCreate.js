@@ -87,6 +87,10 @@ module.exports = {
       }
 
       if (interaction.isModalSubmit()) {
+        if (isSalesComponentInteraction(interaction)) {
+          await handleSalesInteraction(interaction, client);
+          return;
+        }
         if (interaction.customId === CUSTOM_IDS.openTicketReasonModal) {
           await openTicketFromModalSubmit(interaction);
         }
