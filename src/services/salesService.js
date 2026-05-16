@@ -26,7 +26,7 @@ const supabase = createClient(env.supabaseUrl, env.supabaseServiceRoleKey, {
 const PRODUCT_SELECT =
   "id, guild_id, title, description, media_urls, price_amount, inventory_tracked, stock_quantity, sku, status, active, published_point_of_sale, published_virtual_store";
 const CART_SELECT =
-  "id, guild_id, discord_user_id, discord_channel_id, auth_user_id, status, subtotal_amount, total_amount, discount_id, discount_code, discount_kind, discount_amount, discount_snapshot, provider_payment_id, provider_status, provider_ticket_url, provider_qr_code, provider_qr_base64, discord_notification_sent_at";
+  "id, guild_id, discord_user_id, discord_channel_id, auth_user_id, status, subtotal_amount, total_amount, discount_id, discount_code, discount_kind, discount_amount, discount_snapshot, provider_payment_id, provider_status, provider_status_detail, provider_ticket_url, provider_qr_code, provider_qr_base64, payment_expires_at, discord_notification_sent_at";
 
 const COMPONENT_TYPE = {
   ACTION_ROW: 1,
@@ -1105,6 +1105,159 @@ function buildPixPaymentMessage(cartId, payment) {
   return v2Message(components, { files });
 }
 
+function isFinalUnpaidSalesStatus(status) {
+  return ["expired", "rejected", "cancelled", "canceled"].includes(
+    String(status || "").trim().toLowerCase(),
+  );
+}
+
+function resolveFinalPaymentPresentation(status, payment, cart) {
+  const normalizedStatus = String(status || cart?.status || payment?.status || "").trim().toLowerCase();
+  const providerStatus = String(
+    payment?.status || cart?.provider_status || "",
+  ).trim().toLowerCase();
+  const detail = String(
+    payment?.statusDetail ||
+      payment?.status_detail ||
+      cart?.provider_status_detail ||
+      "",
+  ).trim().toLowerCase();
+  const deadlineExpired =
+    normalizedStatus === "expired" ||
+    detail.includes("deadline") ||
+    detail.includes("expired") ||
+    detail.includes("expiration");
+  const refunded =
+    providerStatus === "refunded" ||
+    providerStatus === "charged_back" ||
+    detail.includes("refund") ||
+    detail.includes("reembols") ||
+    detail.includes("chargeback");
+
+  if (refunded) {
+    return {
+      title: "Pagamento reembolsado",
+      description:
+        "O Mercado Pago informou que esse pagamento foi reembolsado ou estornado. A compra nao sera entregue por este carrinho.",
+      color: 0xffb86b,
+      dm:
+        "Seu pagamento no carrinho do Discord foi reembolsado ou estornado pelo Mercado Pago. O canal sera fechado e a compra nao foi entregue.",
+    };
+  }
+  if (deadlineExpired) {
+    return {
+      title: "Pagamento indisponivel",
+      description:
+        "O prazo para pagar esse PIX acabou. O QR Code e o link do Mercado Pago foram desativados.",
+      color: 0xffb86b,
+      dm:
+        "O prazo para pagar o PIX do seu carrinho no Discord acabou. O canal sera fechado; crie um novo carrinho para tentar novamente.",
+    };
+  }
+  if (normalizedStatus === "rejected") {
+    return {
+      title: "Pagamento recusado",
+      description:
+        "O Mercado Pago recusou esse pagamento. O QR Code deste carrinho nao esta mais valido.",
+      color: 0xff6b6b,
+      dm:
+        "O Mercado Pago recusou o pagamento do seu carrinho no Discord. O canal sera fechado; tente novamente criando um novo pagamento.",
+    };
+  }
+  return {
+    title: "Pagamento cancelado",
+    description:
+      "Esse pagamento foi cancelado ou ficou indisponivel no Mercado Pago. O QR Code deste carrinho nao esta mais valido.",
+    color: 0xffb86b,
+    dm:
+      "O pagamento do seu carrinho no Discord foi cancelado ou ficou indisponivel no Mercado Pago. O canal sera fechado.",
+  };
+}
+
+function buildFinalUnpaidPaymentPayload(cartId, payment, status, cart) {
+  const presentation = resolveFinalPaymentPresentation(status, payment, cart);
+  return v2Message([
+    {
+      type: COMPONENT_TYPE.CONTAINER,
+      accent_color: presentation.color,
+      components: [
+        textDisplay([
+          `## ${presentation.title}`,
+          presentation.description,
+          "",
+          `**Valor:** ${formatMoney(payment?.amount || cart?.total_amount || 0)}`,
+          `**Status:** ${status || payment?.status || cart?.status || "indisponivel"}`,
+          "Este canal sera fechado em 20 segundos.",
+        ].join("\n")),
+      ],
+    },
+  ], { files: [], attachments: [] });
+}
+
+async function acquireFinalUnpaidPaymentNotificationLock(cart, status) {
+  const eventKey = `payment_final_unpaid_notified:${String(status || "final").toLowerCase()}`;
+  const result = await supabase
+    .from("guild_sales_order_events")
+    .insert({
+      cart_id: cart.id,
+      guild_id: cart.guild_id,
+      auth_user_id: cart.auth_user_id || null,
+      discord_user_id: cart.discord_user_id,
+      event_type: "payment_final_unpaid_notified",
+      event_key: eventKey,
+      event_payload: {
+        status,
+        providerStatus: cart.provider_status || null,
+        providerStatusDetail: cart.provider_status_detail || null,
+      },
+    })
+    .select("id")
+    .maybeSingle();
+
+  if (!result.error) return true;
+  if (result.error.code === "23505") return false;
+  const message = String(result.error.message || "").toLowerCase();
+  if (result.error.code === "42P01" || message.includes("guild_sales_order_events")) {
+    return true;
+  }
+  console.warn("[salesService] Falha ao travar notificacao final do pagamento.", result.error.message);
+  return true;
+}
+
+async function handleFinalUnpaidPayment(interaction, payload, paymentMessage) {
+  const cart = payload.cart || {};
+  const payment = payload.payment || {};
+  const status = cart.status || payment.status || "cancelled";
+  const presentation = resolveFinalPaymentPresentation(status, payment, cart);
+  const finalPayload = buildFinalUnpaidPaymentPayload(cart.id, payment, status, cart);
+
+  await paymentMessage?.edit(finalPayload).catch(() => null);
+  if (!paymentMessage) {
+    await interaction.channel?.send(finalPayload).catch(() => null);
+  }
+
+  const shouldNotify = await acquireFinalUnpaidPaymentNotificationLock(cart, status);
+  if (shouldNotify) {
+    await interaction.user.send(v2Message([
+      {
+        type: COMPONENT_TYPE.CONTAINER,
+        accent_color: presentation.color,
+        components: [
+          textDisplay([
+            `## ${presentation.title}`,
+            presentation.dm,
+            cart.id ? `Pedido: ${cart.id}` : null,
+          ].filter(Boolean).join("\n")),
+        ],
+      },
+    ])).catch(() => null);
+  }
+
+  setTimeout(() => {
+    interaction.channel?.delete("Carrinho Flowdesk encerrado por pagamento indisponivel").catch(() => null);
+  }, 20_000);
+}
+
 async function deliverApprovedCart(interaction, payload) {
   const deliveries = Array.isArray(payload.deliveries) ? payload.deliveries : [];
   const orderUrl = deliveryUrl(payload.cart.id);
@@ -1259,6 +1412,10 @@ function startPaymentAutoSync(interaction, cartId, paymentMessage) {
       await deliverApprovedCart(interaction, payload);
       return;
     }
+    if (isFinalUnpaidSalesStatus(status)) {
+      await handleFinalUnpaidPayment(interaction, payload, paymentMessage);
+      return;
+    }
     setTimeout(tick, intervalMs);
   };
 
@@ -1283,6 +1440,10 @@ async function handlePaymentSelect(interaction) {
   }
   if (payload.cart?.status === "delivered" || payload.cart?.status === "delivery_failed") {
     await deliverApprovedCart(interaction, payload);
+    return true;
+  }
+  if (isFinalUnpaidSalesStatus(payload.cart?.status || payload.payment?.status)) {
+    await handleFinalUnpaidPayment(interaction, payload, null);
     return true;
   }
 
@@ -1311,6 +1472,11 @@ async function handleCheckPaymentButton(interaction, cartId) {
         ? "Pagamento aprovado. Entrega liberada."
         : "Pagamento ja aprovado e entrega ja processada.",
     );
+    return;
+  }
+  if (isFinalUnpaidSalesStatus(status)) {
+    await handleFinalUnpaidPayment(interaction, payload, interaction.message);
+    await interaction.editReply("Pagamento indisponivel. Atualizei o carrinho e enviei o aviso por DM quando possivel.");
     return;
   }
   await interaction.editReply(`Pagamento ainda nao aprovado. Status atual: ${status}.`);
