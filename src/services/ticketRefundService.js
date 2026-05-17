@@ -896,12 +896,12 @@ async function startLoginPolling({ client, ticket, linkId, authMessage, persist,
 
       const link = await readTicketRefundAuthLink(linkId);
       let authUser = null;
+      
+      // O login so e considerado confirmado se o link seguro gerado para esta sessao foi expressamente logado e confirmado!
       if (link?.status === "confirmed" && link.auth_user_id) {
         authUser = await getAuthUserById(link.auth_user_id);
       }
-      if (!authUser) {
-        authUser = await getAuthUserByDiscordUserId(ticket.user_id);
-      }
+      
       if (!authUser) return;
 
       clearInterval(interval);
