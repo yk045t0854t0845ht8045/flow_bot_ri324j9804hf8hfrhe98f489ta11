@@ -23,6 +23,11 @@ const {
   handleSalesInteraction,
   isSalesComponentInteraction,
 } = require("../services/salesService");
+const {
+  handleTicketRefundInteraction,
+  isTicketRefundInteraction,
+} = require("../services/ticketRefundService");
+const { getGuildTicketRuntime } = require("../services/supabaseService");
 const { isDiscordUserSuspended, isDiscordUserAtRisk } = require("../services/violationService");
 
 function isTicketButtonInteraction(interaction) {
@@ -99,6 +104,11 @@ module.exports = {
 
       if (isSalesComponentInteraction(interaction)) {
         await handleSalesInteraction(interaction, client);
+        return;
+      }
+
+      if (isTicketRefundInteraction(interaction)) {
+        await handleTicketRefundInteraction(interaction, client, getGuildTicketRuntime);
         return;
       }
 

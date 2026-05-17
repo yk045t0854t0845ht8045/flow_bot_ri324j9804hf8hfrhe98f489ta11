@@ -10,6 +10,10 @@ const {
 } = require("./supabaseService");
 const { canClaimTicket, canCloseTicket } = require("../utils/staff");
 const { requestFlowAiChat } = require("./flowAiClient");
+const {
+  buildRefundMemoryPatch,
+  handleRefundOrVerificationMessage,
+} = require("./ticketRefundService");
 
 const MAX_TICKET_AI_MESSAGES = 12;
 const MAX_TICKET_AI_CONTENT = 1800;
@@ -114,6 +118,9 @@ function buildDynamicSystemPrompt(runtime) {
     "Priorize resolver no primeiro retorno com diagnostico objetivo, verificacoes praticas e proximo passo claro.",
     "Quando o problema for de configuracao do Flowdesk ou do Discord, use o contexto salvo do servidor antes de responder.",
     "Se faltar uma informacao critica, faca no maximo uma pergunta complementar e ela deve ser especifica.",
+    "Quando o assunto envolver reembolso, estorno, verificacao de compra, validacao de pedido ou consulta financeira, converse naturalmente, mas nunca conclua nada sem email da compra e numero do pedido.",
+    "Se receber apenas o email, peca tambem o numero do pedido. Se receber apenas o numero do pedido, peca tambem o email usado na compra.",
+    "Depois que os dois dados estiverem disponiveis, avise que a consulta sera feita no sistema integrado e aguarde o fluxo interno retornar as compras reais.",
   ];
 
   if (rules) {
@@ -1549,6 +1556,12 @@ async function handleTicketAiMessage(message, client) {
     return true;
   }
 
+  const historyRowsBeforeUserMessage = await getRecentTicketAiMessages(
+    ticket.id,
+    MAX_TICKET_AI_MESSAGES,
+  ).catch(() => []);
+  const refundMemory = buildRefundMemoryPatch(content, historyRowsBeforeUserMessage);
+
   await persistTicketAiMessage(ticket, {
     authorId: message.author.id,
     authorType: "user",
@@ -1557,6 +1570,11 @@ async function handleTicketAiMessage(message, client) {
     metadata: {
       messageId: message.id,
       attachmentCount: message.attachments?.size || 0,
+      refund: {
+        intent: refundMemory.intent,
+        email: refundMemory.email,
+        orderNumber: refundMemory.orderNumber,
+      },
     },
   });
 
@@ -1672,6 +1690,30 @@ async function handleTicketAiMessage(message, client) {
       lastUserMessageAt: currentIso,
       lastStaffMessageAt: session?.last_staff_message_at || null,
     });
+
+    const refundHandled = await handleRefundOrVerificationMessage({
+      message,
+      client,
+      ticket,
+      runtime,
+      historyRows: historyRowsBeforeUserMessage,
+      content,
+      persist: (input) => persistTicketAiMessage(ticket, input),
+    });
+    if (refundHandled) {
+      await safeUpsertTicketAiSession({
+        ticketId: ticket.id,
+        protocol: ticket.protocol,
+        guildId: ticket.guild_id,
+        channelId: ticket.channel_id,
+        userId: ticket.user_id,
+        status: "active",
+        lastAiReplyAt: nowIso(),
+        lastUserMessageAt: currentIso,
+        lastStaffMessageAt: session?.last_staff_message_at || null,
+      });
+      return true;
+    }
 
     const directReply = buildTicketRuleBasedReply(ticket, runtime, content);
     if (directReply) {

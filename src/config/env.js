@@ -200,6 +200,15 @@ const env = {
         DEFAULT_PUBLIC_APP_URL,
       "/api/internal/sales/discord",
     ),
+  salesInternalRefundApiUrl:
+    optionalEnv("SALES_INTERNAL_REFUND_API_URL") ||
+    buildUrl(
+      process.env.NEXT_PUBLIC_APP_URL ||
+        process.env.APP_URL ||
+        process.env.SITE_URL ||
+        DEFAULT_PUBLIC_APP_URL,
+      "/api/internal/sales/refund",
+    ),
   salesInternalApiToken:
     optionalEnv("SALES_INTERNAL_API_TOKEN") ||
     optionalEnv("FLOWAI_INTERNAL_API_TOKEN") ||
@@ -240,6 +249,7 @@ const env = {
     8_000,
   ),
   aiMentionLogChannelId: optionalEnv("AI_MENTION_LOG_CHANNEL_ID"),
+  aiProactiveRepliesEnabled: parseBoolean(process.env.AI_PROACTIVE_REPLIES_ENABLED, false),
   botHealthHost: optionalEnv("BOT_HEALTH_HOST") || process.env.HOST || "0.0.0.0",
   botHealthPort: parseNumber(process.env.PORT, parseNumber(process.env.BOT_HEALTH_PORT, 3210)),
   statusCriticalWebhookUrl: optionalEnv("STATUS_CRITICAL_WEBHOOK_URL"),

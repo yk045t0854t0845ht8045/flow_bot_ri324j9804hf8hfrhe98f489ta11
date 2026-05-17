@@ -482,6 +482,7 @@ function shouldObserveProactively(message, prompt) {
   const channelProfile = classifyCommunityChannel(message);
   const normalized = normalizeIntentText(prompt);
 
+  if (!env.aiProactiveRepliesEnabled) return false;
   if (!isOfficialGuildMessage(message)) return false;
   if (message.author?.bot || message.webhookId) return false;
   if (!prompt) return false;

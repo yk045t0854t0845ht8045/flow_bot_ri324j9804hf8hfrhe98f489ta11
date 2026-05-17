@@ -105,6 +105,29 @@ function textDisplay(content) {
   };
 }
 
+function buildProductUnavailableReply(productCode) {
+  return {
+    flags: MessageFlags.Ephemeral | COMPONENTS_V2_FLAG,
+    components: [
+      {
+        type: COMPONENT_TYPE.CONTAINER,
+        accent_color: 0xdb4646,
+        components: [
+          textDisplay(
+            [
+              "## Produto indisponivel",
+              "Este produto foi removido do catalogo ou esta indisponivel no momento.",
+              productCode
+                ? `Codigo: \`${productCode}\``
+                : "Atualize a loja do servidor para ver os produtos ativos.",
+            ].join("\n"),
+          ),
+        ],
+      },
+    ],
+  };
+}
+
 function separator() {
   return {
     type: COMPONENT_TYPE.SEPARATOR,
@@ -903,7 +926,7 @@ async function handleAddToCartInteraction(interaction) {
 
   const product = await getProductByCode(guildId, productCode);
   if (!product || product.status !== "active" || product.active === false) {
-    await interaction.editReply("Produto indisponivel.");
+    await interaction.editReply(buildProductUnavailableReply(productCode));
     return true;
   }
   if (!(await productHasEffectiveStock(product, 1))) {
