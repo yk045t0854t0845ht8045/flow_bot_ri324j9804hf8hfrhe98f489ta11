@@ -260,7 +260,23 @@ function isChangeAccountIntent(text) {
     "conta errada",
     "nao e essa",
     "vincular outra",
-    "nova conta"
+    "nova conta",
+    "painel de vinculacao",
+    "link de vinculacao",
+    "tela de vinculacao",
+    "vincular novamente",
+    "mandar a vinculacao",
+    "mandar o painel",
+    "mandar o link de login",
+    "login novamente",
+    "logar de novo",
+    "manda o login",
+    "manda o botao de login",
+    "deslogar",
+    "painel de login",
+    "vincular a conta",
+    "vincular conta",
+    "vincular novamente"
   ]);
 }
 
@@ -687,6 +703,43 @@ async function logRefundAuditEvent(input) {
   if (result.error && !isMissingTableError(result.error, "ticket_refund_audit_events")) {
     console.warn("[ticket-refund] falha ao registrar auditoria:", result.error.message);
   }
+}
+
+async function fetchRecentAiMessages(ticketId) {
+  const result = await supabase
+    .from("ticket_ai_messages")
+    .select("*")
+    .eq("ticket_id", ticketId)
+    .order("created_at", { ascending: false })
+    .limit(30);
+  return result.error ? [] : (result.data || []).reverse();
+}
+
+async function persistRefundStateDirectly(ticket, state, extra = {}) {
+  const safeState = sanitizeRefundState({
+    ...state,
+    ...extra,
+    lastActionAt: extra.lastActionAt || state.lastActionAt || nowIso(),
+  });
+  
+  await supabase
+    .from("ticket_ai_messages")
+    .insert({
+      ticket_id: ticket.id,
+      protocol: ticket.protocol,
+      guild_id: ticket.guild_id,
+      channel_id: ticket.channel_id,
+      author_id: null,
+      author_type: "system",
+      source: "ticket_refund_state",
+      content: `refund-state:${safeState.stage || "idle"}`,
+      metadata: {
+        refund: safeState,
+      },
+    })
+    .catch((error) => {
+      console.warn("[ticket-refund] falha ao persistir estado diretamente:", error.message);
+    });
 }
 
 async function getTicketRefundSettings(guildId, runtime) {
@@ -2106,6 +2159,7 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
         },
       ]),
     );
+    await persistRefundStateDirectly(ticket, { stage: "cancelled", intent: false });
     await logRefundAuditEvent({
       ticket,
       eventType: "selection_cancelled",
@@ -2164,6 +2218,7 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
         order,
         settings,
         reason: "Solicitacao confirmada pelo comprador via FlowAI (Mesmo expirada).",
+        allowedMentions: { parse: [] },
         eligibility,
         protocol: refundProtocol,
       });
@@ -2181,6 +2236,10 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
           },
         ])
       );
+
+      const historyRows = await fetchRecentAiMessages(ticket.id);
+      const previousState = readRefundMemory(historyRows);
+      await persistRefundStateDirectly(ticket, previousState, { stage: "manual_review" });
 
       await logRefundAuditEvent({
         ticket,
@@ -2220,6 +2279,7 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
       ])
     );
 
+    await persistRefundStateDirectly(ticket, { stage: "cancelled", intent: false });
     await logRefundAuditEvent({
       ticket,
       eventType: "selection_cancelled",
@@ -2319,6 +2379,7 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
             order,
             settings,
             reason: `Auto-reembolso falhou: ${String(refundError?.message || refundError).slice(0, 300)}`,
+            allowedMentions: { parse: [] },
             eligibility,
             protocol: fallbackProtocol,
           });
@@ -2326,6 +2387,11 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
             content: `Nao consegui processar automaticamente agora. Escalei para a equipe com o protocolo **${fallbackProtocol}**. Em breve voce recebera uma resposta aqui.`,
             allowedMentions: { parse: [] },
           });
+
+          const historyRows = await fetchRecentAiMessages(ticket.id);
+          const previousState = readRefundMemory(historyRows);
+          await persistRefundStateDirectly(ticket, previousState, { stage: "manual_review" });
+
           await logRefundAuditEvent({
             ticket,
             authUserId: authUser.id,
@@ -2348,6 +2414,11 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
             allowedMentions: { parse: [] },
           });
         }
+
+        const historyRows = await fetchRecentAiMessages(ticket.id);
+        const previousState = readRefundMemory(historyRows);
+        await persistRefundStateDirectly(ticket, previousState, { stage: refundResult?.alreadyRefunded ? "completed" : "completed" });
+
         await logRefundAuditEvent({
           ticket,
           authUserId: authUser.id,
@@ -2398,6 +2469,7 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
         order,
         settings,
         reason: "Solicitacao confirmada pelo comprador via FlowAI.",
+        allowedMentions: { parse: [] },
         eligibility,
         protocol: refundProtocol,
       });
@@ -2414,6 +2486,11 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
           },
         ]),
       );
+
+      const historyRows = await fetchRecentAiMessages(ticket.id);
+      const previousState = readRefundMemory(historyRows);
+      await persistRefundStateDirectly(ticket, previousState, { stage: "manual_review" });
+
       await logRefundAuditEvent({
         ticket,
         authUserId: authUser.id,
