@@ -264,6 +264,22 @@ function isChangeAccountIntent(text) {
   ]);
 }
 
+function isResendEmbedIntent(text) {
+  const normalized = normalizeIntentText(text);
+  return includesAny(normalized, [
+    "manda o embed",
+    "manda de novo",
+    "mandar novamente",
+    "nao vi",
+    "cade o embed",
+    "cade o menu",
+    "manda o menu",
+    "recolocar",
+    "apareceu nao",
+    "nao apareceu"
+  ]);
+}
+
 function isWaitingFiller(text) {
   const normalized = normalizeIntentText(text);
   if (!normalized) return false;
@@ -284,7 +300,22 @@ function isWaitingFiller(text) {
     "to no aguardo",
     "vou pegar",
     "ja mando",
-    "ja envio"
+    "ja envio",
+    "aguardando",
+    "ficar aguardando",
+    "fico aguardando",
+    "vou aguardar",
+    "to aguardando",
+    "estou aguardando",
+    "obrigado",
+    "muito obrigado",
+    "valeu",
+    "tudo certo",
+    "entendido",
+    "ok entendi",
+    "ta certo",
+    "ta bom",
+    "fechou"
   ]);
 }
 
@@ -1476,6 +1507,19 @@ function hasRepeatedFailedCandidate(state, candidates) {
 }
 
 async function answerContextualMessage({ message, persist, state, kind, content, ticket }) {
+  if (kind === "waiting_review") {
+    const nextState = markPrompt(state, "waiting_review");
+    await persistRefundState(persist, nextState);
+    if (!shouldPrompt(state, "waiting_review", 20_000)) return true;
+    await message.reply({
+      content: state.stage === "completed" 
+        ? "O seu pedido ja foi finalizado. Se precisar de mais alguma coisa, a equipe esta a disposicao."
+        : "Sim! O seu pedido de reembolso ja esta em analise pela equipe. E so aguardar a resposta por aqui.",
+      allowedMentions: { parse: [] },
+    });
+    return true;
+  }
+
   if (kind === "waiting") {
     const nextState = markPrompt(state, "waiting");
     await persistRefundState(persist, nextState);
@@ -1551,6 +1595,10 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
       outcome: "user_cancelled",
     });
     return false;
+  }
+
+  if (isWaitingFiller(content) && ["manual_review", "completed"].includes(state.stage)) {
+    return answerContextualMessage({ message, persist, state, kind: "waiting_review", content, ticket });
   }
 
   if (!state.intent && !currentIntent && !(active && orderCandidates.length)) return false;
@@ -1690,7 +1738,10 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
   }
 
   if (state.stage === "selecting_order" && !orderCandidates.length) {
-    if (shouldPrompt(state, "select_pending", REFUND_PROMPT_COOLDOWN_MS)) {
+    const resendEmbed = isResendEmbedIntent(content);
+    if (resendEmbed && state.orderCandidates?.length) {
+      orderCandidates.push(...state.orderCandidates);
+    } else if (shouldPrompt(state, "select_pending", REFUND_PROMPT_COOLDOWN_MS)) {
       state = markPrompt(state, "select_pending");
       await persistRefundState(persist, state);
       await message.reply({
@@ -1698,8 +1749,10 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
           "Eu ja encontrei opcoes compativeis. Selecione a compra no menu acima ou use Cancelar para procurar outro pedido.",
         allowedMentions: { parse: [] },
       });
+      return true;
+    } else {
+      return true;
     }
-    return true;
   }
 
   if (!orderCandidates.length) {
@@ -1779,20 +1832,53 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
     throw error;
   });
 
+  const availableOrders = [];
+  const refundedOrders = [];
+
+  for (const order of orders) {
+    const status = String(order.status || "").toLowerCase();
+    const providerStatus = String(order.providerStatus || "").toLowerCase();
+    const providerDetail = String(order.providerStatusDetail || "").toLowerCase();
+    const alreadyRefunded =
+      status === "refunded" ||
+      providerStatus === "refunded" ||
+      providerStatus === "charged_back" ||
+      providerDetail.includes("refund") ||
+      providerDetail.includes("chargeback") ||
+      providerDetail.includes("reembols");
+
+    if (alreadyRefunded) {
+      refundedOrders.push(order);
+    } else {
+      availableOrders.push(order);
+    }
+  }
+
+  if (orders.length > 0 && availableOrders.length === 0) {
+    state = markPrompt({ ...state, stage: "completed" }, "already_refunded");
+    await persistRefundState(persist, state);
+    await message.channel.send({
+      content:
+        "Este pedido ja consta como reembolsado ou com estorno em andamento no sistema. Nao e possivel solicitar um novo reembolso para a mesma compra.",
+      allowedMentions: { parse: [] },
+    });
+    return true;
+  }
+
   state = sanitizeRefundState({
     ...state,
-    stage: orders.length ? "selecting_order" : "lookup_failed",
+    stage: availableOrders.length ? "selecting_order" : "lookup_failed",
     orderCandidates: [...new Set([...orderCandidates, ...state.orderCandidates])].slice(0, 8),
-    failedOrderCandidates: orders.length
+    failedOrderCandidates: availableOrders.length
       ? state.failedOrderCandidates
       : [...new Set([...(state.failedOrderCandidates || []), ...orderCandidates])].slice(0, 12),
-    availableOrderKeys: orders.map((order) => order.key),
+    availableOrderKeys: availableOrders.map((order) => order.key),
     lookupCount: Number(state.lookupCount || 0) + 1,
     lastLookupAt: nowIso(),
   });
   await persistRefundState(persist, state);
 
-  if (!orders.length) {
+  if (!availableOrders.length) {
     await message.channel.send({
       content:
         "Nao encontrei uma compra compativel com esse numero na conta vinculada. Confira o pedido ou envie outro numero; se a compra estiver em outra conta, refaca o Login com a conta correta.",
@@ -1801,7 +1887,7 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
     return true;
   }
 
-  await message.channel.send(buildOrderSelectionMessage(ticket, orders));
+  await message.channel.send(buildOrderSelectionMessage(ticket, availableOrders));
   return true;
 }
 
