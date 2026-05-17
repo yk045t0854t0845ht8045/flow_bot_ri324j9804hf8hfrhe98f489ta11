@@ -249,6 +249,21 @@ function isCancelRefundIntent(text) {
   ]);
 }
 
+function isChangeAccountIntent(text) {
+  const normalized = normalizeIntentText(text);
+  return includesAny(normalized, [
+    "trocar de conta",
+    "mudar de conta",
+    "outra conta",
+    "mudar conta",
+    "trocar a conta",
+    "conta errada",
+    "nao e essa",
+    "vincular outra",
+    "nova conta"
+  ]);
+}
+
 function isWaitingFiller(text) {
   const normalized = normalizeIntentText(text);
   if (!normalized) return false;
@@ -266,9 +281,10 @@ function isWaitingFiller(text) {
     "calma",
     "um minuto",
     "so um minuto",
-    "aguarda",
-    "ok to no aguardo",
     "to no aguardo",
+    "vou pegar",
+    "ja mando",
+    "ja envio"
   ]);
 }
 
@@ -777,7 +793,27 @@ async function getAuthUserById(userId) {
   return result.error ? null : result.data || null;
 }
 
-function buildLoginPromptPayload(url) {
+function buildLoginPromptPayload(url, authUser) {
+  if (authUser) {
+    return v2Message([
+      {
+        type: COMPONENT_TYPE.CONTAINER,
+        accent_color: 0x8fdbff,
+        components: [
+          textDisplay(
+            [
+              "## Conta ja vinculada",
+              `Sua conta segura (ID: ${authUser.id}) ja esta vinculada. Se a compra foi feita nesta conta, **basta enviar o numero do pedido abaixo**.`,
+              "",
+              "Se voce precisa verificar a compra de **outra conta**, clique em **Login / Trocar Conta**.",
+            ].join("\n"),
+          ),
+        ],
+      },
+      actionRow([linkButton({ label: "Login / Trocar Conta", url })]),
+    ]);
+  }
+
   return v2Message([
     {
       type: COMPONENT_TYPE.CONTAINER,
@@ -868,20 +904,20 @@ async function startLoginPolling({ client, ticket, linkId, authMessage, persist,
   activeLoginPollers.set(key, interval);
 }
 
-async function sendSecureLoginPrompt({ message, client, ticket, persist, state }) {
+async function sendSecureLoginPrompt({ message, client, ticket, persist, state, authUser }) {
   const link = await createTicketRefundAuthLink(ticket);
-  const payload = buildLoginPromptPayload(link.url);
+  const payload = buildLoginPromptPayload(link.url, authUser);
   const sent = await message.channel.send(payload);
   const nextState = markPrompt(
     {
       ...state,
       intent: true,
-      stage: "awaiting_auth",
-      authStatus: "pending",
+      stage: authUser ? "awaiting_order" : "awaiting_auth",
+      authStatus: authUser ? "linked" : "pending",
       authLinkId: link.linkId,
       loginMessageId: sent?.id || null,
     },
-    "login",
+    authUser ? "ask_order_with_login" : "login",
   );
   await persistRefundState(persist, nextState);
   await logRefundAuditEvent({
@@ -1084,25 +1120,7 @@ async function findMatchingOrders({ guildId, authUserId, discordUserId, orderCan
     ),
   );
 
-  let paymentOrders = [];
-  if (authUserId) {
-    const paymentResult = await supabase
-      .from("payment_orders")
-      .select("*")
-      .eq("user_id", authUserId)
-      .order("created_at", { ascending: false })
-      .limit(80);
-    if (paymentResult.error) {
-      throw new Error(paymentResult.error.message);
-    }
-    const filtered = (paymentResult.data || []).filter(
-      (order) => !order.guild_id || String(order.guild_id) === String(guildId),
-    );
-    const eventMap = await fetchPaymentEvents(filtered.map((order) => order.id));
-    paymentOrders = filtered.map((order) => toUnifiedPaymentOrder(order, eventMap.get(order.id) || []));
-  }
-
-  return [...salesOrders, ...paymentOrders]
+  return [...salesOrders]
     .map((order) => ({
       ...order,
       matchScore: scoreOrderMatch(order, orderCandidates),
@@ -1151,17 +1169,7 @@ async function getOrderByKey(guildId, orderKey, options = {}) {
     );
   }
 
-  const orderResult = await supabase
-    .from("payment_orders")
-    .select("*")
-    .eq("id", parsed.id)
-    .maybeSingle();
-  if (orderResult.error || !orderResult.data) return null;
-  const order = orderResult.data;
-  if (order.guild_id && String(order.guild_id) !== String(guildId)) return null;
-  if (options.authUserId && Number(order.user_id) !== Number(options.authUserId)) return null;
-  const eventsByOrder = await fetchPaymentEvents([order.id]);
-  return toUnifiedPaymentOrder(order, eventsByOrder.get(order.id) || []);
+  return null;
 }
 
 function countRefundEvents(events) {
@@ -1547,6 +1555,15 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
 
   if (!state.intent && !currentIntent && !(active && orderCandidates.length)) return false;
 
+  const changeAccount = isChangeAccountIntent(content);
+
+  if (["manual_review", "completed"].includes(state.stage)) {
+    if (!currentIntent) return false;
+    state = createDefaultRefundState();
+    state.intent = true;
+    state.stage = "awaiting_auth";
+  }
+
   if (containsManipulationAttempt(content)) {
     state = sanitizeRefundState({ ...state, intent: true, stage: state.stage || "awaiting_auth" });
     return answerContextualMessage({
@@ -1571,6 +1588,19 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
   }
 
   const authUser = await getAuthUserByDiscordUserId(ticket.user_id);
+
+  if (changeAccount) {
+    await sendSecureLoginPrompt({
+      message,
+      client,
+      ticket,
+      persist,
+      state,
+      authUser: null,
+    });
+    return true;
+  }
+
   if (!authUser) {
     if (isWaitingFiller(content) && active) {
       return answerContextualMessage({ message, persist, state, kind: "waiting", content, ticket });
@@ -1591,6 +1621,7 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
         ticket,
         persist,
         state,
+        authUser: null,
       });
     } else {
       await persistRefundState(persist, state, {
@@ -1608,6 +1639,32 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
     authUserId: authUser.id,
     stage: state.stage === "awaiting_auth" || !state.stage ? "awaiting_order" : state.stage,
   });
+
+  if (!state.authLinkId) {
+    const link = await createTicketRefundAuthLink(ticket);
+    const payload = buildLoginPromptPayload(link.url, authUser);
+    const sent = await message.channel.send(payload);
+
+    state = markPrompt({
+      ...state,
+      authLinkId: link.linkId,
+      loginMessageId: sent?.id || null,
+    }, "ask_order_with_login");
+    await persistRefundState(persist, state);
+
+    await startLoginPolling({
+      client,
+      ticket,
+      linkId: link.linkId,
+      authMessage: sent,
+      persist,
+      state,
+    });
+
+    if (!orderCandidates.length) {
+      return true;
+    }
+  }
 
   if (hasEmail && !orderCandidates.length) {
     state = markPrompt(state, "email_ignored_linked");
