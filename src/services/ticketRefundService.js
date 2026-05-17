@@ -353,12 +353,23 @@ function isCasualGreetingIntent(text) {
   ]) && normalized.length < 18;
 }
 
+function isThankYouIntent(text) {
+  const normalized = normalizeIntentText(text);
+  if (!normalized) return false;
+  return includesAny(normalized, [
+    "obrigado", "obrigada", "valeu", "obg", "agradecido", "agradecida", "tamo junto", "tmj", "perfeito", "show", "tks", "thanks", "vlw"
+  ]) && normalized.length < 25;
+}
+
 function isListOrdersIntent(text) {
   const normalized = normalizeIntentText(text);
   if (!normalized) return false;
   return includesAny(normalized, [
     "tem algum pedido", "tem pedido", "tenho pedido", "meus pedidos", "minhas compras", "qual pedido",
-    "quais compras", "listar pedidos", "ver compras", "ver pedidos", "tenho compra", "tem compra", "algum pedido meu"
+    "quais compras", "listar pedidos", "ver compras", "ver pedidos", "tenho compra", "tem compra", "algum pedido meu",
+    "manda novamente o menu", "manda o menu de novo", "manda o menu", "mostra o menu de novo", "mostra o menu",
+    "quero ver o menu", "manda de novo o menu", "manda de novo", "estornar outro pedido", "reembolsar outro pedido",
+    "quero fazer reembolso de outro pedido", "outro pedido", "mesmo pedido novamente", "reembolso do mesmo pedido"
   ]);
 }
 
@@ -1674,7 +1685,7 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
     return false;
   }
 
-  if (isWaitingFiller(content) && ["manual_review", "completed"].includes(state.stage)) {
+  if ((isWaitingFiller(content) || isThankYouIntent(content)) && ["manual_review", "completed"].includes(state.stage)) {
     return answerContextualMessage({ message, persist, state, kind: "waiting_review", content, ticket });
   }
 
@@ -1700,7 +1711,8 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
   if (!state.intent && !currentIntent && !(active && orderCandidates.length)) return false;
 
   if (["manual_review", "completed"].includes(state.stage)) {
-    if (!currentIntent) return false;
+    const wantsAnother = isListOrdersIntent(content) || isCasualGreetingIntent(content);
+    if (!currentIntent && !wantsAnother) return false;
     state = createDefaultRefundState();
     state.intent = true;
     state.stage = "awaiting_auth";
