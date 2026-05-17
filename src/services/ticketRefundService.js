@@ -862,7 +862,7 @@ function buildLoginPromptPayload(url, authUser) {
           textDisplay(
             [
               "## Conta ja vinculada",
-              `Sua conta segura (ID: ${authUser.id}) ja esta vinculada. Se a compra foi feita nesta conta, **basta enviar o numero do pedido abaixo**.`,
+              `Sua conta segura${authUser.discord_user_id ? ` <@${authUser.discord_user_id}>` : ""}${authUser.email ? ` (**${authUser.email}**)` : ""} ja esta vinculada. Se a compra foi feita nesta conta, **basta enviar o numero do pedido abaixo**.`,
               "",
               "Se voce precisa verificar a compra de **outra conta**, clique em **Login / Trocar Conta**.",
             ].join("\n"),
@@ -1472,7 +1472,7 @@ async function callInternalSalesRefund(cartId, guildId, reason) {
       "x-sales-internal-token": env.salesInternalApiToken,
     },
     body: JSON.stringify({ cartId, guildId, reason }),
-    signal: AbortSignal.timeout?.(20_000),
+    signal: AbortSignal.timeout?.(45_000),
   });
   const payload = await response.json().catch(() => null);
   if (!response.ok || payload?.ok === false) {
