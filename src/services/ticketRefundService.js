@@ -1718,7 +1718,132 @@ async function answerContextualMessage({ message, persist, state, kind, content,
   return false;
 }
 
+async function handleRefundProtocolQuery({ message, client, ticket, protocolCode, persist }) {
+  const searchProtocol = String(protocolCode || "").trim().toUpperCase();
+  
+  const searchingMsg = await message.reply({
+    content: `Certo! Identifiquei o protocolo **\`${searchProtocol}\`**. Vou consultar os detalhes da solicitação de reembolso no nosso banco de dados, só um instante... 🔍`,
+    allowedMentions: { parse: [] },
+  });
+
+  try {
+    const { data: events, error } = await supabase
+      .from("ticket_refund_audit_events")
+      .select("*")
+      .eq("guild_id", ticket.guild_id)
+      .order("created_at", { ascending: false });
+
+    if (error && !isMissingTableError(error, "ticket_refund_audit_events")) {
+      throw error;
+    }
+
+    const matchingEvents = (events || []).filter((ev) => {
+      const proto = ev.metadata?.protocol;
+      return typeof proto === "string" && proto.toUpperCase().includes(searchProtocol);
+    });
+
+    if (!matchingEvents.length) {
+      await searchingMsg.edit({
+        content: `Consultei nosso banco de dados, mas nao localizei nenhuma solicitacao correspondente ao protocolo **\`${searchProtocol}\`** no momento. 😕\n\nConfirme se digitou o código corretamente ou envie o número do pedido para iniciarmos uma nova consulta!`,
+        allowedMentions: { parse: [] },
+      });
+      return true;
+    }
+
+    const latestEvent = matchingEvents[0];
+    const createdDate = latestEvent.created_at ? new Date(latestEvent.created_at) : new Date();
+    const formattedDate = createdDate.toLocaleDateString("pt-BR", {
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+
+    let statusText = "";
+    let colorAccent = 0xf1c40f;
+    let description = "";
+
+    const eventType = String(latestEvent.event_type || "").toLowerCase();
+    const outcome = String(latestEvent.outcome || "").toLowerCase();
+
+    if (
+      eventType.includes("approved") || 
+      eventType.includes("processed") || 
+      outcome === "success" || 
+      outcome === "processed"
+    ) {
+      statusText = "Aprovado e Processado com Sucesso";
+      colorAccent = 0x2ecc71;
+      description = `O estorno do valor já foi concluído em nosso sistema! 🎉\nO valor foi devolvido para a mesma conta de origem do pagamento. Para pagamentos via Pix, o estorno costuma compensar em poucos minutos. Para cartões de crédito, o prazo de lançamento depende do banco emissor.`;
+    } else if (eventType.includes("deny") || eventType.includes("denied") || outcome === "denied") {
+      statusText = "Recusado / Negado";
+      colorAccent = 0xe74c3c;
+      description = `Esta solicitação foi revisada pela nossa equipe e **não foi aprovada** por não cumprir os critérios de reembolso do servidor (como prazo limite expirado ou produto já consumido). Caso precise de suporte adicional, nossa staff está à disposição neste ticket.`;
+    } else {
+      statusText = "Aguardando Revisão Manual";
+      colorAccent = 0xf1c40f;
+      description = `A solicitação foi encaminhada para a análise excepcional da nossa equipe de staff. ⏳\nNossos moderadores estão revisando os detalhes da compra e darão um retorno diretamente aqui no seu ticket em breve. Não se preocupe, não é necessário fazer nada!`;
+    }
+
+    let orderInfoLine = "";
+    if (latestEvent.order_key) {
+      const order = await getOrderByKey(ticket.guild_id, latestEvent.order_key).catch(() => null);
+      if (order) {
+        orderInfoLine = `\n**Compra:** ${order.productTitle || "Produto"}\n**Valor:** ${formatMoney(order.amount, order.currency)}`;
+      }
+    }
+
+    const responseEmbed = new EmbedBuilder()
+      .setTitle("Status da Solicitação de Reembolso")
+      .setColor(colorAccent)
+      .setDescription(
+        [
+          `Encontrei as informações sobre a sua solicitação com o protocolo **\`${searchProtocol}\`**:`,
+          "",
+          `📌 **Status:** \`${statusText}\``,
+          `📅 **Data de Abertura:** ${formattedDate}`,
+          orderInfoLine,
+          "",
+          `ℹ️ **Informações:**`,
+          description,
+        ].join("\n")
+      )
+      .setTimestamp(createdDate);
+
+    await searchingMsg.delete().catch(() => null);
+    await message.reply({
+      embeds: [responseEmbed],
+      allowedMentions: { parse: [] },
+    });
+
+    let newStage = "manual_review";
+    if (statusText.includes("Aprovado")) {
+      newStage = "completed";
+    }
+    
+    const historyRows = await fetchRecentAiMessages(ticket.id);
+    const previousState = readRefundMemory(historyRows);
+    await persistRefundStateDirectly(ticket, previousState, { stage: newStage });
+
+    return true;
+  } catch (error) {
+    console.error("[ticket-refund] erro ao processar busca de protocolo:", error);
+    await searchingMsg.edit({
+      content: `Ocorreu um erro interno ao tentar consultar o protocolo **\`${searchProtocol}\`**. Por favor, tente novamente ou aguarde a staff.`,
+      allowedMentions: { parse: [] },
+    });
+    return true;
+  }
+}
+
 async function handleRefundOrVerificationMessage({ message, client, ticket, runtime, historyRows, content, persist }) {
+  const protocolMatch = String(content || "").match(/(RMB-\d{4,8}-[A-Z0-9]+-[A-Z0-9]+|RMB-[A-Z0-9-]+)/i);
+  if (protocolMatch) {
+    const protocolCode = protocolMatch[0];
+    return await handleRefundProtocolQuery({ message, client, ticket, protocolCode, persist });
+  }
+
   let state = buildRefundMemoryPatch(content, historyRows);
   const active = isActiveRefundState(readRefundMemory(historyRows));
   const currentIntent = state.currentIntent === true;
@@ -1738,8 +1863,10 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
     return false;
   }
 
-  if ((isWaitingFiller(content) || isThankYouIntent(content)) && ["manual_review", "completed"].includes(state.stage)) {
-    return answerContextualMessage({ message, persist, state, kind: "waiting_review", content, ticket });
+  if (isWaitingFiller(content) || isThankYouIntent(content)) {
+    // Agradecimentos e fillers de aguardo (ex: "obrigado", "vou procurar", "ok vou ver")
+    // não devem ser interceptados por respostas estáticas rígidas; retornamos false para a LLM geral responder humanamente!
+    return false;
   }
 
   const changeAccount = isChangeAccountIntent(content);
@@ -1764,7 +1891,7 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
   if (!state.intent && !currentIntent && !(active && orderCandidates.length)) return false;
 
   if (["manual_review", "completed"].includes(state.stage)) {
-    const wantsAnother = isListOrdersIntent(content) || isCasualGreetingIntent(content);
+    const wantsAnother = isListOrdersIntent(content) || isCasualGreetingIntent(content) || orderCandidates.length > 0;
     if (!currentIntent && !wantsAnother) return false;
     state = createDefaultRefundState();
     state.intent = true;
@@ -1976,10 +2103,11 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
           "Conta vinculada. Me envie o numero do pedido para eu consultar status, prazo e elegibilidade com seguranca.",
         allowedMentions: { parse: [] },
       });
+      return true;
     } else {
       await persistRefundState(persist, state, { stage: "awaiting_order" });
+      return false;
     }
-    return true;
   }
 
   if (hasRepeatedFailedCandidate(state, orderCandidates)) {
