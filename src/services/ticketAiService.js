@@ -842,6 +842,10 @@ function splitDiscordMessage(content) {
 }
 
 async function replyToTicketMessage(message, content) {
+  if (typeof content === "string" && (content.includes("Login Seguro") || content.includes("login seguro"))) {
+    content = content.replace(/\[Login Seguro\]\([^)]+\)/gi, "**Login Seguro** (use o botao de Login enviado abaixo)");
+    content = content.replace(/\[Link de Login\]\([^)]+\)/gi, "**Login Seguro** (use o botao de Login enviado abaixo)");
+  }
   const chunks = splitDiscordMessage(content);
   if (!chunks.length) return;
 

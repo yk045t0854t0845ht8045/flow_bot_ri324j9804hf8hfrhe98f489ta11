@@ -1678,9 +1678,26 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
     return answerContextualMessage({ message, persist, state, kind: "waiting_review", content, ticket });
   }
 
-  if (!state.intent && !currentIntent && !(active && orderCandidates.length)) return false;
-
   const changeAccount = isChangeAccountIntent(content);
+  if (changeAccount) {
+    state = sanitizeRefundState({
+      ...state,
+      intent: true,
+      stage: "awaiting_auth",
+      authStatus: "pending",
+    });
+    await sendSecureLoginPrompt({
+      message,
+      client,
+      ticket,
+      persist,
+      state,
+      authUser: null,
+    });
+    return true;
+  }
+
+  if (!state.intent && !currentIntent && !(active && orderCandidates.length)) return false;
 
   if (["manual_review", "completed"].includes(state.stage)) {
     if (!currentIntent) return false;
@@ -1713,18 +1730,6 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
   }
 
   const authUser = await getAuthUserByDiscordUserId(ticket.user_id);
-
-  if (changeAccount) {
-    await sendSecureLoginPrompt({
-      message,
-      client,
-      ticket,
-      persist,
-      state,
-      authUser: null,
-    });
-    return true;
-  }
 
   if (!authUser) {
     if (isWaitingFiller(content) && active) {
