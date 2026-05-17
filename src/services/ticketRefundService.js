@@ -345,6 +345,23 @@ function isTimingQuestion(text) {
   ]);
 }
 
+function isCasualGreetingIntent(text) {
+  const normalized = normalizeIntentText(text);
+  if (!normalized) return false;
+  return includesAny(normalized, [
+    "eae", "eai", "beleza", "opa", "oi", "ola", "olá", "tudo bem", "tudo bom", "bom dia", "boa tarde", "boa noite", "fala tu", "coé", "koe"
+  ]) && normalized.length < 18;
+}
+
+function isListOrdersIntent(text) {
+  const normalized = normalizeIntentText(text);
+  if (!normalized) return false;
+  return includesAny(normalized, [
+    "tem algum pedido", "tem pedido", "tenho pedido", "meus pedidos", "minhas compras", "qual pedido",
+    "quais compras", "listar pedidos", "ver compras", "ver pedidos", "tenho compra", "tem compra", "algum pedido meu"
+  ]);
+}
+
 function containsManipulationAttempt(text) {
   const normalized = normalizeIntentText(text);
   return includesAny(normalized, [
@@ -1164,6 +1181,55 @@ async function findMatchingOrders({ guildId, authUserId, discordUserId, orderCan
     .slice(0, 10);
 }
 
+async function listUserRecentOrders({ guildId, authUserId, discordUserId }) {
+  const cartRows = new Map();
+
+  if (authUserId) {
+    const authCartResult = await supabase
+      .from("guild_sales_carts")
+      .select("*")
+      .eq("guild_id", guildId)
+      .eq("auth_user_id", authUserId)
+      .order("created_at", { ascending: false })
+      .limit(60);
+    if (!authCartResult.error) {
+      for (const cart of authCartResult.data || []) cartRows.set(cart.id, cart);
+    }
+  }
+
+  if (discordUserId) {
+    const discordCartResult = await supabase
+      .from("guild_sales_carts")
+      .select("*")
+      .eq("guild_id", guildId)
+      .eq("discord_user_id", discordUserId)
+      .order("created_at", { ascending: false })
+      .limit(60);
+    if (!discordCartResult.error) {
+      for (const cart of discordCartResult.data || []) cartRows.set(cart.id, cart);
+    }
+  }
+
+  const carts = Array.from(cartRows.values());
+  const cartIds = carts.map((cart) => cart.id);
+  const [itemsByCart, deliveriesByCart, eventsByCart] = await Promise.all([
+    fetchSalesCartItems(cartIds),
+    fetchSalesDeliveries(cartIds),
+    fetchSalesEvents(cartIds),
+  ]);
+
+  const salesOrders = carts.map((cart) =>
+    toUnifiedSalesOrder(
+      cart,
+      itemsByCart.get(cart.id) || [],
+      deliveriesByCart.get(cart.id) || [],
+      eventsByCart.get(cart.id) || [],
+    ),
+  );
+
+  return salesOrders;
+}
+
 async function getOrderByKey(guildId, orderKey, options = {}) {
   const parsed = decodeOrderKey(orderKey);
   if (!parsed) return null;
@@ -1746,6 +1812,71 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
 
   if (isTimingQuestion(content) && !orderCandidates.length) {
     return answerContextualMessage({ message, persist, state, kind: "timing", content, ticket });
+  }
+
+  if (isCasualGreetingIntent(content) && !orderCandidates.length) {
+    state = markPrompt(state, "greeting");
+    await persistRefundState(persist, state);
+    await message.reply({
+      content:
+        "Tudo otimo por aqui! 😄\n\nEstou com a sua conta segura vinculada e pronta. Para darmos andamento ao reembolso, basta me enviar o numero do seu pedido (por exemplo, `90058`). Se você quer trocar a conta vinculada, clique em **Login / Trocar Conta** acima!",
+      allowedMentions: { parse: [] },
+    });
+    return true;
+  }
+
+  if (isListOrdersIntent(content) && !orderCandidates.length) {
+    const activeOrders = await listUserRecentOrders({
+      guildId: ticket.guild_id,
+      authUserId: authUser.id,
+      discordUserId: ticket.user_id,
+    });
+
+    const availableOrders = [];
+    for (const order of activeOrders) {
+      const status = String(order.status || "").toLowerCase();
+      const providerStatus = String(order.providerStatus || "").toLowerCase();
+      const providerDetail = String(order.providerStatusDetail || "").toLowerCase();
+      const alreadyRefunded =
+        status === "refunded" ||
+        providerStatus === "refunded" ||
+        providerStatus === "charged_back" ||
+        providerDetail.includes("refund") ||
+        providerDetail.includes("chargeback") ||
+        providerDetail.includes("reembols");
+
+      const paid =
+        order.source === "sales"
+          ? ["paid", "delivered", "delivery_failed"].includes(status)
+          : ["approved", "settled"].includes(status) || providerStatus === "approved";
+
+      if (paid && !alreadyRefunded) {
+        availableOrders.push(order);
+      }
+    }
+
+    if (availableOrders.length > 0) {
+      state = sanitizeRefundState({
+        ...state,
+        stage: "selecting_order",
+        availableOrderKeys: availableOrders.map((order) => order.key),
+      });
+      await persistRefundState(persist, state);
+
+      await message.reply({
+        content:
+          "Encontrei as seguintes compras recentes associadas a sua conta vinculada. 😄\n\nPor favor, selecione qual delas voce quer verificar para reembolso no menu abaixo:",
+        allowedMentions: { parse: [] },
+      });
+      await message.channel.send(buildOrderSelectionMessage(ticket, availableOrders));
+    } else {
+      await message.reply({
+        content:
+          "Consultei sua conta segura vinculada, mas nao encontrei nenhuma compra recente aprovada sob ela. 😕\n\nSe a compra foi feita sob outra conta, voce pode clicar em **Login / Trocar Conta** acima para vincular o cadastro correto. Caso contrario, me envie o numero do pedido para eu verificar mais a fundo.",
+        allowedMentions: { parse: [] },
+      });
+    }
+    return true;
   }
 
   if (state.stage === "selecting_order" && !orderCandidates.length) {
