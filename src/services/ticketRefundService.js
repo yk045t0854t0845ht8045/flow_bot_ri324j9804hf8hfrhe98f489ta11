@@ -1304,21 +1304,19 @@ function evaluateRefundEligibility(order, settings, context = {}) {
     insideWindow &&
     !alreadyRefunded &&
     riskScore < 35;
-  const manualRequired =
-    !eligible ||
-    settings.manualApprovalRequired ||
-    riskScore > 15 ||
-    deliveredOrConsumed ||
-    order.source !== "sales";
+
+  const canAutoRefund =
+    eligible &&
+    settings.autoProcessEnabled &&
+    !deliveredOrConsumed &&
+    order.source === "sales" &&
+    riskScore < 20;
+
+  const manualRequired = !canAutoRefund;
 
   return {
     eligible,
-    canAutoRefund:
-      eligible &&
-      settings.autoProcessEnabled &&
-      !settings.manualApprovalRequired &&
-      !manualRequired &&
-      order.source === "sales",
+    canAutoRefund,
     manualRequired,
     paid,
     hasProviderPayment,
@@ -1422,7 +1420,15 @@ function summarizeEligibilityForStaff(eligibility) {
   return lines.join("\n");
 }
 
-async function sendManualApprovalRequest({ client, ticket, order, settings, reason, eligibility }) {
+
+function generateRefundProtocol(ticketId, orderKey) {
+  const datePart = new Date().toISOString().slice(0,10).replace(/-/g,'');
+  const rand = crypto.randomBytes(3).toString('hex').toUpperCase();
+  const ticketSuffix = String(ticketId || '').slice(-4).toUpperCase();
+  return `RMB-${datePart}-${ticketSuffix}-${rand}`;
+}
+
+async function sendManualApprovalRequest({ client, ticket, order, settings, reason, eligibility, protocol }) {
   const guild = await client.guilds.fetch(ticket.guild_id).catch(() => null);
   const channel = settings.approvalChannelId
     ? await guild?.channels.fetch(settings.approvalChannelId).catch(() => null)
@@ -1432,9 +1438,14 @@ async function sendManualApprovalRequest({ client, ticket, order, settings, reas
   }
 
   const embed = new EmbedBuilder()
-    .setTitle("Solicitacao de reembolso")
+    .setTitle("Solicitacao de Reembolso")
     .setColor(eligibility.eligible ? 0xf1c40f : 0xdb4646)
     .addFields(
+      {
+        name: "Protocolo",
+        value: `\`${protocol}\``,
+        inline: true,
+      },
       {
         name: "Ticket",
         value: `${ticket.protocol || ticket.id}\n<#${ticket.channel_id}>`,
@@ -1887,6 +1898,22 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
     return true;
   }
 
+  // Check if all found orders are outside the refund window (warn before selection)
+  const tempSettings = await getTicketRefundSettings(ticket.guild_id, runtime).catch(() => null);
+  const allOutsideWindow = tempSettings && availableOrders.every((ord) => {
+    const purchaseMs = parseTimestampMs(resolvePurchaseDate(ord));
+    const limitDays = Math.max(0, Number(tempSettings.refundLimitDays || DEFAULT_REFUND_DAYS));
+    const deadlineMs = purchaseMs + limitDays * 24 * 60 * 60 * 1000;
+    return Number.isFinite(purchaseMs) && Date.now() > deadlineMs;
+  });
+
+  if (allOutsideWindow && tempSettings) {
+    await message.channel.send({
+      content: `⚠️ O prazo limite de reembolso configurado (**${tempSettings.refundLimitDays} dias**) ja foi ultrapassado para esta(s) compra(s). Voce ainda pode selecionar e enviar a solicitacao para analise da equipe.`,
+      allowedMentions: { parse: [] },
+    });
+  }
+
   await message.channel.send(buildOrderSelectionMessage(ticket, availableOrders));
   return true;
 }
@@ -1935,6 +1962,120 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
       ticket,
       eventType: "selection_cancelled",
       outcome: "user_cancelled",
+    });
+    return true;
+  }
+
+  if (action === "confirm_expired") {
+    if (interaction.user.id !== ticket.user_id) {
+      await interaction.reply({
+        content: "Somente o comprador deste ticket pode confirmar esta acao.",
+        ephemeral: true,
+      });
+      return true;
+    }
+
+    const authUser = await getAuthUserByDiscordUserId(ticket.user_id);
+    const selectedOrderKey = orderKeyFromId;
+    const order = await getOrderByKey(ticket.guild_id, selectedOrderKey, {
+      authUserId: authUser?.id,
+      discordUserId: ticket.user_id,
+    });
+
+    if (!order) {
+      await interaction.reply({
+        content: "Nao encontrei essa compra na conta vinculada.",
+        ephemeral: true,
+      });
+      return true;
+    }
+
+    const lockKey = `${ticket.id}:${order.key}`;
+    if (pendingRefundActions.has(lockKey)) {
+      await interaction.reply({
+        content: "Ja existe uma solicitacao em andamento para essa compra.",
+        ephemeral: true,
+      });
+      return true;
+    }
+    pendingRefundActions.add(lockKey);
+
+    try {
+      const accountViolations = await fetchActiveAccountViolations(authUser?.id);
+      const eligibility = evaluateRefundEligibility(order, settings, {
+        authUserId: authUser?.id,
+        discordUserId: ticket.user_id,
+        accountViolations,
+      });
+
+      const refundProtocol = generateRefundProtocol(ticket.id, order.key);
+
+      await sendManualApprovalRequest({
+        client,
+        ticket,
+        order,
+        settings,
+        reason: "Solicitacao confirmada pelo comprador via FlowAI (Mesmo expirada).",
+        eligibility,
+        protocol: refundProtocol,
+      });
+
+      await interaction.update(
+        v2Message([
+          {
+            type: COMPONENT_TYPE.CONTAINER,
+            accent_color: 0xf1c40f,
+            components: [
+              textDisplay(
+                `Compra confirmada. A solicitacao foi enviada para analise da equipe responsavel.\n\n**Protocolo: ${refundProtocol}**\nGuarde este numero — ele identifica sua solicitacao e sera usado na comunicacao com a equipe.\n\n> ⚠️ *Pedido fora do prazo limite de reembolso (${eligibility.refundDays} dias). Enviado para analise excepcional da staff.*`
+              ),
+            ],
+          },
+        ])
+      );
+
+      await logRefundAuditEvent({
+        ticket,
+        authUserId: authUser?.id,
+        orderKey: order.key,
+        riskScore: eligibility.riskScore,
+        eventType: "manual_review_opened",
+        outcome: "awaiting_staff",
+        metadata: { protocol: refundProtocol, insideWindow: eligibility.insideWindow, reasons: eligibility.reasons, userConfirmedExpired: true },
+      });
+      return true;
+    } finally {
+      pendingRefundActions.delete(lockKey);
+    }
+  }
+
+  if (action === "cancel_expired") {
+    if (interaction.user.id !== ticket.user_id) {
+      await interaction.reply({
+        content: "Somente o comprador deste ticket pode cancelar esta acao.",
+        ephemeral: true,
+      });
+      return true;
+    }
+
+    await interaction.update(
+      v2Message([
+        {
+          type: COMPONENT_TYPE.CONTAINER,
+          accent_color: 0xb0b0b0,
+          components: [
+            textDisplay(
+              "Solicitacao de reembolso cancelada devido ao prazo expirado. Se precisar de outra ajuda, envie no chat."
+            ),
+          ],
+        },
+      ])
+    );
+
+    await logRefundAuditEvent({
+      ticket,
+      eventType: "selection_cancelled",
+      outcome: "user_cancelled_expired_window",
     });
     return true;
   }
@@ -2002,36 +2143,106 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
       });
 
       if (eligibility.canAutoRefund) {
+        const autoProtocol = generateRefundProtocol(ticket.id, order.key);
         await interaction.update(
           v2Message([
             {
               type: COMPONENT_TYPE.CONTAINER,
-              accent_color: 0x8fdbff,
+              accent_color: 0x2ecc71,
               components: [
-                textDisplay("Compra confirmada. O reembolso esta sendo processado automaticamente agora."),
+                textDisplay(`Compra confirmada. O reembolso esta sendo processado automaticamente.\n\n**Protocolo: ${autoProtocol}**`),
               ],
             },
           ]),
         );
-        await callInternalSalesRefund(
-          order.id,
-          ticket.guild_id,
-          "Solicitacao validada automaticamente pelo FlowAI no ticket.",
-        );
-        await interaction.followUp({
-          content: `${settings.successMessage}\n\nCompra: ${order.productTitle}\nValor: ${formatMoney(order.amount, order.currency)}\nPrazo estimado: o estorno normalmente segue o prazo do Mercado Pago e do banco emissor.`,
-          allowedMentions: { parse: [] },
-        });
+        let refundResult = null;
+        try {
+          refundResult = await callInternalSalesRefund(
+            order.id,
+            ticket.guild_id,
+            `Reembolso automatico FlowAI — protocolo ${autoProtocol}`,
+          );
+        } catch (refundError) {
+          // Auto-process falhou — escalar para revisao manual em vez de deixar sem resposta
+          const fallbackProtocol = generateRefundProtocol(ticket.id, order.key);
+          await sendManualApprovalRequest({
+            client,
+            ticket,
+            order,
+            settings,
+            reason: `Auto-reembolso falhou: ${String(refundError?.message || refundError).slice(0, 300)}`,
+            eligibility,
+            protocol: fallbackProtocol,
+          });
+          await interaction.followUp({
+            content: `Nao consegui processar automaticamente agora. Escalei para a equipe com o protocolo **${fallbackProtocol}**. Em breve voce recebera uma resposta aqui.`,
+            allowedMentions: { parse: [] },
+          });
+          await logRefundAuditEvent({
+            ticket,
+            authUserId: authUser.id,
+            orderKey: order.key,
+            riskScore: eligibility.riskScore,
+            eventType: "auto_refund_fallback_to_manual",
+            outcome: "manual_review",
+            metadata: { protocol: fallbackProtocol, error: String(refundError?.message || refundError).slice(0, 300) },
+          });
+          return true;
+        }
+        if (refundResult?.alreadyRefunded) {
+          await interaction.followUp({
+            content: "Este pedido ja consta como reembolsado no sistema do provedor de pagamento.",
+            allowedMentions: { parse: [] },
+          });
+        } else {
+          await interaction.followUp({
+            content: `${settings.successMessage}\n\nCompra: ${order.productTitle}\nValor: ${formatMoney(order.amount, order.currency)}\nProtocolo: **${autoProtocol}**\nO estorno segue o prazo do provedor de pagamento e do banco emissor.`,
+            allowedMentions: { parse: [] },
+          });
+        }
         await logRefundAuditEvent({
           ticket,
           authUserId: authUser.id,
           orderKey: order.key,
           riskScore: eligibility.riskScore,
           eventType: "refund_processed",
-          outcome: "success",
+          outcome: refundResult?.alreadyRefunded ? "already_refunded" : "success",
+          metadata: { protocol: autoProtocol },
         });
         return true;
       }
+
+      // Warn user if outside refund window and ask for confirmation
+      if (!eligibility.insideWindow) {
+        await interaction.update(
+          v2Message([
+            {
+              type: COMPONENT_TYPE.CONTAINER,
+              accent_color: 0xe67e22,
+              components: [
+                textDisplay(
+                  `⚠️ **Aviso de Prazo Expirado**\n\nIdentifiquei que esta compra (${order.productTitle}) foi realizada em **${formatDate(resolvePurchaseDate(order))}**.\nO prazo limite para reembolso configurado no servidor e de **${eligibility.refundDays} dias** (expirou em **${formatDate(eligibility.deadline)}**).\n\nMesmo assim, voce deseja prosseguir e abrir um chamado para a equipe analisar o seu caso manualmente?`
+                ),
+              ],
+            },
+            actionRow([
+              button({
+                customId: `${REFUND_PREFIX}confirm_expired:${ticket.id}:${order.key}`,
+                label: "Sim, abrir chamado",
+                style: ButtonStyle.Danger,
+              }),
+              button({
+                customId: `${REFUND_PREFIX}cancel_expired:${ticket.id}:${order.key}`,
+                label: "Nao, cancelar",
+                style: ButtonStyle.Secondary,
+              }),
+            ]),
+          ])
+        );
+        return true;
+      }
+
+      const refundProtocol = generateRefundProtocol(ticket.id, order.key);
 
       await sendManualApprovalRequest({
         client,
@@ -2040,6 +2251,7 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
         settings,
         reason: "Solicitacao confirmada pelo comprador via FlowAI.",
         eligibility,
+        protocol: refundProtocol,
       });
       await interaction.update(
         v2Message([
@@ -2048,12 +2260,21 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
             accent_color: 0xf1c40f,
             components: [
               textDisplay(
-                "Compra confirmada. A solicitacao foi enviada para analise da equipe responsavel. Assim que houver uma decisao, ela sera registrada por aqui.",
+                `Compra confirmada. A solicitacao foi enviada para analise da equipe responsavel.\n\n**Protocolo: ${refundProtocol}**\nGuarde este numero — ele identifica sua solicitacao e sera usado na comunicacao com a equipe.`
               ),
             ],
           },
         ]),
       );
+      await logRefundAuditEvent({
+        ticket,
+        authUserId: authUser.id,
+        orderKey: order.key,
+        riskScore: eligibility.riskScore,
+        eventType: "manual_review_opened",
+        outcome: "awaiting_staff",
+        metadata: { protocol: refundProtocol, insideWindow: eligibility.insideWindow, reasons: eligibility.reasons },
+      });
       return true;
     } finally {
       pendingRefundActions.delete(lockKey);
@@ -2120,16 +2341,17 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
     pendingRefundActions.add(lockKey);
     try {
       await interaction.deferUpdate();
-      await callInternalSalesRefund(order.id, ticket.guild_id, `Aprovado manualmente por ${interaction.user.id}.`);
+      const manualProtocol = generateRefundProtocol(ticket.id, order.key);
+      await callInternalSalesRefund(order.id, ticket.guild_id, `Aprovado manualmente por ${interaction.user.id} — protocolo ${manualProtocol}.`);
       await interaction.editReply({
-        content: `Reembolso aprovado e processado por <@${interaction.user.id}> para a compra ${order.productTitle}.`,
+        content: `Reembolso aprovado e processado por <@${interaction.user.id}> para a compra **${order.productTitle}** — Protocolo: \`${manualProtocol}\``,
         embeds: interaction.message.embeds,
         components: [],
         allowedMentions: { parse: [] },
       });
       const channel = await client.channels.fetch(ticket.channel_id).catch(() => null);
       await channel?.send?.({
-        content: `${settings.successMessage}\n\nCompra: ${order.productTitle}\nValor: ${formatMoney(order.amount, order.currency)}\nPrazo estimado: o estorno normalmente segue o prazo do Mercado Pago e do banco emissor.`,
+        content: `${settings.successMessage}\n\nCompra: ${order.productTitle}\nValor: ${formatMoney(order.amount, order.currency)}\nProtocolo: **${manualProtocol}**\nO estorno segue o prazo do provedor de pagamento e do banco emissor.`,
         allowedMentions: { parse: [] },
       });
       await logRefundAuditEvent({
