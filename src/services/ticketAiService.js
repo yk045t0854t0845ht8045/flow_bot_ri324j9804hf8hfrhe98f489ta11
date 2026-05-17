@@ -16,6 +16,7 @@ const {
 } = require("./ticketRefundService");
 
 const MAX_TICKET_AI_MESSAGES = 12;
+const MAX_TICKET_REFUND_CONTEXT_MESSAGES = 40;
 const MAX_TICKET_AI_CONTENT = 1800;
 const MAX_TICKET_LOG_TEXT = 3200;
 const IN_FLIGHT_NOTICE_TTL_MS = 1000 * 12;
@@ -118,9 +119,9 @@ function buildDynamicSystemPrompt(runtime) {
     "Priorize resolver no primeiro retorno com diagnostico objetivo, verificacoes praticas e proximo passo claro.",
     "Quando o problema for de configuracao do Flowdesk ou do Discord, use o contexto salvo do servidor antes de responder.",
     "Se faltar uma informacao critica, faca no maximo uma pergunta complementar e ela deve ser especifica.",
-    "Quando o assunto envolver reembolso, estorno, verificacao de compra, validacao de pedido ou consulta financeira, converse naturalmente, mas nunca conclua nada sem email da compra e numero do pedido.",
-    "Se receber apenas o email, peca tambem o numero do pedido. Se receber apenas o numero do pedido, peca tambem o email usado na compra.",
-    "Depois que os dois dados estiverem disponiveis, avise que a consulta sera feita no sistema integrado e aguarde o fluxo interno retornar as compras reais.",
+    "Quando o assunto envolver reembolso, estorno, verificacao de compra, validacao de pedido ou consulta financeira, converse naturalmente, mas nunca conclua nada sem login seguro da conta e numero do pedido.",
+    "Nao solicite email ou senha no chat para reembolso. Se o usuario enviar email, explique que a verificacao usa login seguro e continue pedindo apenas o numero do pedido depois do vinculo.",
+    "Depois que a conta estiver vinculada e o numero do pedido estiver disponivel, avise que a consulta sera feita no sistema integrado e aguarde o fluxo interno retornar as compras reais.",
   ];
 
   if (rules) {
@@ -950,8 +951,8 @@ function buildInitialReasonGuidance(reason) {
       "Entendi.",
       "Sobre reembolso, isso normalmente segue com a equipe responsavel pela compra/licenca.",
       hasPartner
-        ? "Sobre parceria, isso tambem entra no time responsavel. Se quiser adiantar, manda o email da compra e o link da sua comunidade/projeto."
-        : "Se quiser adiantar, manda o email da compra ou o numero do pedido.",
+        ? "Sobre parceria, isso tambem entra no time responsavel. Se quiser adiantar, manda o link da sua comunidade/projeto."
+        : "Se quiser adiantar, use o login seguro quando eu pedir e separe o numero do pedido.",
     ].join(" ");
   }
 
@@ -1047,7 +1048,7 @@ function buildTicketRuleBasedReply(ticket, runtime, content) {
   }
 
   if (normalized.includes("reembolso") || normalized.includes("estorno")) {
-    return "Certo. Para adiantar isso, me manda o email da compra ou o numero do pedido. Se tiver mais de um assunto no ticket, eu separo com voce por partes.";
+    return "Certo. Para adiantar isso com seguranca, eu vou usar o login vinculado e depois pedir apenas o numero do pedido. Se tiver mais de um assunto no ticket, eu separo com voce por partes.";
   }
 
   if (normalized.includes("parceir")) {
@@ -1111,7 +1112,7 @@ function buildTicketFailSafeReply(ticket, runtime, content) {
       return [
         "Ja consigo adiantar essa triagem por aqui.",
         "",
-        "Se isso envolve pagamento, licenca, renovacao ou reembolso, me manda o email da compra e, se existir, o numero do pedido ou a cobranca que apareceu.",
+        "Se isso envolve pagamento, licenca, renovacao ou reembolso, eu vou usar o login seguro da conta e depois pedir o numero do pedido ou a cobranca que apareceu.",
         "Se houve duplicidade, chargeback ou cancelamento, eu separo com voce o que ja da para validar agora e o que precisa do financeiro.",
       ].join("\n");
     case "sales":
@@ -1217,7 +1218,7 @@ function buildTicketSuggestionFallback(reason, settings, options = {}) {
     case "billing":
       return [
         "Pelo que voce descreveu, vale adiantar tres pontos antes de seguir com o ticket:",
-        "- separe o email da compra, numero do pedido ou a cobranca envolvida",
+        "- tenha em maos o numero do pedido ou a cobranca envolvida",
         "- se houve duplicidade, chargeback, cancelamento ou estorno, diga isso logo na abertura",
         "- se for licenca ou plano, diga qual recurso deveria estar liberado",
         "",
@@ -1558,7 +1559,7 @@ async function handleTicketAiMessage(message, client) {
 
   const historyRowsBeforeUserMessage = await getRecentTicketAiMessages(
     ticket.id,
-    MAX_TICKET_AI_MESSAGES,
+    MAX_TICKET_REFUND_CONTEXT_MESSAGES,
   ).catch(() => []);
   const refundMemory = buildRefundMemoryPatch(content, historyRowsBeforeUserMessage);
 
@@ -1571,9 +1572,7 @@ async function handleTicketAiMessage(message, client) {
       messageId: message.id,
       attachmentCount: message.attachments?.size || 0,
       refund: {
-        intent: refundMemory.intent,
-        email: refundMemory.email,
-        orderNumber: refundMemory.orderNumber,
+        ...refundMemory,
       },
     },
   });

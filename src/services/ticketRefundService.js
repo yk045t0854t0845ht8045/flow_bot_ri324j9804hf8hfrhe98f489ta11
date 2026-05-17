@@ -3,8 +3,9 @@ const {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
-  StringSelectMenuBuilder,
+  MessageFlags,
 } = require("discord.js");
+const crypto = require("node:crypto");
 const { createClient } = require("@supabase/supabase-js");
 const { env } = require("../config/env");
 const { canClaimTicket, canCloseTicket } = require("../utils/staff");
@@ -17,9 +18,33 @@ const supabase = createClient(env.supabaseUrl, env.supabaseServiceRoleKey, {
 });
 
 const REFUND_PREFIX = "ticket:refund:";
-const ORDER_LOOKUP_TIMEOUT_MS = 12_000;
 const DEFAULT_REFUND_DAYS = 7;
+const ORDER_LOOKUP_TIMEOUT_MS = 12_000;
+const REFUND_CONTEXT_TTL_MS = 1000 * 60 * 60;
+const REFUND_PROMPT_COOLDOWN_MS = 1000 * 35;
+const REFUND_LOGIN_LINK_TTL_MS = 1000 * 60 * 15;
+const REFUND_LOGIN_POLL_MS = 5000;
+const REFUND_LOGIN_POLL_MAX_MS = 1000 * 60 * 5;
+const REFUND_LOOKUP_RATE_LIMIT_WINDOW_MS = 1000 * 60 * 10;
+const REFUND_LOOKUP_RATE_LIMIT_MAX = 5;
+const COMPONENTS_V2_FLAG = MessageFlags.IsComponentsV2 || 32768;
+
+const COMPONENT_TYPE = {
+  ACTION_ROW: 1,
+  BUTTON: 2,
+  STRING_SELECT: 3,
+  TEXT_DISPLAY: 10,
+  SEPARATOR: 14,
+  CONTAINER: 17,
+};
+
 const pendingRefundActions = new Set();
+const activeLoginPollers = new Map();
+const lookupBuckets = new Map();
+
+function nowIso() {
+  return new Date().toISOString();
+}
 
 function normalizeText(value, maxLength = 1800) {
   return String(value || "")
@@ -27,6 +52,12 @@ function normalizeText(value, maxLength = 1800) {
     .replace(/\r/g, "\n")
     .trim()
     .slice(0, maxLength);
+}
+
+function truncateText(value, maxLength) {
+  const text = String(value || "").trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
 }
 
 function normalizeIntentText(value) {
@@ -38,77 +69,413 @@ function normalizeIntentText(value) {
     .trim();
 }
 
+function textDisplay(content) {
+  return {
+    type: COMPONENT_TYPE.TEXT_DISPLAY,
+    content: truncateText(content, 3900),
+  };
+}
+
+function separator() {
+  return {
+    type: COMPONENT_TYPE.SEPARATOR,
+    divider: true,
+    spacing: 1,
+  };
+}
+
+function actionRow(components) {
+  return {
+    type: COMPONENT_TYPE.ACTION_ROW,
+    components,
+  };
+}
+
+function linkButton({ label, url }) {
+  return {
+    type: COMPONENT_TYPE.BUTTON,
+    style: ButtonStyle.Link,
+    label: truncateText(label, 80),
+    url,
+  };
+}
+
+function button({ customId, label, style = ButtonStyle.Secondary, disabled = false }) {
+  return {
+    type: COMPONENT_TYPE.BUTTON,
+    style,
+    custom_id: customId,
+    label: truncateText(label, 80),
+    disabled,
+  };
+}
+
+function selectMenu({ customId, placeholder, options }) {
+  return {
+    type: COMPONENT_TYPE.STRING_SELECT,
+    custom_id: customId,
+    placeholder: truncateText(placeholder, 100),
+    min_values: 1,
+    max_values: 1,
+    options,
+  };
+}
+
+function v2Message(components, extra = {}) {
+  return {
+    flags: COMPONENTS_V2_FLAG,
+    allowedMentions: { parse: [] },
+    components,
+    ...extra,
+  };
+}
+
+function buildAppUrl(path) {
+  const base = String(env.appUrl || "https://www.flwdesk.com").replace(/\/+$/, "");
+  return `${base}${path.startsWith("/") ? path : `/${path}`}`;
+}
+
+function createSecureToken() {
+  return crypto.randomBytes(32).toString("base64url");
+}
+
+function hashSecureToken(token) {
+  return crypto
+    .createHash("sha256")
+    .update(String(token || "").trim(), "utf8")
+    .digest("hex");
+}
+
+function parseTimestampMs(value) {
+  const parsed = Date.parse(String(value || ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 function extractEmail(text) {
   const match = String(text || "").match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
   return match ? match[0].toLowerCase() : null;
 }
 
-function extractOrderNumber(text) {
-  const normalized = String(text || "");
-  const explicit = normalized.match(
-    /(?:pedido|ordem|order|compra|numero|n[úu]mero|#)\s*(?:do|da|n[ºo.]*)?\s*[:#-]?\s*([a-z0-9-]{4,64})/i,
-  );
-  if (explicit?.[1]) return explicit[1].trim();
+function normalizeLookupToken(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/^#+/, "")
+    .replace(/[^a-z0-9]+/g, "");
+}
 
-  const candidates = normalized.match(/\b(?:[a-z]{2,}-)?[a-z0-9]{6,64}\b/gi) || [];
-  return candidates
-    .map((candidate) => candidate.trim())
-    .find((candidate) => !candidate.includes("@") && /\d/.test(candidate)) || null;
+function normalizeDigits(value) {
+  return String(value || "").replace(/\D/g, "");
+}
+
+function extractOrderCandidates(text, options = {}) {
+  const raw = String(text || "");
+  const withoutEmails = raw.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, " ");
+  const normalized = normalizeIntentText(withoutEmails);
+  const candidates = [];
+
+  const pushCandidate = (value, explicit = false) => {
+    const token = normalizeLookupToken(value);
+    if (!token || !/\d/.test(token)) return;
+    if (token.length < 2) return;
+    if (!explicit && token.length < (options.allowShortGeneric ? 2 : 4)) return;
+    if (candidates.includes(token)) return;
+    candidates.push(token);
+  };
+
+  const explicitPattern =
+    /(?:#|pedido|ordem|order|compra|numero|num|n|id|codigo|cod|protocolo|e o|eh o)\s*(?:do|da|n|numero|pedido)?\s*[:#-]?\s*([a-z0-9][a-z0-9_-]{1,63})/gi;
+  for (const match of normalized.matchAll(explicitPattern)) {
+    pushCandidate(match[1], true);
+  }
+
+  for (const match of withoutEmails.matchAll(/#\s*([a-z0-9][a-z0-9_-]{1,63})/gi)) {
+    pushCandidate(match[1], true);
+  }
+
+  const genericPattern = options.allowShortGeneric
+    ? /\b(?:[a-z]{2,}-)?[a-z0-9]{2,64}\b/gi
+    : /\b(?:[a-z]{2,}-)?[a-z0-9]{4,64}\b/gi;
+  for (const match of withoutEmails.matchAll(genericPattern)) {
+    const candidate = match[0];
+    if (candidate.includes("@")) continue;
+    pushCandidate(candidate, false);
+  }
+
+  return candidates.slice(0, 6);
+}
+
+function includesAny(normalized, hints) {
+  return hints.some((hint) => normalized.includes(hint));
 }
 
 function isRefundOrOrderIntent(text) {
   const normalized = normalizeIntentText(text);
-  return [
+  return includesAny(normalized, [
     "reembolso",
     "estorno",
     "refund",
+    "devolver dinheiro",
+    "cancelar compra",
+    "cancelamento da compra",
     "verificar compra",
     "verificacao de compra",
     "validar pedido",
     "consultar pedido",
     "numero do pedido",
     "n do pedido",
-  ].some((hint) => normalized.includes(hint));
+    "meu pedido",
+    "minha compra",
+    "comprei",
+    "nao recebi",
+    "pedido",
+  ]);
+}
+
+function isCancelRefundIntent(text) {
+  const normalized = normalizeIntentText(text);
+  return includesAny(normalized, [
+    "esquece",
+    "deixa pra la",
+    "deixa quieto",
+    "cancela isso",
+    "cancelar isso",
+    "cancelar reembolso",
+    "outro assunto",
+    "outra coisa",
+    "nao quero mais",
+  ]);
+}
+
+function isWaitingFiller(text) {
+  const normalized = normalizeIntentText(text);
+  if (!normalized) return false;
+  return includesAny(normalized, [
+    "pera",
+    "perai",
+    "vou ver",
+    "vou procurar",
+    "to procurando",
+    "estou procurando",
+    "nao achei",
+    "n achei",
+    "nao sei",
+    "n sei",
+    "calma",
+    "um minuto",
+    "so um minuto",
+    "aguarda",
+    "ok to no aguardo",
+    "to no aguardo",
+  ]);
+}
+
+function isOrderHelpQuestion(text) {
+  const normalized = normalizeIntentText(text);
+  return includesAny(normalized, [
+    "como vejo",
+    "onde vejo",
+    "onde acho",
+    "onde encontro",
+    "como acho",
+    "nao sei o numero",
+    "nao sei o pedido",
+    "qual numero",
+  ]);
+}
+
+function isTimingQuestion(text) {
+  const normalized = normalizeIntentText(text);
+  return includesAny(normalized, [
+    "demora",
+    "quanto tempo",
+    "prazo",
+    "quando cai",
+    "quando volta",
+    "estorno demora",
+  ]);
+}
+
+function containsManipulationAttempt(text) {
+  const normalized = normalizeIntentText(text);
+  return includesAny(normalized, [
+    "ignore as regras",
+    "ignora as regras",
+    "burlar",
+    "aprova sem validar",
+    "aprovar sem validar",
+    "finge que",
+    "sou admin",
+    "sem verificacao",
+    "nao verifica",
+  ]);
+}
+
+function createDefaultRefundState() {
+  return {
+    version: 2,
+    intent: false,
+    stage: null,
+    authStatus: "unknown",
+    authUserId: null,
+    authLinkId: null,
+    loginMessageId: null,
+    orderCandidates: [],
+    failedOrderCandidates: [],
+    availableOrderKeys: [],
+    selectedOrderKey: null,
+    lookupCount: 0,
+    lastPromptKind: null,
+    lastPromptAt: null,
+    lastLookupAt: null,
+    lastActionAt: null,
+    riskScore: null,
+  };
+}
+
+function coerceNumberOrNull(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function sanitizeRefundState(state) {
+  const base = createDefaultRefundState();
+  const merged = {
+    ...base,
+    ...(state && typeof state === "object" ? state : {}),
+    version: 2,
+  };
+
+  merged.intent = merged.intent === true;
+  merged.stage = typeof merged.stage === "string" ? merged.stage : null;
+  merged.authStatus = typeof merged.authStatus === "string" ? merged.authStatus : "unknown";
+  merged.authUserId = coerceNumberOrNull(merged.authUserId);
+  merged.authLinkId = typeof merged.authLinkId === "string" ? merged.authLinkId : null;
+  merged.loginMessageId =
+    typeof merged.loginMessageId === "string" ? merged.loginMessageId : null;
+  merged.orderCandidates = Array.isArray(merged.orderCandidates)
+    ? merged.orderCandidates.map(normalizeLookupToken).filter(Boolean).slice(0, 8)
+    : [];
+  merged.failedOrderCandidates = Array.isArray(merged.failedOrderCandidates)
+    ? merged.failedOrderCandidates.map(normalizeLookupToken).filter(Boolean).slice(0, 12)
+    : [];
+  merged.availableOrderKeys = Array.isArray(merged.availableOrderKeys)
+    ? merged.availableOrderKeys.map((key) => String(key || "").slice(0, 90)).filter(Boolean).slice(0, 10)
+    : [];
+  merged.selectedOrderKey =
+    typeof merged.selectedOrderKey === "string" ? merged.selectedOrderKey.slice(0, 90) : null;
+  merged.lookupCount = Math.max(0, Number(merged.lookupCount || 0));
+  merged.lastPromptKind =
+    typeof merged.lastPromptKind === "string" ? merged.lastPromptKind : null;
+  merged.lastPromptAt =
+    typeof merged.lastPromptAt === "string" ? merged.lastPromptAt : null;
+  merged.lastLookupAt =
+    typeof merged.lastLookupAt === "string" ? merged.lastLookupAt : null;
+  merged.lastActionAt =
+    typeof merged.lastActionAt === "string" ? merged.lastActionAt : null;
+  merged.riskScore = coerceNumberOrNull(merged.riskScore);
+  return merged;
+}
+
+function isActiveRefundState(state) {
+  return [
+    "awaiting_auth",
+    "awaiting_order",
+    "lookup_failed",
+    "selecting_order",
+  ].includes(String(state?.stage || ""));
 }
 
 function readRefundMemory(historyRows) {
-  const memory = {
-    email: null,
-    orderNumber: null,
-    intent: false,
-  };
+  let state = createDefaultRefundState();
 
   for (const row of historyRows || []) {
     const metadata = row?.metadata && typeof row.metadata === "object" ? row.metadata : {};
     const refund = metadata.refund && typeof metadata.refund === "object" ? metadata.refund : {};
-    if (refund.intent === true) memory.intent = true;
-    if (typeof refund.email === "string" && refund.email) memory.email = refund.email;
-    if (typeof refund.orderNumber === "string" && refund.orderNumber) {
-      memory.orderNumber = refund.orderNumber;
-    }
+    if (!Object.keys(refund).length) continue;
+
+    state = sanitizeRefundState({
+      ...state,
+      ...refund,
+      intent: state.intent || refund.intent === true,
+      orderCandidates:
+        Array.isArray(refund.orderCandidates) && refund.orderCandidates.length
+          ? refund.orderCandidates
+          : refund.orderNumber
+            ? [refund.orderNumber]
+            : state.orderCandidates,
+      failedOrderCandidates:
+        Array.isArray(refund.failedOrderCandidates) && refund.failedOrderCandidates.length
+          ? refund.failedOrderCandidates
+          : state.failedOrderCandidates,
+      lastActionAt: refund.lastActionAt || row.created_at || state.lastActionAt,
+    });
   }
 
-  return memory;
+  const lastActionMs = parseTimestampMs(state.lastActionAt);
+  if (
+    lastActionMs > 0 &&
+    Date.now() - lastActionMs > REFUND_CONTEXT_TTL_MS &&
+    !["manual_review", "completed"].includes(String(state.stage || ""))
+  ) {
+    return createDefaultRefundState();
+  }
+
+  if (state.stage === "cancelled") {
+    return createDefaultRefundState();
+  }
+
+  return state;
 }
 
 function buildRefundMemoryPatch(content, historyRows) {
-  const memory = readRefundMemory(historyRows);
+  const previousState = readRefundMemory(historyRows);
+  const currentIntent = isRefundOrOrderIntent(content);
+  const cancelIntent = isCancelRefundIntent(content);
+  const active = isActiveRefundState(previousState);
+  const orderCandidates = extractOrderCandidates(content, {
+    allowShortGeneric: active && !cancelIntent,
+  });
   const email = extractEmail(content);
-  const orderNumber = extractOrderNumber(content);
-  const intent = memory.intent || isRefundOrOrderIntent(content);
 
-  return {
+  if (cancelIntent && active) {
+    return sanitizeRefundState({
+      ...previousState,
+      intent: false,
+      stage: "cancelled",
+      lastActionAt: nowIso(),
+      currentIntent,
+      cancelIntent: true,
+      orderCandidates: previousState.orderCandidates,
+    });
+  }
+
+  const intent = previousState.intent || currentIntent || (active && orderCandidates.length > 0);
+  const nextOrderCandidates = intent && orderCandidates.length
+    ? [...new Set([...orderCandidates, ...previousState.orderCandidates])].slice(0, 8)
+    : previousState.orderCandidates;
+
+  return sanitizeRefundState({
+    ...previousState,
     intent,
-    email: email || memory.email,
-    orderNumber: orderNumber || memory.orderNumber,
-    justProvidedEmail: Boolean(email && !orderNumber && !memory.orderNumber),
-  };
+    stage: previousState.stage || (intent ? "awaiting_auth" : null),
+    orderCandidates: nextOrderCandidates,
+    orderNumber: nextOrderCandidates[0] || null,
+    currentIntent,
+    cancelIntent: false,
+    justProvidedEmail: Boolean(email && !orderCandidates.length),
+    chatEmailProvided: Boolean(email),
+    lastActionAt: nowIso(),
+  });
 }
 
-function formatMoney(value) {
+function formatMoney(value, currency = "BRL") {
   return new Intl.NumberFormat("pt-BR", {
     style: "currency",
-    currency: "BRL",
+    currency: currency || "BRL",
   }).format(Number(value || 0));
 }
 
@@ -125,9 +492,10 @@ function formatDate(value) {
 function resolveProductTitle(items) {
   const titles = (items || [])
     .map((item) => {
-      const snapshot = item?.product_snapshot && typeof item.product_snapshot === "object"
-        ? item.product_snapshot
-        : {};
+      const snapshot =
+        item?.product_snapshot && typeof item.product_snapshot === "object"
+          ? item.product_snapshot
+          : {};
       return normalizeText(snapshot.title || snapshot.name || "Produto", 80);
     })
     .filter(Boolean);
@@ -136,64 +504,114 @@ function resolveProductTitle(items) {
   return `${titles[0]} +${titles.length - 1}`;
 }
 
-function resolvePurchaseDate(cart) {
-  return cart.paid_at || cart.created_at || cart.updated_at || null;
+function resolvePurchaseDate(order) {
+  return order.purchaseDate || order.paid_at || order.created_at || order.updated_at || null;
 }
 
-function normalizeOrderToken(value) {
-  return String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/^#/, "");
+function encodeOrderKey(source, id) {
+  return `${source === "payment" ? "p" : "s"}_${String(id || "").replace(/[^a-zA-Z0-9_-]/g, "")}`;
 }
 
-function orderMatches(cart, orderNumber) {
-  const token = normalizeOrderToken(orderNumber);
-  if (!token) return true;
-  const candidates = [
-    cart.id,
-    cart.provider_payment_id,
-    cart.provider_external_reference,
-    cart.checkout_token_hash,
-  ].map(normalizeOrderToken);
-  return candidates.some(
-    (candidate) =>
-      candidate &&
-      (candidate === token || candidate.endsWith(token) || token.endsWith(candidate)),
-  );
-}
-
-function evaluateRefundEligibility(cart, settings) {
-  const purchaseDate = resolvePurchaseDate(cart);
-  const purchaseMs = purchaseDate ? Date.parse(purchaseDate) : Number.NaN;
-  const refundDays = Math.max(0, Number(settings.refundLimitDays || DEFAULT_REFUND_DAYS));
-  const deadlineMs = Number.isFinite(purchaseMs)
-    ? purchaseMs + refundDays * 24 * 60 * 60 * 1000
-    : Number.NaN;
-  const insideWindow = Number.isFinite(deadlineMs) ? Date.now() <= deadlineMs : false;
-  const status = String(cart.status || "").toLowerCase();
-  const providerStatus = String(cart.provider_status || "").toLowerCase();
-  const alreadyRefunded =
-    status === "refunded" ||
-    providerStatus === "refunded" ||
-    String(cart.provider_status_detail || "").toLowerCase().includes("refund");
-  const paid = ["paid", "delivered", "delivery_failed"].includes(status);
-  const hasProviderPayment = Boolean(cart.provider_payment_id);
-
+function decodeOrderKey(value) {
+  const normalized = String(value || "").trim();
+  const match = normalized.match(/^([sp])_([a-zA-Z0-9_-]{1,80})$/);
+  if (!match) return null;
   return {
-    eligible: paid && hasProviderPayment && insideWindow && !alreadyRefunded,
-    paid,
-    hasProviderPayment,
-    alreadyRefunded,
-    insideWindow,
-    refundDays,
-    deadline: Number.isFinite(deadlineMs) ? new Date(deadlineMs).toISOString() : null,
+    source: match[1] === "p" ? "payment" : "sales",
+    id: match[2],
   };
 }
 
-function parseJsonObject(value) {
-  if (!value || typeof value !== "object") return {};
-  return value;
+function buildOrderTokens(order) {
+  const raw = order.raw || {};
+  return [
+    order.id,
+    order.key,
+    raw.order_number,
+    raw.order_public_id,
+    raw.cart_public_id,
+    raw.provider_payment_id,
+    raw.provider_external_reference,
+    raw.checkout_token_hash,
+    raw.id,
+  ]
+    .map((value) => normalizeLookupToken(value))
+    .filter(Boolean);
+}
+
+function scoreOrderMatch(order, candidates) {
+  const tokens = buildOrderTokens(order);
+  let best = 0;
+  for (const candidate of candidates || []) {
+    const normalizedCandidate = normalizeLookupToken(candidate);
+    const candidateDigits = normalizeDigits(normalizedCandidate);
+    if (!normalizedCandidate) continue;
+
+    for (const token of tokens) {
+      const tokenDigits = normalizeDigits(token);
+      if (token === normalizedCandidate) best = Math.max(best, 100);
+      if (candidateDigits && tokenDigits && tokenDigits === candidateDigits) best = Math.max(best, 96);
+      if (normalizedCandidate.length >= 4 && token.endsWith(normalizedCandidate)) {
+        best = Math.max(best, 82);
+      }
+      if (candidateDigits.length >= 4 && tokenDigits.endsWith(candidateDigits)) {
+        best = Math.max(best, 84);
+      }
+      if (normalizedCandidate.length >= 2 && token.endsWith(normalizedCandidate)) {
+        best = Math.max(best, 58);
+      }
+      if (candidateDigits.length >= 2 && tokenDigits.endsWith(candidateDigits)) {
+        best = Math.max(best, 60);
+      }
+      if (normalizedCandidate.length >= 4 && token.includes(normalizedCandidate)) {
+        best = Math.max(best, 48);
+      }
+    }
+  }
+  return best;
+}
+
+async function withTimeout(promise, timeoutMs, label) {
+  let timeout = null;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeout = setTimeout(() => reject(new Error(`${label} excedeu o tempo limite.`)), timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function isMissingTableError(error, tableName) {
+  const message = String(error?.message || "").toLowerCase();
+  return (
+    error?.code === "42P01" ||
+    error?.code === "PGRST205" ||
+    message.includes(String(tableName || "").toLowerCase()) ||
+    message.includes("schema cache")
+  );
+}
+
+async function logRefundAuditEvent(input) {
+  const payload = {
+    ticket_id: input.ticket?.id || null,
+    guild_id: input.ticket?.guild_id || input.guildId || null,
+    channel_id: input.ticket?.channel_id || null,
+    discord_user_id: input.ticket?.user_id || input.discordUserId || null,
+    auth_user_id: input.authUserId || null,
+    event_type: input.eventType,
+    outcome: input.outcome || "recorded",
+    order_key: input.orderKey || null,
+    risk_score: Number.isFinite(Number(input.riskScore)) ? Number(input.riskScore) : null,
+    metadata: input.metadata || {},
+  };
+
+  const result = await supabase.from("ticket_refund_audit_events").insert(payload);
+  if (result.error && !isMissingTableError(result.error, "ticket_refund_audit_events")) {
+    console.warn("[ticket-refund] falha ao registrar auditoria:", result.error.message);
+  }
 }
 
 async function getTicketRefundSettings(guildId, runtime) {
@@ -223,8 +641,7 @@ async function getTicketRefundSettings(guildId, runtime) {
     .maybeSingle();
 
   if (result.error) {
-    const message = String(result.error.message || "").toLowerCase();
-    if (result.error.code === "42P01" || message.includes("guild_ticket_refund_settings")) {
+    if (isMissingTableError(result.error, "guild_ticket_refund_settings")) {
       return fallback;
     }
     console.warn("[ticket-refund] falha ao ler configuracao:", result.error.message);
@@ -249,99 +666,671 @@ async function getTicketRefundSettings(guildId, runtime) {
   };
 }
 
-async function withTimeout(promise, timeoutMs, label) {
-  let timeout = null;
-  const timeoutPromise = new Promise((_, reject) => {
-    timeout = setTimeout(() => reject(new Error(`${label} excedeu o tempo limite.`)), timeoutMs);
+async function persistRefundState(persist, state, extra = {}) {
+  if (typeof persist !== "function") return;
+  const safeState = sanitizeRefundState({
+    ...state,
+    ...extra,
+    lastActionAt: extra.lastActionAt || state.lastActionAt || nowIso(),
   });
-
-  try {
-    return await Promise.race([promise, timeoutPromise]);
-  } finally {
-    clearTimeout(timeout);
-  }
+  await persist({
+    authorId: null,
+    authorType: "system",
+    source: "ticket_refund_state",
+    content: `refund-state:${safeState.stage || "idle"}`,
+    metadata: {
+      refund: safeState,
+    },
+  }).catch((error) => {
+    console.warn("[ticket-refund] falha ao persistir estado:", error.message);
+  });
 }
 
-async function findSalesOrders({ guildId, email, orderNumber, discordUserId }) {
-  const normalizedEmail = String(email || "").trim().toLowerCase();
-  const userResult = await supabase
+function shouldPrompt(state, kind, cooldownMs = REFUND_PROMPT_COOLDOWN_MS) {
+  if (state.lastPromptKind !== kind) return true;
+  const lastPromptMs = parseTimestampMs(state.lastPromptAt);
+  return !lastPromptMs || Date.now() - lastPromptMs >= cooldownMs;
+}
+
+function markPrompt(state, kind) {
+  return sanitizeRefundState({
+    ...state,
+    lastPromptKind: kind,
+    lastPromptAt: nowIso(),
+    lastActionAt: nowIso(),
+  });
+}
+
+async function getAuthUserByDiscordUserId(discordUserId) {
+  const normalizedDiscordUserId = String(discordUserId || "").trim();
+  if (!normalizedDiscordUserId) return null;
+  const result = await supabase
     .from("auth_users")
-    .select("id, email, discord_user_id")
-    .ilike("email", normalizedEmail)
+    .select("id, email, discord_user_id, display_name, username")
+    .eq("discord_user_id", normalizedDiscordUserId)
+    .maybeSingle();
+  if (result.error) {
+    console.warn("[ticket-refund] falha ao consultar usuario vinculado:", result.error.message);
+    return null;
+  }
+  return result.data || null;
+}
+
+async function createTicketRefundAuthLink(ticket) {
+  const token = createSecureToken();
+  const expiresAt = new Date(Date.now() + REFUND_LOGIN_LINK_TTL_MS).toISOString();
+  const insert = await supabase
+    .from("ticket_refund_auth_links")
+    .insert({
+      ticket_id: ticket.id,
+      guild_id: ticket.guild_id,
+      channel_id: ticket.channel_id,
+      discord_user_id: ticket.user_id,
+      token_hash: hashSecureToken(token),
+      status: "pending",
+      expires_at: expiresAt,
+    })
+    .select("id")
     .maybeSingle();
 
-  const authUser = userResult.error ? null : userResult.data;
-  const query = supabase
-    .from("guild_sales_carts")
-    .select(
-      "id, guild_id, discord_user_id, auth_user_id, status, total_amount, provider, provider_payment_id, provider_status, provider_status_detail, paid_at, created_at, updated_at",
-    )
-    .eq("guild_id", guildId)
-    .order("created_at", { ascending: false })
-    .limit(20);
-
-  if (authUser?.id) {
-    query.eq("auth_user_id", authUser.id);
-  } else if (discordUserId) {
-    query.eq("discord_user_id", discordUserId);
+  if (insert.error) {
+    if (!isMissingTableError(insert.error, "ticket_refund_auth_links")) {
+      console.warn("[ticket-refund] falha ao criar link de login:", insert.error.message);
+    }
+    return {
+      linkId: null,
+      url: buildAppUrl("/api/auth/discord"),
+      expiresAt,
+    };
   }
 
-  const cartsResult = await query;
-  if (cartsResult.error) {
-    throw new Error(cartsResult.error.message);
+  return {
+    linkId: insert.data?.id || null,
+    url: buildAppUrl(`/support/discord-auth/${encodeURIComponent(token)}`),
+    expiresAt,
+  };
+}
+
+async function readTicketRefundAuthLink(linkId) {
+  if (!linkId) return null;
+  const result = await supabase
+    .from("ticket_refund_auth_links")
+    .select("id, ticket_id, guild_id, discord_user_id, status, auth_user_id, expires_at, confirmed_at")
+    .eq("id", linkId)
+    .maybeSingle();
+  if (result.error) {
+    if (!isMissingTableError(result.error, "ticket_refund_auth_links")) {
+      console.warn("[ticket-refund] falha ao ler link de login:", result.error.message);
+    }
+    return null;
   }
+  return result.data || null;
+}
 
-  const carts = (cartsResult.data || []).filter((cart) => orderMatches(cart, orderNumber));
-  if (!carts.length) return [];
+async function getAuthUserById(userId) {
+  if (!Number.isFinite(Number(userId))) return null;
+  const result = await supabase
+    .from("auth_users")
+    .select("id, email, discord_user_id, display_name, username")
+    .eq("id", Number(userId))
+    .maybeSingle();
+  return result.error ? null : result.data || null;
+}
 
-  const cartIds = carts.map((cart) => cart.id);
-  const itemsResult = await supabase
+function buildLoginPromptPayload(url) {
+  return v2Message([
+    {
+      type: COMPONENT_TYPE.CONTAINER,
+      accent_color: 0x8fdbff,
+      components: [
+        textDisplay(
+          [
+            "## Login seguro necessario",
+            "Para verificar reembolso eu preciso confirmar que este Discord pertence a uma conta Flowdesk. Nao envie senha ou dados sensiveis no chat.",
+            "",
+            "Clique em **Login** para entrar ou vincular sua conta. Assim que a vinculacao terminar, eu atualizo esta mensagem e continuo por aqui pedindo apenas o numero do pedido.",
+          ].join("\n"),
+        ),
+      ],
+    },
+    actionRow([linkButton({ label: "Login", url })]),
+  ]);
+}
+
+function buildLoginConfirmedPayload() {
+  return v2Message([
+    {
+      type: COMPONENT_TYPE.CONTAINER,
+      accent_color: 0x2ecc71,
+      components: [
+        textDisplay(
+          [
+            "## Conta vinculada com sucesso",
+            "A verificacao segura foi concluida. Pode voltar ao ticket; vou continuar usando a conta vinculada, sem pedir email ou senha no chat.",
+          ].join("\n"),
+        ),
+      ],
+    },
+  ]);
+}
+
+async function startLoginPolling({ client, ticket, linkId, authMessage, persist, state }) {
+  const key = `${ticket.id}:${linkId || ticket.user_id}`;
+  if (activeLoginPollers.has(key)) return;
+
+  const startedAt = Date.now();
+  const interval = setInterval(async () => {
+    try {
+      if (Date.now() - startedAt > REFUND_LOGIN_POLL_MAX_MS) {
+        clearInterval(interval);
+        activeLoginPollers.delete(key);
+        return;
+      }
+
+      const link = await readTicketRefundAuthLink(linkId);
+      let authUser = null;
+      if (link?.status === "confirmed" && link.auth_user_id) {
+        authUser = await getAuthUserById(link.auth_user_id);
+      }
+      if (!authUser) {
+        authUser = await getAuthUserByDiscordUserId(ticket.user_id);
+      }
+      if (!authUser) return;
+
+      clearInterval(interval);
+      activeLoginPollers.delete(key);
+
+      await authMessage?.edit(buildLoginConfirmedPayload()).catch(() => null);
+      const channel = await client.channels.fetch(ticket.channel_id).catch(() => null);
+      await channel?.send?.({
+        content:
+          "Conta vinculada com sucesso. Agora me envie o numero do pedido para eu consultar a compra com seguranca.",
+        allowedMentions: { parse: [] },
+      });
+      await persistRefundState(persist, state, {
+        stage: "awaiting_order",
+        authStatus: "linked",
+        authUserId: authUser.id,
+        lastPromptKind: "order_after_auth",
+        lastPromptAt: nowIso(),
+      });
+      await logRefundAuditEvent({
+        ticket,
+        authUserId: authUser.id,
+        eventType: "auth_link_confirmed",
+        outcome: "success",
+      });
+    } catch (error) {
+      console.warn("[ticket-refund] poll de login falhou:", error.message);
+    }
+  }, REFUND_LOGIN_POLL_MS);
+
+  activeLoginPollers.set(key, interval);
+}
+
+async function sendSecureLoginPrompt({ message, client, ticket, persist, state }) {
+  const link = await createTicketRefundAuthLink(ticket);
+  const payload = buildLoginPromptPayload(link.url);
+  const sent = await message.channel.send(payload);
+  const nextState = markPrompt(
+    {
+      ...state,
+      intent: true,
+      stage: "awaiting_auth",
+      authStatus: "pending",
+      authLinkId: link.linkId,
+      loginMessageId: sent?.id || null,
+    },
+    "login",
+  );
+  await persistRefundState(persist, nextState);
+  await logRefundAuditEvent({
+    ticket,
+    eventType: "auth_link_created",
+    outcome: link.linkId ? "success" : "fallback",
+    metadata: { expiresAt: link.expiresAt },
+  });
+  await startLoginPolling({
+    client,
+    ticket,
+    linkId: link.linkId,
+    authMessage: sent,
+    persist,
+    state: nextState,
+  });
+}
+
+async function fetchSalesCartItems(cartIds) {
+  if (!cartIds.length) return new Map();
+  const result = await supabase
     .from("guild_sales_cart_items")
     .select("id, cart_id, product_id, quantity, unit_price_amount, total_amount, product_snapshot")
     .in("cart_id", cartIds);
 
-  const itemsByCart = new Map();
-  for (const item of itemsResult.error ? [] : itemsResult.data || []) {
-    const current = itemsByCart.get(item.cart_id) || [];
+  const byCart = new Map();
+  for (const item of result.error ? [] : result.data || []) {
+    const current = byCart.get(item.cart_id) || [];
     current.push(item);
-    itemsByCart.set(item.cart_id, current);
+    byCart.set(item.cart_id, current);
   }
-
-  return carts.map((cart) => ({
-    ...cart,
-    items: itemsByCart.get(cart.id) || [],
-    productTitle: resolveProductTitle(itemsByCart.get(cart.id) || []),
-  }));
+  return byCart;
 }
 
-function buildOrderSelectionMessage(ticket, orders, settings) {
-  const options = orders.slice(0, 10).map((order) => ({
-    label: resolveProductTitle(order.items).slice(0, 100),
-    description: `${formatMoney(order.total_amount)} | ${formatDate(resolvePurchaseDate(order))}`.slice(0, 100),
-    value: order.id,
-  }));
+async function fetchSalesDeliveries(cartIds) {
+  if (!cartIds.length) return new Map();
+  const result = await supabase
+    .from("guild_sales_order_deliveries")
+    .select("*")
+    .in("cart_id", cartIds);
+
+  const byCart = new Map();
+  for (const delivery of result.error ? [] : result.data || []) {
+    const current = byCart.get(delivery.cart_id) || [];
+    current.push(delivery);
+    byCart.set(delivery.cart_id, current);
+  }
+  return byCart;
+}
+
+async function fetchSalesEvents(cartIds) {
+  if (!cartIds.length) return new Map();
+  const result = await supabase
+    .from("guild_sales_order_events")
+    .select("*")
+    .in("cart_id", cartIds)
+    .order("created_at", { ascending: false });
+
+  const byCart = new Map();
+  for (const event of result.error ? [] : result.data || []) {
+    const current = byCart.get(event.cart_id) || [];
+    current.push(event);
+    byCart.set(event.cart_id, current);
+  }
+  return byCart;
+}
+
+async function fetchPaymentEvents(orderIds) {
+  if (!orderIds.length) return new Map();
+  const result = await supabase
+    .from("payment_order_events")
+    .select("*")
+    .in("payment_order_id", orderIds)
+    .order("created_at", { ascending: false });
+
+  const byOrder = new Map();
+  for (const event of result.error ? [] : result.data || []) {
+    const current = byOrder.get(event.payment_order_id) || [];
+    current.push(event);
+    byOrder.set(event.payment_order_id, current);
+  }
+  return byOrder;
+}
+
+async function fetchActiveAccountViolations(authUserId) {
+  if (!Number.isFinite(Number(authUserId))) return [];
+  const result = await supabase
+    .from("account_violations")
+    .select("id, type, category_id, reason, expires_at, updated_at")
+    .eq("user_id", Number(authUserId))
+    .order("updated_at", { ascending: false })
+    .limit(20);
+  if (result.error) {
+    if (!isMissingTableError(result.error, "account_violations")) {
+      console.warn("[ticket-refund] falha ao ler violacoes da conta:", result.error.message);
+    }
+    return [];
+  }
+  const now = Date.now();
+  return (result.data || []).filter((violation) => {
+    const expiresAt = Date.parse(String(violation.expires_at || ""));
+    return !Number.isFinite(expiresAt) || expiresAt > now;
+  });
+}
+
+function toUnifiedSalesOrder(cart, items = [], deliveries = [], events = []) {
+  const productTitle = resolveProductTitle(items);
+  return {
+    source: "sales",
+    id: cart.id,
+    key: encodeOrderKey("sales", cart.id),
+    productTitle,
+    amount: Number(cart.total_amount || 0),
+    currency: cart.currency || "BRL",
+    status: cart.status,
+    provider: cart.provider || "mercado_pago",
+    providerPaymentId: cart.provider_payment_id || null,
+    providerStatus: cart.provider_status || null,
+    providerStatusDetail: cart.provider_status_detail || null,
+    purchaseDate: cart.paid_at || cart.created_at || cart.updated_at || null,
+    authUserId: Number.isFinite(Number(cart.auth_user_id)) ? Number(cart.auth_user_id) : null,
+    discordUserId: cart.discord_user_id || null,
+    items,
+    deliveries,
+    events,
+    raw: cart,
+  };
+}
+
+function toUnifiedPaymentOrder(order, events = []) {
+  const productTitle =
+    normalizeText(order.plan_name || "", 90) ||
+    normalizeText(order.plan_code || "", 90) ||
+    `Pedido #${order.order_number || order.id}`;
+  return {
+    source: "payment",
+    id: order.id,
+    key: encodeOrderKey("payment", order.id),
+    productTitle,
+    amount: Number(order.amount || 0),
+    currency: order.currency || "BRL",
+    status: order.status,
+    provider: order.provider || "mercado_pago",
+    providerPaymentId: order.provider_payment_id || null,
+    providerStatus: order.provider_status || null,
+    providerStatusDetail: order.provider_status_detail || null,
+    purchaseDate: order.paid_at || order.created_at || order.updated_at || null,
+    authUserId: Number.isFinite(Number(order.user_id)) ? Number(order.user_id) : null,
+    discordUserId: null,
+    items: [],
+    deliveries: [],
+    events,
+    raw: order,
+  };
+}
+
+async function findMatchingOrders({ guildId, authUserId, discordUserId, orderCandidates }) {
+  const cartRows = new Map();
+
+  if (authUserId) {
+    const authCartResult = await supabase
+      .from("guild_sales_carts")
+      .select("*")
+      .eq("guild_id", guildId)
+      .eq("auth_user_id", authUserId)
+      .order("created_at", { ascending: false })
+      .limit(60);
+    if (!authCartResult.error) {
+      for (const cart of authCartResult.data || []) cartRows.set(cart.id, cart);
+    }
+  }
+
+  if (discordUserId) {
+    const discordCartResult = await supabase
+      .from("guild_sales_carts")
+      .select("*")
+      .eq("guild_id", guildId)
+      .eq("discord_user_id", discordUserId)
+      .order("created_at", { ascending: false })
+      .limit(60);
+    if (!discordCartResult.error) {
+      for (const cart of discordCartResult.data || []) cartRows.set(cart.id, cart);
+    }
+  }
+
+  const carts = Array.from(cartRows.values());
+  const cartIds = carts.map((cart) => cart.id);
+  const [itemsByCart, deliveriesByCart, eventsByCart] = await Promise.all([
+    fetchSalesCartItems(cartIds),
+    fetchSalesDeliveries(cartIds),
+    fetchSalesEvents(cartIds),
+  ]);
+
+  const salesOrders = carts.map((cart) =>
+    toUnifiedSalesOrder(
+      cart,
+      itemsByCart.get(cart.id) || [],
+      deliveriesByCart.get(cart.id) || [],
+      eventsByCart.get(cart.id) || [],
+    ),
+  );
+
+  let paymentOrders = [];
+  if (authUserId) {
+    const paymentResult = await supabase
+      .from("payment_orders")
+      .select("*")
+      .eq("user_id", authUserId)
+      .order("created_at", { ascending: false })
+      .limit(80);
+    if (paymentResult.error) {
+      throw new Error(paymentResult.error.message);
+    }
+    const filtered = (paymentResult.data || []).filter(
+      (order) => !order.guild_id || String(order.guild_id) === String(guildId),
+    );
+    const eventMap = await fetchPaymentEvents(filtered.map((order) => order.id));
+    paymentOrders = filtered.map((order) => toUnifiedPaymentOrder(order, eventMap.get(order.id) || []));
+  }
+
+  return [...salesOrders, ...paymentOrders]
+    .map((order) => ({
+      ...order,
+      matchScore: scoreOrderMatch(order, orderCandidates),
+    }))
+    .filter((order) => order.matchScore > 0)
+    .sort((left, right) => {
+      if (right.matchScore !== left.matchScore) return right.matchScore - left.matchScore;
+      return parseTimestampMs(resolvePurchaseDate(right)) - parseTimestampMs(resolvePurchaseDate(left));
+    })
+    .slice(0, 10);
+}
+
+async function getOrderByKey(guildId, orderKey, options = {}) {
+  const parsed = decodeOrderKey(orderKey);
+  if (!parsed) return null;
+
+  if (parsed.source === "sales") {
+    const cartResult = await supabase
+      .from("guild_sales_carts")
+      .select("*")
+      .eq("guild_id", guildId)
+      .eq("id", parsed.id)
+      .maybeSingle();
+    if (cartResult.error || !cartResult.data) return null;
+    const cart = cartResult.data;
+    if (
+      options.authUserId &&
+      cart.auth_user_id &&
+      Number(cart.auth_user_id) !== Number(options.authUserId)
+    ) {
+      return null;
+    }
+    if (options.discordUserId && cart.discord_user_id !== options.discordUserId && !cart.auth_user_id) {
+      return null;
+    }
+    const [itemsByCart, deliveriesByCart, eventsByCart] = await Promise.all([
+      fetchSalesCartItems([cart.id]),
+      fetchSalesDeliveries([cart.id]),
+      fetchSalesEvents([cart.id]),
+    ]);
+    return toUnifiedSalesOrder(
+      cart,
+      itemsByCart.get(cart.id) || [],
+      deliveriesByCart.get(cart.id) || [],
+      eventsByCart.get(cart.id) || [],
+    );
+  }
+
+  const orderResult = await supabase
+    .from("payment_orders")
+    .select("*")
+    .eq("id", parsed.id)
+    .maybeSingle();
+  if (orderResult.error || !orderResult.data) return null;
+  const order = orderResult.data;
+  if (order.guild_id && String(order.guild_id) !== String(guildId)) return null;
+  if (options.authUserId && Number(order.user_id) !== Number(options.authUserId)) return null;
+  const eventsByOrder = await fetchPaymentEvents([order.id]);
+  return toUnifiedPaymentOrder(order, eventsByOrder.get(order.id) || []);
+}
+
+function countRefundEvents(events) {
+  return (events || []).filter((event) => {
+    const type = String(event.event_type || "").toLowerCase();
+    const payload = JSON.stringify(event.event_payload || {}).toLowerCase();
+    return type.includes("refund") || payload.includes("refund") || payload.includes("reembols");
+  }).length;
+}
+
+function evaluateRefundEligibility(order, settings, context = {}) {
+  const purchaseDate = resolvePurchaseDate(order);
+  const purchaseMs = purchaseDate ? Date.parse(purchaseDate) : Number.NaN;
+  const refundDays = Math.max(0, Number(settings.refundLimitDays || DEFAULT_REFUND_DAYS));
+  const deadlineMs = Number.isFinite(purchaseMs)
+    ? purchaseMs + refundDays * 24 * 60 * 60 * 1000
+    : Number.NaN;
+  const insideWindow = Number.isFinite(deadlineMs) ? Date.now() <= deadlineMs : false;
+  const status = String(order.status || "").toLowerCase();
+  const providerStatus = String(order.providerStatus || "").toLowerCase();
+  const providerDetail = String(order.providerStatusDetail || "").toLowerCase();
+  const alreadyRefunded =
+    status === "refunded" ||
+    providerStatus === "refunded" ||
+    providerStatus === "charged_back" ||
+    providerDetail.includes("refund") ||
+    providerDetail.includes("chargeback") ||
+    providerDetail.includes("reembols");
+  const paid =
+    order.source === "sales"
+      ? ["paid", "delivered", "delivery_failed"].includes(status)
+      : ["approved", "settled"].includes(status) || providerStatus === "approved";
+  const hasProviderPayment = Boolean(order.providerPaymentId);
+  const ownershipOk =
+    context.authUserId && order.authUserId
+      ? Number(context.authUserId) === Number(order.authUserId)
+      : order.source === "sales" && context.discordUserId && order.discordUserId === context.discordUserId;
+  const deliveredOrConsumed =
+    order.source === "sales" &&
+    (order.deliveries?.length > 0 || ["delivered", "delivery_failed"].includes(status));
+  const previousRefundEvents = countRefundEvents(order.events);
+  const discountSnapshot = order.raw?.discount_snapshot || order.raw?.provider_payload?.discount || null;
+  const discountAmount = Number(order.raw?.discount_amount || discountSnapshot?.amount || 0);
+  const suspiciousInput = context.suspiciousInput === true;
+  const repeatedLookups = Number(context.lookupCount || 0) >= 3;
+  const accountViolations = Array.isArray(context.accountViolations)
+    ? context.accountViolations
+    : [];
+  const financialViolation = accountViolations.some((violation) => {
+    const type = normalizeIntentText(`${violation.type || ""} ${violation.category_id || ""}`);
+    return (
+      type.includes("fraude") ||
+      type.includes("estorno") ||
+      type.includes("contestacao") ||
+      type.includes("pagamento") ||
+      type.includes("blacklist") ||
+      type.includes("burla")
+    );
+  });
+
+  const reasons = [];
+  if (!ownershipOk) reasons.push("ownership_mismatch");
+  if (!paid) reasons.push("not_paid_status");
+  if (!hasProviderPayment) reasons.push("missing_provider_payment");
+  if (!insideWindow) reasons.push("outside_refund_window");
+  if (alreadyRefunded) reasons.push("already_refunded");
+  if (deliveredOrConsumed) reasons.push("delivered_or_consumed");
+  if (previousRefundEvents > 0) reasons.push("previous_refund_events");
+  if (discountAmount > 0) reasons.push("discount_used");
+  if (suspiciousInput) reasons.push("manipulation_attempt");
+  if (repeatedLookups) reasons.push("repeated_lookup_attempts");
+  if (accountViolations.length > 0) reasons.push("active_account_violations");
+  if (financialViolation) reasons.push("financial_risk_violation");
+  if (order.source !== "sales") reasons.push("payment_order_requires_financial_review");
+
+  let riskScore = 0;
+  if (!ownershipOk) riskScore += 45;
+  if (!paid || !hasProviderPayment) riskScore += 30;
+  if (!insideWindow) riskScore += 25;
+  if (alreadyRefunded) riskScore += 45;
+  if (deliveredOrConsumed) riskScore += 20;
+  if (previousRefundEvents > 0) riskScore += 25;
+  if (discountAmount > 0) riskScore += 8;
+  if (suspiciousInput) riskScore += 35;
+  if (repeatedLookups) riskScore += 12;
+  if (accountViolations.length > 0) riskScore += 20;
+  if (financialViolation) riskScore += 35;
+  if (order.source !== "sales") riskScore += 20;
+  riskScore = Math.min(100, riskScore);
+
+  const validationsComplete =
+    Boolean(context.authUserId) &&
+    ownershipOk &&
+    Boolean(purchaseDate) &&
+    Boolean(order.status) &&
+    hasProviderPayment;
+  const eligible =
+    validationsComplete &&
+    paid &&
+    hasProviderPayment &&
+    insideWindow &&
+    !alreadyRefunded &&
+    riskScore < 35;
+  const manualRequired =
+    !eligible ||
+    settings.manualApprovalRequired ||
+    riskScore > 15 ||
+    deliveredOrConsumed ||
+    order.source !== "sales";
 
   return {
-    content: [
-      "Encontrei compra(s) compativeis com os dados enviados.",
-      "Selecione abaixo qual compra voce quer verificar para reembolso. Se nenhuma for a correta, use Cancelar.",
-    ].join("\n"),
-    components: [
-      new ActionRowBuilder().addComponents(
-        new StringSelectMenuBuilder()
-          .setCustomId(`${REFUND_PREFIX}select:${ticket.id}`)
-          .setPlaceholder("Selecionar compra")
-          .addOptions(options),
-      ),
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`${REFUND_PREFIX}cancel:${ticket.id}`)
-          .setLabel("Cancelar")
-          .setStyle(ButtonStyle.Secondary),
-      ),
-    ],
-    allowedMentions: { parse: [] },
+    eligible,
+    canAutoRefund:
+      eligible &&
+      settings.autoProcessEnabled &&
+      !settings.manualApprovalRequired &&
+      !manualRequired &&
+      order.source === "sales",
+    manualRequired,
+    paid,
+    hasProviderPayment,
+    alreadyRefunded,
+    insideWindow,
+    refundDays,
+    deadline: Number.isFinite(deadlineMs) ? new Date(deadlineMs).toISOString() : null,
+    ownershipOk,
+    validationsComplete,
+    deliveredOrConsumed,
+    previousRefundEvents,
+    riskScore,
+    reasons,
   };
+}
+
+function buildOrderSelectionMessage(ticket, orders) {
+  const options = orders.slice(0, 10).map((order) => ({
+    label: truncateText(order.productTitle || "Produto", 100),
+    description: `${formatMoney(order.amount, order.currency)} | ${formatDate(resolvePurchaseDate(order))}`.slice(0, 100),
+    value: order.key,
+  }));
+
+  return v2Message([
+    {
+      type: COMPONENT_TYPE.CONTAINER,
+      accent_color: 0x8fdbff,
+      components: [
+        textDisplay(
+          [
+            "Encontrei compra(s) compativeis na conta vinculada.",
+            "Selecione qual compra voce quer verificar para reembolso. Se nenhuma for a correta, use **Cancelar**.",
+          ].join("\n"),
+        ),
+      ],
+    },
+    actionRow([
+      selectMenu({
+        customId: `${REFUND_PREFIX}select:${ticket.id}`,
+        placeholder: "Selecionar compra",
+        options,
+      }),
+    ]),
+    actionRow([
+      button({
+        customId: `${REFUND_PREFIX}cancel:${ticket.id}`,
+        label: "Cancelar",
+        style: ButtonStyle.Secondary,
+      }),
+    ]),
+  ]);
 }
 
 function hasRefundApprovalPermission(member, settings, runtime) {
@@ -378,7 +1367,23 @@ async function callInternalSalesRefund(cartId, guildId, reason) {
   return payload;
 }
 
-async function sendManualApprovalRequest({ client, ticket, order, settings, reason }) {
+function summarizeEligibilityForStaff(eligibility) {
+  const lines = [
+    `Score de risco: ${eligibility.riskScore}/100`,
+    `Titularidade: ${eligibility.ownershipOk ? "ok" : "divergente"}`,
+    `Status pago: ${eligibility.paid ? "sim" : "nao"}`,
+    `Prazo: ${eligibility.insideWindow ? "dentro" : "fora"} (${eligibility.refundDays} dia(s))`,
+    `Pagamento externo: ${eligibility.hasProviderPayment ? "presente" : "ausente"}`,
+    `Ja reembolsado: ${eligibility.alreadyRefunded ? "sim" : "nao"}`,
+    `Produto entregue/usado: ${eligibility.deliveredOrConsumed ? "sim" : "nao"}`,
+  ];
+  if (eligibility.reasons.length) {
+    lines.push(`Sinais internos: ${eligibility.reasons.join(", ")}`);
+  }
+  return lines.join("\n");
+}
+
+async function sendManualApprovalRequest({ client, ticket, order, settings, reason, eligibility }) {
   const guild = await client.guilds.fetch(ticket.guild_id).catch(() => null);
   const channel = settings.approvalChannelId
     ? await guild?.channels.fetch(settings.approvalChannelId).catch(() => null)
@@ -387,18 +1392,44 @@ async function sendManualApprovalRequest({ client, ticket, order, settings, reas
     throw new Error("Canal de aprovacao de reembolso nao configurado ou inacessivel.");
   }
 
-  const eligibility = evaluateRefundEligibility(order, settings);
   const embed = new EmbedBuilder()
     .setTitle("Solicitacao de reembolso")
     .setColor(eligibility.eligible ? 0xf1c40f : 0xdb4646)
     .addFields(
-      { name: "Ticket", value: `${ticket.protocol || ticket.id}\n<#${ticket.channel_id}>`, inline: true },
+      {
+        name: "Ticket",
+        value: `${ticket.protocol || ticket.id}\n<#${ticket.channel_id}>`,
+        inline: true,
+      },
       { name: "Usuario", value: `<@${ticket.user_id}>`, inline: true },
-      { name: "Compra", value: `${order.productTitle || resolveProductTitle(order.items)}\n${formatMoney(order.total_amount)} | ${formatDate(resolvePurchaseDate(order))}`, inline: false },
-      { name: "Pedido", value: `\`${order.id}\``, inline: true },
-      { name: "Pagamento", value: order.provider_payment_id ? `\`${order.provider_payment_id}\`` : "Nao informado", inline: true },
-      { name: "Elegibilidade", value: eligibility.eligible ? "Dentro das regras configuradas." : "Fora das regras automaticas. Revisao manual necessaria.", inline: false },
-      { name: "Motivo", value: normalizeText(reason || "Solicitado pelo comprador no ticket.", 900), inline: false },
+      {
+        name: "Compra",
+        value: `${order.productTitle}\n${formatMoney(order.amount, order.currency)} | ${formatDate(resolvePurchaseDate(order))}`,
+        inline: false,
+      },
+      {
+        name: "Pedido",
+        value:
+          order.source === "payment"
+            ? `#${order.raw?.order_number || order.id} (${order.key})`
+            : `\`${order.id}\``,
+        inline: true,
+      },
+      {
+        name: "Pagamento",
+        value: order.providerPaymentId ? `\`${order.providerPaymentId}\`` : "Nao informado",
+        inline: true,
+      },
+      {
+        name: "Validacao",
+        value: summarizeEligibilityForStaff(eligibility),
+        inline: false,
+      },
+      {
+        name: "Motivo",
+        value: normalizeText(reason || "Solicitado pelo comprador no ticket.", 900),
+        inline: false,
+      },
     )
     .setTimestamp(new Date());
 
@@ -407,11 +1438,11 @@ async function sendManualApprovalRequest({ client, ticket, order, settings, reas
     components: [
       new ActionRowBuilder().addComponents(
         new ButtonBuilder()
-          .setCustomId(`${REFUND_PREFIX}approve:${ticket.id}:${order.id}`)
+          .setCustomId(`${REFUND_PREFIX}approve:${ticket.id}:${order.key}`)
           .setLabel("Aprovar")
           .setStyle(ButtonStyle.Success),
         new ButtonBuilder()
-          .setCustomId(`${REFUND_PREFIX}deny:${ticket.id}:${order.id}`)
+          .setCustomId(`${REFUND_PREFIX}deny:${ticket.id}:${order.key}`)
           .setLabel("Negar")
           .setStyle(ButtonStyle.Danger),
       ),
@@ -420,41 +1451,238 @@ async function sendManualApprovalRequest({ client, ticket, order, settings, reas
   });
 }
 
-async function handleRefundOrVerificationMessage({ message, client, ticket, runtime, historyRows, content, persist }) {
-  const memory = buildRefundMemoryPatch(content, historyRows);
-  if (!memory.intent) return false;
+function registerLookupAttempt(ticket) {
+  const key = `${ticket.guild_id}:${ticket.user_id}`;
+  const now = Date.now();
+  const bucket = (lookupBuckets.get(key) || []).filter(
+    (timestamp) => now - timestamp < REFUND_LOOKUP_RATE_LIMIT_WINDOW_MS,
+  );
+  bucket.push(now);
+  lookupBuckets.set(key, bucket);
+  return bucket.length <= REFUND_LOOKUP_RATE_LIMIT_MAX;
+}
 
-  await persist({
-    authorId: message.author.id,
-    authorType: "user",
-    source: "ticket_refund_context",
-    content: `refund-context:${JSON.stringify({
-      email: memory.email,
-      orderNumber: memory.orderNumber,
-      intent: true,
-    })}`,
-    metadata: {
-      refund: {
-        intent: true,
-        email: memory.email,
-        orderNumber: memory.orderNumber,
-      },
-    },
-  });
+function hasRepeatedFailedCandidate(state, candidates) {
+  const failed = new Set(state.failedOrderCandidates || []);
+  return candidates.length > 0 && candidates.every((candidate) => failed.has(normalizeLookupToken(candidate)));
+}
 
-  if (!memory.email) {
+async function answerContextualMessage({ message, persist, state, kind, content, ticket }) {
+  if (kind === "waiting") {
+    const nextState = markPrompt(state, "waiting");
+    await persistRefundState(persist, nextState);
+    if (!shouldPrompt(state, "waiting", 20_000)) return true;
+    const waitingForAuth =
+      state.stage === "awaiting_auth" || (state.authStatus && state.authStatus !== "linked");
     await message.reply({
-      content:
-        "Consigo verificar isso para voce. Para continuar, preciso do email usado na compra e do numero do pedido.",
+      content: waitingForAuth
+        ? "Sem pressa. Quando concluir o Login seguro, eu continuo daqui sem reiniciar o atendimento."
+        : "Sem pressa. Quando encontrar, me envie apenas o numero do pedido; eu continuo daqui sem reiniciar o atendimento.",
       allowedMentions: { parse: [] },
     });
     return true;
   }
 
-  if (!memory.orderNumber) {
+  if (kind === "order_help") {
+    const nextState = markPrompt(state, "order_help");
+    await persistRefundState(persist, nextState);
     await message.reply({
       content:
-        "Recebi o email. Para continuar a verificacao, tambem e obrigatorio enviar o numero do pedido.",
+        "O numero costuma aparecer no comprovante ou na area de pedidos, geralmente como `#90058`. Pode mandar com ou sem `#`; eu normalizo aqui.",
+      allowedMentions: { parse: [] },
+    });
+    return true;
+  }
+
+  if (kind === "timing") {
+    const nextState = markPrompt(state, "timing");
+    await persistRefundState(persist, nextState);
+    await message.reply({
+      content:
+        "Depois da validacao, o prazo de estorno depende do provedor de pagamento e do banco emissor. Antes disso eu preciso confirmar a compra correta com seguranca.",
+      allowedMentions: { parse: [] },
+    });
+    return true;
+  }
+
+  if (kind === "manipulation") {
+    const nextState = markPrompt(state, "security");
+    await persistRefundState(persist, nextState);
+    await message.reply({
+      content:
+        "Consigo ajudar, mas reembolso passa por validacao de titularidade, status e regras do servidor. Vou seguir esse processo para proteger sua conta e a loja.",
+      allowedMentions: { parse: [] },
+    });
+    await logRefundAuditEvent({
+      ticket,
+      eventType: "manipulation_attempt_detected",
+      outcome: "guarded",
+      metadata: { content: normalizeText(content, 300) },
+    });
+    return true;
+  }
+
+  return false;
+}
+
+async function handleRefundOrVerificationMessage({ message, client, ticket, runtime, historyRows, content, persist }) {
+  let state = buildRefundMemoryPatch(content, historyRows);
+  const active = isActiveRefundState(readRefundMemory(historyRows));
+  const currentIntent = state.currentIntent === true;
+  const cancelIntent = state.cancelIntent === true;
+  const orderCandidates = extractOrderCandidates(content, {
+    allowShortGeneric: active && !cancelIntent,
+  });
+  const hasEmail = Boolean(extractEmail(content));
+
+  if (cancelIntent && active) {
+    await persistRefundState(persist, state);
+    await logRefundAuditEvent({
+      ticket,
+      eventType: "conversation_cancelled",
+      outcome: "user_cancelled",
+    });
+    return false;
+  }
+
+  if (!state.intent && !currentIntent && !(active && orderCandidates.length)) return false;
+
+  if (containsManipulationAttempt(content)) {
+    state = sanitizeRefundState({ ...state, intent: true, stage: state.stage || "awaiting_auth" });
+    return answerContextualMessage({
+      message,
+      persist,
+      state,
+      kind: "manipulation",
+      content,
+      ticket,
+    });
+  }
+
+  const settings = await getTicketRefundSettings(ticket.guild_id, runtime);
+  if (!settings.enabled) {
+    await persistRefundState(persist, state, { stage: "manual_review" });
+    await message.reply({
+      content:
+        "A verificacao automatica de reembolso nao esta ativa neste servidor. Vou manter o contexto no ticket para a equipe acompanhar por aqui.",
+      allowedMentions: { parse: [] },
+    });
+    return true;
+  }
+
+  const authUser = await getAuthUserByDiscordUserId(ticket.user_id);
+  if (!authUser) {
+    if (isWaitingFiller(content) && active) {
+      return answerContextualMessage({ message, persist, state, kind: "waiting", content, ticket });
+    }
+
+    if (hasEmail && shouldPrompt(state, "email_redirect", 10_000)) {
+      await message.reply({
+        content:
+          "Para sua seguranca, nao vou usar email enviado no chat. Use o botao de Login para vincular a conta correta e eu sigo sem pedir senha ou dados sensiveis.",
+        allowedMentions: { parse: [] },
+      });
+    }
+
+    if (shouldPrompt(state, "login", REFUND_PROMPT_COOLDOWN_MS) || !state.authLinkId) {
+      await sendSecureLoginPrompt({
+        message,
+        client,
+        ticket,
+        persist,
+        state,
+      });
+    } else {
+      await persistRefundState(persist, state, {
+        stage: "awaiting_auth",
+        authStatus: "pending",
+      });
+    }
+    return true;
+  }
+
+  state = sanitizeRefundState({
+    ...state,
+    intent: true,
+    authStatus: "linked",
+    authUserId: authUser.id,
+    stage: state.stage === "awaiting_auth" || !state.stage ? "awaiting_order" : state.stage,
+  });
+
+  if (hasEmail && !orderCandidates.length) {
+    state = markPrompt(state, "email_ignored_linked");
+    await persistRefundState(persist, state);
+    await message.reply({
+      content:
+        "Conta segura ja vinculada. Nao preciso que voce envie email no chat; agora me mande apenas o numero do pedido.",
+      allowedMentions: { parse: [] },
+    });
+    return true;
+  }
+
+  if (isWaitingFiller(content) && !orderCandidates.length) {
+    return answerContextualMessage({ message, persist, state, kind: "waiting", content, ticket });
+  }
+
+  if (isOrderHelpQuestion(content) && !orderCandidates.length) {
+    return answerContextualMessage({ message, persist, state, kind: "order_help", content, ticket });
+  }
+
+  if (isTimingQuestion(content) && !orderCandidates.length) {
+    return answerContextualMessage({ message, persist, state, kind: "timing", content, ticket });
+  }
+
+  if (state.stage === "selecting_order" && !orderCandidates.length) {
+    if (shouldPrompt(state, "select_pending", REFUND_PROMPT_COOLDOWN_MS)) {
+      state = markPrompt(state, "select_pending");
+      await persistRefundState(persist, state);
+      await message.reply({
+        content:
+          "Eu ja encontrei opcoes compativeis. Selecione a compra no menu acima ou use Cancelar para procurar outro pedido.",
+        allowedMentions: { parse: [] },
+      });
+    }
+    return true;
+  }
+
+  if (!orderCandidates.length) {
+    if (shouldPrompt(state, "ask_order", REFUND_PROMPT_COOLDOWN_MS)) {
+      state = markPrompt({ ...state, stage: "awaiting_order" }, "ask_order");
+      await persistRefundState(persist, state);
+      await message.reply({
+        content:
+          "Conta vinculada. Me envie o numero do pedido para eu consultar status, prazo e elegibilidade com seguranca.",
+        allowedMentions: { parse: [] },
+      });
+    } else {
+      await persistRefundState(persist, state, { stage: "awaiting_order" });
+    }
+    return true;
+  }
+
+  if (hasRepeatedFailedCandidate(state, orderCandidates)) {
+    state = markPrompt({ ...state, stage: "lookup_failed" }, "same_failed_order");
+    await persistRefundState(persist, state);
+    await message.reply({
+      content:
+        "Eu ja tentei esse numero na conta vinculada e nao encontrei uma compra correspondente. Confira se e o pedido certo ou envie outro numero; se for de outra conta, refaca o Login com a conta correta.",
+      allowedMentions: { parse: [] },
+    });
+    return true;
+  }
+
+  if (!registerLookupAttempt(ticket)) {
+    state = markPrompt({ ...state, stage: "manual_review" }, "rate_limited");
+    await persistRefundState(persist, state);
+    await logRefundAuditEvent({
+      ticket,
+      authUserId: authUser.id,
+      eventType: "lookup_rate_limited",
+      outcome: "manual_review",
+    });
+    await message.reply({
+      content:
+        "Detectei muitas tentativas de consulta em pouco tempo. Para proteger a compra, vou deixar a equipe validar manualmente por aqui.",
       allowedMentions: { parse: [] },
     });
     return true;
@@ -462,80 +1690,74 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
 
   await message.channel.send({
     content:
-      "Certo, vou consultar a compra no sistema com o email e o numero do pedido informados. Aguarde um momento enquanto verifico status, prazo e elegibilidade.",
+      "Certo, vou consultar a compra na conta vinculada. Aguarde um momento enquanto verifico status, prazo e elegibilidade.",
     allowedMentions: { parse: [] },
   });
 
-  const settings = await getTicketRefundSettings(ticket.guild_id, runtime);
-  if (!settings.enabled) {
-    await message.channel.send({
-      content:
-        "A verificacao automatica de reembolso nao esta ativa neste servidor. Encaminhei o atendimento para a equipe responsavel acompanhar por aqui.",
-      allowedMentions: { parse: [] },
-    });
-    return true;
-  }
+  await logRefundAuditEvent({
+    ticket,
+    authUserId: authUser.id,
+    eventType: "lookup_started",
+    outcome: "started",
+    metadata: { orderCandidates },
+  });
 
   const orders = await withTimeout(
-    findSalesOrders({
+    findMatchingOrders({
       guildId: ticket.guild_id,
-      email: memory.email,
-      orderNumber: memory.orderNumber,
+      authUserId: authUser.id,
       discordUserId: ticket.user_id,
+      orderCandidates,
     }),
     ORDER_LOOKUP_TIMEOUT_MS,
     "Consulta de compra",
-  );
+  ).catch(async (error) => {
+    await logRefundAuditEvent({
+      ticket,
+      authUserId: authUser.id,
+      eventType: "lookup_failed",
+      outcome: "error",
+      metadata: { message: normalizeText(error.message, 300), orderCandidates },
+    });
+    throw error;
+  });
+
+  state = sanitizeRefundState({
+    ...state,
+    stage: orders.length ? "selecting_order" : "lookup_failed",
+    orderCandidates: [...new Set([...orderCandidates, ...state.orderCandidates])].slice(0, 8),
+    failedOrderCandidates: orders.length
+      ? state.failedOrderCandidates
+      : [...new Set([...(state.failedOrderCandidates || []), ...orderCandidates])].slice(0, 12),
+    availableOrderKeys: orders.map((order) => order.key),
+    lookupCount: Number(state.lookupCount || 0) + 1,
+    lastLookupAt: nowIso(),
+  });
+  await persistRefundState(persist, state);
 
   if (!orders.length) {
     await message.channel.send({
       content:
-        "Nao encontrei uma compra compativel com esse email e numero de pedido. Confira os dados enviados ou aguarde a equipe validar manualmente pelo painel.",
+        "Nao encontrei uma compra compativel com esse numero na conta vinculada. Confira o pedido ou envie outro numero; se a compra estiver em outra conta, refaca o Login com a conta correta.",
       allowedMentions: { parse: [] },
     });
     return true;
   }
 
-  await message.channel.send(buildOrderSelectionMessage(ticket, orders, settings));
+  await message.channel.send(buildOrderSelectionMessage(ticket, orders));
   return true;
 }
 
 async function getTicketById(ticketId) {
-  const result = await supabase
-    .from("tickets")
-    .select("*")
-    .eq("id", ticketId)
-    .maybeSingle();
+  const result = await supabase.from("tickets").select("*").eq("id", ticketId).maybeSingle();
   return result.error ? null : result.data;
-}
-
-async function getOrderById(guildId, cartId) {
-  const cartResult = await supabase
-    .from("guild_sales_carts")
-    .select(
-      "id, guild_id, discord_user_id, auth_user_id, status, total_amount, provider, provider_payment_id, provider_status, provider_status_detail, paid_at, created_at, updated_at",
-    )
-    .eq("guild_id", guildId)
-    .eq("id", cartId)
-    .maybeSingle();
-  if (cartResult.error || !cartResult.data) return null;
-  const itemsResult = await supabase
-    .from("guild_sales_cart_items")
-    .select("id, cart_id, product_id, quantity, unit_price_amount, total_amount, product_snapshot")
-    .eq("cart_id", cartId);
-  const items = itemsResult.error ? [] : itemsResult.data || [];
-  return {
-    ...cartResult.data,
-    items,
-    productTitle: resolveProductTitle(items),
-  };
 }
 
 async function handleTicketRefundInteraction(interaction, client, runtimeLoader) {
   const customId = String(interaction.customId || "");
   if (!customId.startsWith(REFUND_PREFIX)) return false;
 
-  const [, , action, ticketId, cartId] = customId.split(":");
+  const [, , action, ticketId, orderKeyFromId] = customId.split(":");
   const ticket = await getTicketById(ticketId);
   if (!ticket) {
     await interaction.reply({ content: "Ticket nao encontrado para esta acao.", ephemeral: true });
@@ -547,48 +1769,123 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
 
   if (action === "cancel") {
     if (interaction.user.id !== ticket.user_id) {
-      await interaction.reply({ content: "Somente o comprador deste ticket pode cancelar esta selecao.", ephemeral: true });
+      await interaction.reply({
+        content: "Somente o comprador deste ticket pode cancelar esta selecao.",
+        ephemeral: true,
+      });
       return true;
     }
-    await interaction.update({
-      content: "Selecao cancelada. Envie o email e o numero do pedido corretos para eu consultar novamente.",
-      components: [],
-      allowedMentions: { parse: [] },
+    await interaction.update(
+      v2Message([
+        {
+          type: COMPONENT_TYPE.CONTAINER,
+          accent_color: 0xb0b0b0,
+          components: [
+            textDisplay(
+              "Selecao cancelada. Envie outro numero de pedido se quiser continuar a verificacao, ou siga com o novo assunto no ticket.",
+            ),
+          ],
+        },
+      ]),
+    );
+    await logRefundAuditEvent({
+      ticket,
+      eventType: "selection_cancelled",
+      outcome: "user_cancelled",
     });
     return true;
   }
 
   if (action === "select") {
     if (interaction.user.id !== ticket.user_id) {
-      await interaction.reply({ content: "Somente o comprador deste ticket pode selecionar a compra.", ephemeral: true });
-      return true;
-    }
-    const selectedCartId = interaction.values?.[0];
-    const order = await getOrderById(ticket.guild_id, selectedCartId);
-    if (!order) {
-      await interaction.reply({ content: "Nao encontrei essa compra no sistema.", ephemeral: true });
+      await interaction.reply({
+        content: "Somente o comprador deste ticket pode selecionar a compra.",
+        ephemeral: true,
+      });
       return true;
     }
 
-    const lockKey = `${ticket.id}:${order.id}`;
+    const authUser = await getAuthUserByDiscordUserId(ticket.user_id);
+    if (!authUser) {
+      await interaction.reply({
+        content: "A conta Discord ainda nao esta vinculada. Use o botao de Login antes de confirmar a compra.",
+        ephemeral: true,
+      });
+      return true;
+    }
+
+    const selectedOrderKey = interaction.values?.[0];
+    const order = await getOrderByKey(ticket.guild_id, selectedOrderKey, {
+      authUserId: authUser.id,
+      discordUserId: ticket.user_id,
+    });
+    if (!order) {
+      await interaction.reply({
+        content: "Nao encontrei essa compra na conta vinculada.",
+        ephemeral: true,
+      });
+      return true;
+    }
+
+    const lockKey = `${ticket.id}:${order.key}`;
     if (pendingRefundActions.has(lockKey)) {
-      await interaction.reply({ content: "Ja existe uma solicitacao em andamento para essa compra.", ephemeral: true });
+      await interaction.reply({
+        content: "Ja existe uma solicitacao em andamento para essa compra.",
+        ephemeral: true,
+      });
       return true;
     }
     pendingRefundActions.add(lockKey);
 
     try {
-      const eligibility = evaluateRefundEligibility(order, settings);
-      if (eligibility.eligible && settings.autoProcessEnabled && !settings.manualApprovalRequired) {
-        await interaction.update({
-          content: "Compra confirmada. O reembolso esta sendo processado automaticamente agora.",
-          components: [],
+      const accountViolations = await fetchActiveAccountViolations(authUser.id);
+      const eligibility = evaluateRefundEligibility(order, settings, {
+        authUserId: authUser.id,
+        discordUserId: ticket.user_id,
+        accountViolations,
+      });
+      await logRefundAuditEvent({
+        ticket,
+        authUserId: authUser.id,
+        orderKey: order.key,
+        riskScore: eligibility.riskScore,
+        eventType: "order_selected",
+        outcome: eligibility.canAutoRefund ? "auto_candidate" : "manual_review",
+        metadata: {
+          source: order.source,
+          reasons: eligibility.reasons,
+          activeViolationCount: accountViolations.length,
+        },
+      });
+
+      if (eligibility.canAutoRefund) {
+        await interaction.update(
+          v2Message([
+            {
+              type: COMPONENT_TYPE.CONTAINER,
+              accent_color: 0x8fdbff,
+              components: [
+                textDisplay("Compra confirmada. O reembolso esta sendo processado automaticamente agora."),
+              ],
+            },
+          ]),
+        );
+        await callInternalSalesRefund(
+          order.id,
+          ticket.guild_id,
+          "Solicitacao validada automaticamente pelo FlowAI no ticket.",
+        );
+        await interaction.followUp({
+          content: `${settings.successMessage}\n\nCompra: ${order.productTitle}\nValor: ${formatMoney(order.amount, order.currency)}\nPrazo estimado: o estorno normalmente segue o prazo do Mercado Pago e do banco emissor.`,
           allowedMentions: { parse: [] },
         });
-        await callInternalSalesRefund(order.id, ticket.guild_id, "Solicitacao validada automaticamente pelo FlowAI no ticket.");
-        await interaction.followUp({
-          content: `${settings.successMessage}\n\nCompra: ${order.productTitle}\nValor: ${formatMoney(order.total_amount)}\nPrazo estimado: o estorno normalmente segue o prazo do Mercado Pago e do banco emissor.`,
-          allowedMentions: { parse: [] },
+        await logRefundAuditEvent({
+          ticket,
+          authUserId: authUser.id,
+          orderKey: order.key,
+          riskScore: eligibility.riskScore,
+          eventType: "refund_processed",
+          outcome: "success",
         });
         return true;
       }
@@ -599,13 +1896,21 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
         order,
         settings,
         reason: "Solicitacao confirmada pelo comprador via FlowAI.",
+        eligibility,
       });
-      await interaction.update({
-        content:
-          "Compra confirmada. A solicitacao foi enviada para analise da equipe responsavel. Assim que houver uma decisao, ela sera registrada por aqui.",
-        components: [],
-        allowedMentions: { parse: [] },
-      });
+      await interaction.update(
+        v2Message([
+          {
+            type: COMPONENT_TYPE.CONTAINER,
+            accent_color: 0xf1c40f,
+            components: [
+              textDisplay(
+                "Compra confirmada. A solicitacao foi enviada para analise da equipe responsavel. Assim que houver uma decisao, ela sera registrada por aqui.",
+              ),
+            ],
+          },
+        ]),
+      );
       return true;
     } finally {
       pendingRefundActions.delete(lockKey);
@@ -614,12 +1919,18 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
 
   if (action === "approve" || action === "deny") {
     if (!hasRefundApprovalPermission(interaction.member, settings, runtime)) {
-      await interaction.reply({ content: "Voce nao tem permissao para decidir este reembolso.", ephemeral: true });
+      await interaction.reply({
+        content: "Voce nao tem permissao para decidir este reembolso.",
+        ephemeral: true,
+      });
       return true;
     }
-    const order = await getOrderById(ticket.guild_id, cartId);
+    const order = await getOrderByKey(ticket.guild_id, orderKeyFromId);
     if (!order) {
-      await interaction.reply({ content: "Compra nao encontrada para esta decisao.", ephemeral: true });
+      await interaction.reply({
+        content: "Compra nao encontrada para esta decisao.",
+        ephemeral: true,
+      });
       return true;
     }
 
@@ -636,12 +1947,31 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
           "A equipe analisou a solicitacao de reembolso e ela foi negada neste momento. Caso precise de mais detalhes, responda neste ticket.",
         allowedMentions: { parse: [] },
       });
+      await logRefundAuditEvent({
+        ticket,
+        orderKey: order.key,
+        eventType: "manual_refund_denied",
+        outcome: "denied",
+        metadata: { decidedBy: interaction.user.id },
+      });
       return true;
     }
 
-    const lockKey = `${ticket.id}:${order.id}`;
+    if (order.source !== "sales") {
+      await interaction.reply({
+        content:
+          "Este pedido pertence ao financeiro da plataforma e precisa ser reembolsado pelo painel administrativo de pagamentos.",
+        ephemeral: true,
+      });
+      return true;
+    }
+
+    const lockKey = `${ticket.id}:${order.key}`;
     if (pendingRefundActions.has(lockKey)) {
-      await interaction.reply({ content: "Este reembolso ja esta sendo processado.", ephemeral: true });
+      await interaction.reply({
+        content: "Este reembolso ja esta sendo processado.",
+        ephemeral: true,
+      });
       return true;
     }
     pendingRefundActions.add(lockKey);
@@ -656,14 +1986,28 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
       });
       const channel = await client.channels.fetch(ticket.channel_id).catch(() => null);
       await channel?.send?.({
-        content: `${settings.successMessage}\n\nCompra: ${order.productTitle}\nValor: ${formatMoney(order.total_amount)}\nPrazo estimado: o estorno normalmente segue o prazo do Mercado Pago e do banco emissor.`,
+        content: `${settings.successMessage}\n\nCompra: ${order.productTitle}\nValor: ${formatMoney(order.amount, order.currency)}\nPrazo estimado: o estorno normalmente segue o prazo do Mercado Pago e do banco emissor.`,
         allowedMentions: { parse: [] },
+      });
+      await logRefundAuditEvent({
+        ticket,
+        orderKey: order.key,
+        eventType: "manual_refund_approved",
+        outcome: "processed",
+        metadata: { decidedBy: interaction.user.id },
       });
       return true;
     } catch (error) {
       await interaction.followUp({
         content: `Nao consegui processar automaticamente: ${normalizeText(error.message, 300)}`,
         ephemeral: true,
+      });
+      await logRefundAuditEvent({
+        ticket,
+        orderKey: order.key,
+        eventType: "manual_refund_process_failed",
+        outcome: "error",
+        metadata: { message: normalizeText(error.message, 300), decidedBy: interaction.user.id },
       });
       return true;
     } finally {
