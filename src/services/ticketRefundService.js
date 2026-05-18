@@ -739,10 +739,14 @@ function buildRefundMemoryPatch(content, historyRows) {
 }
 
 function formatMoney(value, currency = "BRL") {
-  return new Intl.NumberFormat("pt-BR", {
-    style: "currency",
-    currency: currency || "BRL",
-  }).format(Number(value || 0));
+  try {
+    return new Intl.NumberFormat("pt-BR", {
+      style: "currency",
+      currency: currency || "BRL",
+    }).format(Number(value || 0));
+  } catch {
+    return `R$ ${Number(value || 0).toFixed(2).replace(".", ",")}`;
+  }
 }
 
 function formatDate(value) {
@@ -2220,6 +2224,28 @@ function buildRefundSuccessContent({ settings, order, protocol }) {
   return `${settings.successMessage || "Reembolso concluido com sucesso."}\n\nCompra: ${order.productTitle}\nValor: ${formatMoney(order.amount, order.currency)}\nProtocolo: **${protocol}**\nO estorno segue o prazo do provedor de pagamento e do banco emissor.`;
 }
 
+async function sendRefundTicketConfirmation({ client, interaction, ticket, content }) {
+  const channel =
+    (await client.channels.fetch(ticket.channel_id).catch(() => null)) ||
+    interaction?.channel ||
+    null;
+
+  if (!channel || typeof channel.send !== "function") {
+    return { ok: false, error: new Error("Canal do ticket indisponivel para confirmacao.") };
+  }
+
+  try {
+    await channel.send({
+      content,
+      allowedMentions: { parse: [] },
+    });
+    return { ok: true };
+  } catch (error) {
+    console.warn("[ticket-refund] falha ao enviar confirmacao no ticket:", error?.message || error);
+    return { ok: false, error };
+  }
+}
+
 function registerLookupAttempt(ticket) {
   const key = `${ticket.guild_id}:${ticket.user_id}`;
   const now = Date.now();
@@ -3488,14 +3514,19 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
       return true;
     }
     pendingRefundActions.add(lockKey);
+    let manualProtocol = null;
+    let finalOrderForFallback = order;
+    let successContentForFallback = null;
+    let financialCompleted = false;
     try {
       await acknowledgeComponent(interaction, correlationId);
-      const manualProtocol = generateRefundProtocol(ticket.id, order.key);
+      manualProtocol = generateRefundProtocol(ticket.id, order.key);
       let refundResult = null;
       let finalOrder = order;
       let recoveredFromUncertainError = false;
       try {
         refundResult = await callInternalSalesRefund(order.id, ticket.guild_id, `Aprovado manualmente por ${interaction.user.id} — protocolo ${manualProtocol}.`);
+        financialCompleted = true;
       } catch (financialError) {
         const reconciliation = await confirmRefundAfterUncertainError({
           ticket,
@@ -3512,6 +3543,7 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
             reconciliationReason: reconciliation.reason,
           };
           recoveredFromUncertainError = true;
+          financialCompleted = true;
           await logRefundAuditEvent({
             ticket,
             orderKey: order.key,
@@ -3554,18 +3586,21 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
         return true;
         }
       }
+      finalOrderForFallback = finalOrder;
       const approvalUpdate = await updateComponentMessage(interaction, {
         content: `Reembolso aprovado e processado por <@${interaction.user.id}> para a compra **${order.productTitle}** — Protocolo: \`${manualProtocol}\``,
         embeds: interaction.message.embeds,
         components: [],
         allowedMentions: { parse: [] },
       }, correlationId);
-      const channel = await client.channels.fetch(ticket.channel_id).catch(() => null);
       const successContent = buildRefundSuccessContent({ settings, order: finalOrder, protocol: manualProtocol });
-      const ticketNotice = await channel?.send?.({
+      successContentForFallback = successContent;
+      const ticketNotice = await sendRefundTicketConfirmation({
+        client,
+        interaction,
+        ticket,
         content: successContent,
-        allowedMentions: { parse: [] },
-      }).then(() => ({ ok: true })).catch((discordError) => ({ ok: false, error: discordError }));
+      });
       const dmQueue = await enqueueRefundDirectMessage({
         ticket,
         order: finalOrder,
@@ -3609,6 +3644,53 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
       });
       return true;
     } catch (error) {
+      if (financialCompleted) {
+        const fallbackContent =
+          successContentForFallback ||
+          buildRefundSuccessContent({
+            settings,
+            order: finalOrderForFallback,
+            protocol: manualProtocol || generateRefundProtocol(ticket.id, order.key),
+          });
+        const fallbackTicketNotice = await sendRefundTicketConfirmation({
+          client,
+          interaction,
+          ticket,
+          content: fallbackContent,
+        });
+        const fallbackEmailNotice = await sendRefundProcessedEmail({
+          discordUserId: ticket.user_id,
+          refundProtocol: manualProtocol || "reembolso-aprovado",
+          productTitle: finalOrderForFallback.productTitle,
+          amountLabel: formatMoney(finalOrderForFallback.amount, finalOrderForFallback.currency),
+        });
+        await logRefundAuditEvent({
+          ticket,
+          orderKey: order.key,
+          eventType: "manual_refund_notification_recovered",
+          outcome: "financial_success_notification_retried",
+          correlationId,
+          metadata: {
+            responsible_user: interaction.user.id,
+            action_time: new Date().toISOString(),
+            method: "manual",
+            transaction_id: order.providerPaymentId || null,
+            final_status: "refunded",
+            decidedBy: interaction.user.id,
+            original_error: normalizeText(error.message, 300),
+            fallback_ticket_confirmation_sent: fallbackTicketNotice.ok,
+            fallback_email_confirmation_sent: fallbackEmailNotice?.sent === true,
+          },
+        });
+        await sendInteractionNotice(interaction, {
+          content:
+            fallbackTicketNotice.ok || fallbackEmailNotice?.sent === true
+              ? "Reembolso financeiro confirmado. Reenviei a confirmacao no ticket/email."
+              : "Reembolso financeiro confirmado. Nao consegui reenviar a confirmacao agora, mas o evento ficou registrado para auditoria.",
+          ephemeral: true,
+        }, correlationId);
+        return true;
+      }
       await sendInteractionNotice(interaction, {
         content: "O reembolso financeiro foi tratado, mas houve falha em uma etapa de notificacao. O evento foi registrado para retry/auditoria.",
         ephemeral: true,
