@@ -2785,9 +2785,16 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
 
     if (action === "deny") {
       await interaction.update({
-        content: `Reembolso negado por <@${interaction.user.id}> para a compra ${order.productTitle}.`,
+        content: `Reembolso negado por <@${interaction.user.id}> para a compra **${order.productTitle}**.`,
         embeds: interaction.message.embeds,
-        components: [],
+        components: [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId(`${REFUND_PREFIX}approve:${ticket.id}:${order.key}`)
+              .setLabel("Aprovar mesmo assim (Reverter negação)")
+              .setStyle(ButtonStyle.Success)
+          ),
+        ],
         allowedMentions: { parse: [] },
       });
       const channel = await client.channels.fetch(ticket.channel_id).catch(() => null);
