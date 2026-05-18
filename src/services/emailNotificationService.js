@@ -127,6 +127,50 @@ function buildSupportTicketEmailHtml(input) {
   `;
 }
 
+function buildRefundProcessedEmailHtml(input) {
+  return `
+    <!doctype html>
+    <html lang="pt-BR">
+      <body style="margin:0;padding:0;background:#EEF3F8;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#EEF3F8;border-collapse:collapse;">
+          <tr>
+            <td align="center" style="padding:32px 16px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:640px;background:#FFFFFF;border:1px solid #D8E1EC;border-radius:24px;border-collapse:separate;overflow:hidden;">
+                <tr>
+                  <td style="padding:32px 36px;font-family:Arial,Helvetica,sans-serif;color:#0F172A;">
+                    <div style="font-size:12px;letter-spacing:0.16em;text-transform:uppercase;color:#64748B;">Flowdesk Reembolso</div>
+                    <h1 style="margin:12px 0 0;font-size:30px;line-height:1.15;">Reembolso aprovado</h1>
+                    <p style="margin:14px 0 0;font-size:16px;line-height:1.7;color:#475569;">
+                      Seu reembolso foi processado com sucesso. O prazo de visualizacao do valor depende do provedor de pagamento e do banco emissor.
+                    </p>
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:22px;border:1px solid #E2E8F0;border-radius:18px;background:#F8FAFC;">
+                      <tr>
+                        <td style="padding:14px 16px;font-size:13px;color:#64748B;">Protocolo</td>
+                        <td align="right" style="padding:14px 16px;font-size:15px;font-weight:700;color:#0F172A;">${escapeHtml(input.refundProtocol)}</td>
+                      </tr>
+                      <tr>
+                        <td style="padding:14px 16px;border-top:1px solid #E2E8F0;font-size:13px;color:#64748B;">Compra</td>
+                        <td align="right" style="padding:14px 16px;border-top:1px solid #E2E8F0;font-size:15px;font-weight:700;color:#0F172A;">${escapeHtml(input.productTitle)}</td>
+                      </tr>
+                      <tr>
+                        <td style="padding:14px 16px;border-top:1px solid #E2E8F0;font-size:13px;color:#64748B;">Valor</td>
+                        <td align="right" style="padding:14px 16px;border-top:1px solid #E2E8F0;font-size:15px;font-weight:700;color:#0F172A;">${escapeHtml(input.amountLabel)}</td>
+                      </tr>
+                    </table>
+                    <p style="margin:24px 0 0;font-size:13px;line-height:1.7;color:#64748B;">
+                      Este email foi enviado automaticamente para confirmar o processamento do reembolso.
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+    </html>
+  `;
+}
+
 async function sendSupportTicketOpenedEmail(input) {
   try {
     const contact = await getAuthUserContactByDiscordUserId(input.discordUserId);
@@ -169,6 +213,53 @@ async function sendSupportTicketOpenedEmail(input) {
   }
 }
 
+async function sendRefundProcessedEmail(input) {
+  try {
+    const contact = await getAuthUserContactByDiscordUserId(input.discordUserId);
+    if (!contact || !isValidEmail(contact.email)) return { sent: false, reason: "missing_email" };
+
+    const resolved = getTransporter();
+    if (!resolved) return { sent: false, reason: "smtp_not_configured" };
+
+    const { transporter, config } = resolved;
+    const from = config.fromName
+      ? `"${config.fromName.replace(/"/g, "")}" <${config.fromEmail}>`
+      : config.fromEmail;
+
+    await transporter.sendMail({
+      from,
+      to: contact.email,
+      replyTo: config.replyTo || undefined,
+      envelope: {
+        from: config.envelopeFrom,
+        to: contact.email,
+      },
+      subject: `Flowdesk | Reembolso ${input.refundProtocol} aprovado`,
+      headers: {
+        "Auto-Submitted": "auto-generated",
+        "X-Auto-Response-Suppress": "All",
+        "X-Flowdesk-Email-Type": "ticket-refund-processed",
+      },
+      text: [
+        "Flowdesk Reembolso",
+        "",
+        "Seu reembolso foi aprovado e processado com sucesso.",
+        `Protocolo: ${input.refundProtocol}`,
+        `Compra: ${input.productTitle}`,
+        `Valor: ${input.amountLabel}`,
+        "",
+        "O prazo de visualizacao do valor depende do provedor de pagamento e do banco emissor.",
+      ].join("\n"),
+      html: buildRefundProcessedEmailHtml(input),
+    });
+    return { sent: true, email: contact.email };
+  } catch (error) {
+    console.warn("[email-notification] refund-processed failed:", error);
+    return { sent: false, error };
+  }
+}
+
 module.exports = {
+  sendRefundProcessedEmail,
   sendSupportTicketOpenedEmail,
 };

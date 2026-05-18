@@ -9,6 +9,8 @@ const crypto = require("node:crypto");
 const { createClient } = require("@supabase/supabase-js");
 const { env } = require("../config/env");
 const { canClaimTicket, canCloseTicket } = require("../utils/staff");
+const { sendRefundProcessedEmail } = require("./emailNotificationService");
+const { processDirectMessageQueue } = require("./directMessageQueueService");
 
 const supabase = createClient(env.supabaseUrl, env.supabaseServiceRoleKey, {
   auth: {
@@ -944,9 +946,16 @@ async function logRefundAuditEvent(input) {
     metadata,
   };
 
-  const result = await supabase.from("ticket_refund_audit_events").insert(payload);
-  if (result.error && !isMissingTableError(result.error, "ticket_refund_audit_events")) {
-    console.warn("[ticket-refund] falha ao registrar auditoria:", result.error.message);
+  try {
+    const result = await supabase.from("ticket_refund_audit_events").insert(payload);
+    if (result.error && !isMissingTableError(result.error, "ticket_refund_audit_events")) {
+      console.warn("[ticket-refund] falha ao registrar auditoria:", result.error.message);
+      return { ok: false, error: result.error };
+    }
+    return { ok: true };
+  } catch (error) {
+    console.warn("[ticket-refund] excecao ao registrar auditoria:", error?.message || error);
+    return { ok: false, error };
   }
 }
 
@@ -2163,42 +2172,48 @@ async function sendAutoRefundInfoLog({ client, ticket, order, settings, protocol
 
 async function enqueueRefundDirectMessage({ ticket, order, protocol, kind, content }) {
   const notificationKey = `ticket:${ticket.id}:refund:${kind}:${protocol}`;
-  const result = await supabase
-    .from("ticket_dm_queue")
-    .upsert(
-      {
-        notification_key: notificationKey,
-        kind: kind === "denied" ? "ticket_refund_denied_dm" : "ticket_refund_processed_dm",
-        ticket_id: ticket.id,
-        protocol: ticket.protocol,
-        guild_id: ticket.guild_id,
-        user_id: ticket.user_id,
-        payload: {
-          content,
-          allowedMentions: { parse: [] },
+  try {
+    const result = await supabase
+      .from("ticket_dm_queue")
+      .upsert(
+        {
+          notification_key: notificationKey,
+          kind: kind === "denied" ? "ticket_refund_denied_dm" : "ticket_refund_processed_dm",
+          ticket_id: ticket.id,
+          protocol: ticket.protocol,
+          guild_id: ticket.guild_id,
+          user_id: ticket.user_id,
+          payload: {
+            content,
+            allowedMentions: { parse: [] },
+          },
+          status: "pending",
+          attempt_count: 0,
+          max_attempts: 12,
+          next_attempt_at: new Date().toISOString(),
+          last_error: null,
+          dm_channel_id: null,
+          delivered_message_id: null,
+          sent_at: null,
         },
-        status: "pending",
-        attempt_count: 0,
-        max_attempts: 12,
-        next_attempt_at: new Date().toISOString(),
-        last_error: null,
-        dm_channel_id: null,
-        delivered_message_id: null,
-        sent_at: null,
-      },
-      { onConflict: "notification_key" },
-    )
-    .select("id")
-    .maybeSingle();
+        { onConflict: "notification_key" },
+      )
+      .select("id")
+      .maybeSingle();
 
-  if (result.error && !isMissingTableError(result.error, "ticket_dm_queue")) {
-    console.warn("[ticket-refund] falha ao enfileirar DM de reembolso:", result.error.message);
+    if (result.error && !isMissingTableError(result.error, "ticket_dm_queue")) {
+      console.warn("[ticket-refund] falha ao enfileirar DM de reembolso:", result.error.message);
+      return { notificationKey, queued: false, error: result.error };
+    }
+
+    return {
+      notificationKey,
+      queued: !result.error,
+    };
+  } catch (error) {
+    console.warn("[ticket-refund] excecao ao enfileirar DM de reembolso:", error?.message || error);
+    return { notificationKey, queued: false, error };
   }
-
-  return {
-    notificationKey,
-    queued: !result.error,
-  };
 }
 
 function buildRefundSuccessContent({ settings, order, protocol }) {
@@ -3234,12 +3249,23 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
             content: successContent,
             allowedMentions: { parse: [] },
           }, correlationId);
-          await enqueueRefundDirectMessage({
+          const dmQueue = await enqueueRefundDirectMessage({
             ticket,
             order,
             protocol: autoProtocol,
             kind: "processed",
             content: successContent,
+          });
+          if (dmQueue.queued) {
+            void processDirectMessageQueue(client, { notificationKey: dmQueue.notificationKey }).catch((error) => {
+              console.warn("[ticket-refund] falha ao processar DM imediata de auto-reembolso:", error?.message || error);
+            });
+          }
+          await sendRefundProcessedEmail({
+            discordUserId: ticket.user_id,
+            refundProtocol: autoProtocol,
+            productTitle: order.productTitle,
+            amountLabel: formatMoney(order.amount, order.currency),
           });
         }
 
@@ -3540,12 +3566,23 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
         content: successContent,
         allowedMentions: { parse: [] },
       }).then(() => ({ ok: true })).catch((discordError) => ({ ok: false, error: discordError }));
-      await enqueueRefundDirectMessage({
+      const dmQueue = await enqueueRefundDirectMessage({
         ticket,
         order: finalOrder,
         protocol: manualProtocol,
         kind: "processed",
         content: successContent,
+      });
+      if (dmQueue.queued) {
+        void processDirectMessageQueue(client, { notificationKey: dmQueue.notificationKey }).catch((error) => {
+          console.warn("[ticket-refund] falha ao processar DM imediata de reembolso manual:", error?.message || error);
+        });
+      }
+      const emailNotice = await sendRefundProcessedEmail({
+        discordUserId: ticket.user_id,
+        refundProtocol: manualProtocol,
+        productTitle: finalOrder.productTitle,
+        amountLabel: formatMoney(finalOrder.amount, finalOrder.currency),
       });
       await logRefundAuditEvent({
         ticket,
@@ -3566,6 +3603,8 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
           discord_approval_message_updated: approvalUpdate.ok,
           discord_ticket_confirmation_sent: ticketNotice?.ok === true,
           discord_ticket_confirmation_error: ticketNotice?.ok === false ? serializeDiscordError(ticketNotice.error) : null,
+          email_confirmation_sent: emailNotice?.sent === true,
+          email_confirmation_error: emailNotice?.sent === false ? normalizeText(emailNotice.reason || emailNotice.error?.message || "", 180) : null,
         },
       });
       return true;
