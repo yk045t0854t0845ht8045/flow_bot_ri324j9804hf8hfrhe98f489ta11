@@ -1933,9 +1933,72 @@ async function callInternalSalesRefund(cartId, guildId, reason) {
   });
   const payload = await response.json().catch(() => null);
   if (!response.ok || payload?.ok === false) {
-    throw new Error(payload?.message || `Falha HTTP ${response.status} ao reembolsar.`);
+    const error = new Error(payload?.message || `Falha HTTP ${response.status} ao reembolsar.`);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
   }
   return payload;
+}
+
+function isProviderCommunicationUncertainty(error) {
+  const message = normalizeIntentText(
+    `${error?.message || ""} ${error?.payload?.message || ""} ${error?.payload?.error || ""}`,
+  );
+  return includesAny(message, [
+    "communication error",
+    "communication_error",
+    "timeout",
+    "tempo limite",
+    "falha de rede",
+    "network",
+    "econnreset",
+    "etimedout",
+    "socket hang up",
+    "mercado pago",
+  ]);
+}
+
+function isRefundedOrder(order) {
+  const status = String(order?.status || "").toLowerCase();
+  const providerStatus = String(order?.providerStatus || "").toLowerCase();
+  const providerDetail = String(order?.providerStatusDetail || "").toLowerCase();
+  return (
+    status === "refunded" ||
+    providerStatus === "refunded" ||
+    providerStatus === "charged_back" ||
+    providerDetail.includes("refund") ||
+    providerDetail.includes("chargeback") ||
+    providerDetail.includes("reembols") ||
+    countRefundEvents(order?.events || []) > 0
+  );
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function confirmRefundAfterUncertainError({ ticket, order, authUserId, error, attempts = 4 }) {
+  if (!isProviderCommunicationUncertainty(error)) {
+    return { confirmed: false, order: null, reason: "not_recoverable_error" };
+  }
+
+  for (let index = 0; index < attempts; index += 1) {
+    if (index > 0) await delay(1200 * index);
+    const refreshedOrder = await getOrderByKey(ticket.guild_id, order.key, {
+      authUserId,
+      discordUserId: ticket.user_id,
+    }).catch(() => null);
+    if (isRefundedOrder(refreshedOrder)) {
+      return {
+        confirmed: true,
+        order: refreshedOrder,
+        reason: "post_error_reconciliation",
+      };
+    }
+  }
+
+  return { confirmed: false, order: null, reason: "not_confirmed_after_reconciliation" };
 }
 
 function summarizeEligibilityForStaff(eligibility) {
@@ -3403,30 +3466,67 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
       await acknowledgeComponent(interaction, correlationId);
       const manualProtocol = generateRefundProtocol(ticket.id, order.key);
       let refundResult = null;
+      let finalOrder = order;
+      let recoveredFromUncertainError = false;
       try {
         refundResult = await callInternalSalesRefund(order.id, ticket.guild_id, `Aprovado manualmente por ${interaction.user.id} — protocolo ${manualProtocol}.`);
       } catch (financialError) {
+        const reconciliation = await confirmRefundAfterUncertainError({
+          ticket,
+          order,
+          authUserId: authUser?.id,
+          error: financialError,
+        });
+        if (reconciliation.confirmed) {
+          finalOrder = reconciliation.order || order;
+          refundResult = {
+            ok: true,
+            alreadyRefunded: true,
+            reconciledAfterError: true,
+            reconciliationReason: reconciliation.reason,
+          };
+          recoveredFromUncertainError = true;
+          await logRefundAuditEvent({
+            ticket,
+            orderKey: order.key,
+            eventType: "manual_refund_financial_reconciled",
+            outcome: "processed_after_uncertain_provider_error",
+            correlationId,
+            metadata: {
+              responsible_user: interaction.user.id,
+              action_time: new Date().toISOString(),
+              method: "manual",
+              transaction_id: order.providerPaymentId || null,
+              final_status: "refunded",
+              decidedBy: interaction.user.id,
+              provider_error: normalizeText(financialError.message, 300),
+              reconciliation_reason: reconciliation.reason,
+            },
+          });
+        } else {
         await sendInteractionNotice(interaction, {
-          content: `Nao consegui processar o estorno financeiro: ${normalizeText(financialError.message, 300)}`,
+          content: `Ainda nao consegui confirmar o estorno financeiro: ${normalizeText(financialError.message, 300)}. Nao aprove novamente agora; deixei registrado para reconciliacao e auditoria.`,
           ephemeral: true,
         }, correlationId);
         await logRefundAuditEvent({
           ticket,
           orderKey: order.key,
-          eventType: "manual_refund_financial_failed",
-          outcome: "financial_error",
+          eventType: "manual_refund_financial_uncertain",
+          outcome: "needs_reconciliation",
           correlationId,
           metadata: {
             responsible_user: interaction.user.id,
             action_time: new Date().toISOString(),
             method: "manual",
             transaction_id: order.providerPaymentId || null,
-            final_status: "financial_error",
+            final_status: "provider_result_uncertain",
             decidedBy: interaction.user.id,
             message: normalizeText(financialError.message, 300),
+            reconciliation_reason: reconciliation.reason,
           },
         });
         return true;
+        }
       }
       const approvalUpdate = await updateComponentMessage(interaction, {
         content: `Reembolso aprovado e processado por <@${interaction.user.id}> para a compra **${order.productTitle}** — Protocolo: \`${manualProtocol}\``,
@@ -3435,14 +3535,14 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
         allowedMentions: { parse: [] },
       }, correlationId);
       const channel = await client.channels.fetch(ticket.channel_id).catch(() => null);
-      const successContent = buildRefundSuccessContent({ settings, order, protocol: manualProtocol });
+      const successContent = buildRefundSuccessContent({ settings, order: finalOrder, protocol: manualProtocol });
       const ticketNotice = await channel?.send?.({
         content: successContent,
         allowedMentions: { parse: [] },
       }).then(() => ({ ok: true })).catch((discordError) => ({ ok: false, error: discordError }));
       await enqueueRefundDirectMessage({
         ticket,
-        order,
+        order: finalOrder,
         protocol: manualProtocol,
         kind: "processed",
         content: successContent,
@@ -3461,6 +3561,7 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
           transaction_id: order.providerPaymentId || null,
           final_status: refundResult?.alreadyRefunded ? "already_refunded" : "refunded",
           decidedBy: interaction.user.id,
+          recovered_from_uncertain_provider_error: recoveredFromUncertainError,
           protocol: manualProtocol,
           discord_approval_message_updated: approvalUpdate.ok,
           discord_ticket_confirmation_sent: ticketNotice?.ok === true,
