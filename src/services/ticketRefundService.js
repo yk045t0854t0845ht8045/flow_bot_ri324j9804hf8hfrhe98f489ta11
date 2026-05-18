@@ -361,6 +361,16 @@ function isOrderInfoIntent(text) {
     "status do pedido",
     "informacoes do pedido",
     "info do pedido",
+    "data da compra",
+    "dia da compra",
+    "quando foi comprado",
+    "quando comprei",
+    "que dia foi comprado",
+    "qual dia foi comprado",
+    "qual foi o dia da compra",
+    "em que dia foi comprado",
+    "quando esse pedido foi comprado",
+    "quando o pedido foi comprado",
     "nao recebi",
     "nao chegou",
   ]);
@@ -383,6 +393,14 @@ function assistantAskedForOrderNumber(historyRows) {
         "vou verificar",
       ]),
   );
+}
+
+async function getReferencedAuthorMessageContent(message) {
+  const referencedId = message?.reference?.messageId;
+  if (!referencedId || typeof message?.channel?.messages?.fetch !== "function") return "";
+  const referenced = await message.channel.messages.fetch(referencedId).catch(() => null);
+  if (!referenced || referenced.author?.id !== message.author?.id) return "";
+  return String(referenced.content || "");
 }
 
 function isCancelRefundIntent(text) {
@@ -563,6 +581,7 @@ function createDefaultRefundState() {
     authStatus: "unknown",
     authUserId: null,
     authLinkId: null,
+    authConfirmedAt: null,
     loginMessageId: null,
     orderCandidates: [],
     failedOrderCandidates: [],
@@ -596,6 +615,8 @@ function sanitizeRefundState(state) {
   merged.authStatus = typeof merged.authStatus === "string" ? merged.authStatus : "unknown";
   merged.authUserId = coerceNumberOrNull(merged.authUserId);
   merged.authLinkId = typeof merged.authLinkId === "string" ? merged.authLinkId : null;
+  merged.authConfirmedAt =
+    typeof merged.authConfirmedAt === "string" ? merged.authConfirmedAt : null;
   merged.loginMessageId =
     typeof merged.loginMessageId === "string" ? merged.loginMessageId : null;
   merged.orderCandidates = Array.isArray(merged.orderCandidates)
@@ -940,15 +961,15 @@ async function fetchRecentAiMessages(ticketId) {
 }
 
 async function persistRefundStateDirectly(ticket, state, extra = {}) {
+  const baseState = state && typeof state === "object" ? state : {};
   const safeState = sanitizeRefundState({
-    ...state,
+    ...baseState,
     ...extra,
-    lastActionAt: extra.lastActionAt || state.lastActionAt || nowIso(),
+    lastActionAt: extra.lastActionAt || baseState.lastActionAt || nowIso(),
   });
-  
-  await supabase
-    .from("ticket_ai_messages")
-    .insert({
+
+  try {
+    const result = await supabase.from("ticket_ai_messages").insert({
       ticket_id: ticket.id,
       protocol: ticket.protocol,
       guild_id: ticket.guild_id,
@@ -960,10 +981,18 @@ async function persistRefundStateDirectly(ticket, state, extra = {}) {
       metadata: {
         refund: safeState,
       },
-    })
-    .catch((error) => {
-      console.warn("[ticket-refund] falha ao persistir estado diretamente:", error.message);
     });
+
+    if (result.error) {
+      console.warn("[ticket-refund] falha ao persistir estado diretamente:", result.error.message);
+      return { ok: false, error: result.error };
+    }
+
+    return { ok: true, state: safeState };
+  } catch (error) {
+    console.warn("[ticket-refund] excecao ao persistir estado diretamente:", error?.message || error);
+    return { ok: false, error };
+  }
 }
 
 async function getTicketRefundSettings(guildId, runtime) {
@@ -1130,7 +1159,28 @@ async function getAuthUserById(userId) {
   return result.error ? null : result.data || null;
 }
 
-function buildLoginPromptPayload(url, authUser) {
+function buildLoginPromptPayload(url, authUser, options = {}) {
+  const requireConfirmation = options.requireConfirmation === true;
+  if (authUser && requireConfirmation) {
+    return v2Message([
+      {
+        type: COMPONENT_TYPE.CONTAINER,
+        accent_color: 0x8fdbff,
+        components: [
+          textDisplay(
+            [
+              "## Confirme sua conta segura",
+              `Encontrei uma conta Flowdesk associada a este Discord${authUser.email ? ` (**${authUser.email}**)` : ""}, mas antes de consultar qualquer pedido preciso confirmar o acesso nesta sessao.`,
+              "",
+              "Clique em **Confirmar / Trocar Conta**. Depois da confirmacao, envie novamente o numero do pedido para eu consultar com seguranca.",
+            ].join("\n"),
+          ),
+        ],
+      },
+      actionRow([linkButton({ label: "Confirmar / Trocar Conta", url })]),
+    ]);
+  }
+
   if (authUser) {
     return v2Message([
       {
@@ -1224,6 +1274,7 @@ async function startLoginPolling({ client, ticket, linkId, authMessage, persist,
         stage: "awaiting_order",
         authStatus: "linked",
         authUserId: authUser.id,
+        authConfirmedAt: nowIso(),
         lastPromptKind: "order_after_auth",
         lastPromptAt: nowIso(),
       });
@@ -1241,20 +1292,22 @@ async function startLoginPolling({ client, ticket, linkId, authMessage, persist,
   activeLoginPollers.set(key, interval);
 }
 
-async function sendSecureLoginPrompt({ message, client, ticket, persist, state, authUser }) {
+async function sendSecureLoginPrompt({ message, client, ticket, persist, state, authUser, requireConfirmation = false }) {
   const link = await createTicketRefundAuthLink(ticket);
-  const payload = buildLoginPromptPayload(link.url, authUser);
+  const payload = buildLoginPromptPayload(link.url, authUser, { requireConfirmation });
   const sent = await message.channel.send(payload);
+  const isAlreadyConfirmed = Boolean(authUser && !requireConfirmation);
   const nextState = markPrompt(
     {
       ...state,
       intent: true,
-      stage: authUser ? "awaiting_order" : "awaiting_auth",
-      authStatus: authUser ? "linked" : "pending",
+      stage: isAlreadyConfirmed ? "awaiting_order" : "awaiting_auth",
+      authStatus: isAlreadyConfirmed ? "linked" : "pending",
+      authUserId: authUser?.id || state.authUserId || null,
       authLinkId: link.linkId,
       loginMessageId: sent?.id || null,
     },
-    authUser ? "ask_order_with_login" : "login",
+    authUser ? "confirm_account" : "login",
   );
   await persistRefundState(persist, nextState);
   await logRefundAuditEvent({
@@ -1569,6 +1622,15 @@ function buildSafeOrderInfoEmbed(order) {
     )
     .setFooter({ text: "Consulta feita apenas para o Discord vinculado a este ticket." })
     .setTimestamp(new Date());
+}
+
+function isOrderOwnedByTicketContext(order, context = {}) {
+  const orderAuthUserId = coerceNumberOrNull(order?.authUserId);
+  const contextAuthUserId = coerceNumberOrNull(context.authUserId);
+  if (orderAuthUserId) {
+    return Boolean(contextAuthUserId) && Number(orderAuthUserId) === Number(contextAuthUserId);
+  }
+  return Boolean(context.discordUserId && order?.discordUserId === context.discordUserId);
 }
 
 async function listUserRecentOrders({ guildId, authUserId, discordUserId }) {
@@ -2463,6 +2525,37 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
     return true;
   }
 
+  const sessionAuthConfirmed =
+    state.authStatus === "linked" &&
+    Number(state.authUserId) === Number(authUser.id) &&
+    Boolean(state.authLinkId) &&
+    Boolean(state.authConfirmedAt);
+
+  if (!sessionAuthConfirmed) {
+    const pendingState = sanitizeRefundState({
+      ...state,
+      intent: true,
+      authStatus: "pending",
+      authUserId: authUser.id,
+      stage: "awaiting_auth",
+    });
+
+    if (shouldPrompt(pendingState, "confirm_account", REFUND_PROMPT_COOLDOWN_MS) || !pendingState.authLinkId) {
+      await sendSecureLoginPrompt({
+        message,
+        client,
+        ticket,
+        persist,
+        state: pendingState,
+        authUser,
+        requireConfirmation: true,
+      });
+    } else {
+      await persistRefundState(persist, pendingState);
+    }
+    return true;
+  }
+
   state = sanitizeRefundState({
     ...state,
     intent: true,
@@ -2680,11 +2773,35 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
     });
     throw error;
   });
+  const visibleOrders = orders.filter((order) =>
+    isOrderOwnedByTicketContext(order, {
+      authUserId: authUser.id,
+      discordUserId: ticket.user_id,
+    }),
+  );
+
+  if (orders.length > 0 && visibleOrders.length === 0) {
+    state = markPrompt({ ...state, stage: "lookup_failed" }, "ownership_mismatch");
+    await persistRefundState(persist, state);
+    await logRefundAuditEvent({
+      ticket,
+      authUserId: authUser.id,
+      eventType: "lookup_ownership_mismatch",
+      outcome: "blocked",
+      metadata: { orderCandidates },
+    });
+    await message.channel.send({
+      content:
+        "Encontrei uma referencia parecida, mas ela nao pertence a conta confirmada neste ticket. Por seguranca, nao posso consultar nem abrir reembolso desse pedido. Confirme a conta correta pelo Login / Trocar Conta e envie o numero novamente.",
+      allowedMentions: { parse: [] },
+    });
+    return true;
+  }
 
   const availableOrders = [];
   const refundedOrders = [];
 
-  for (const order of orders) {
+  for (const order of visibleOrders) {
     const status = String(order.status || "").toLowerCase();
     const providerStatus = String(order.providerStatus || "").toLowerCase();
     const providerDetail = String(order.providerStatusDetail || "").toLowerCase();
@@ -2703,7 +2820,7 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
     }
   }
 
-  if (orders.length > 0 && availableOrders.length === 0) {
+  if (visibleOrders.length > 0 && availableOrders.length === 0) {
     state = markPrompt({ ...state, stage: "completed" }, "already_refunded");
     await persistRefundState(persist, state);
     await message.channel.send({
@@ -3383,18 +3500,25 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
 
 async function handleOrderInfoLookupMessage({ message, ticket, historyRows, content, persist }) {
   const previousState = readRefundMemory(historyRows);
-  const orderCandidates = extractOrderCandidates(content, {
+  const askedForOrderInfo = isOrderInfoIntent(content);
+  const referencedContent = askedForOrderInfo ? await getReferencedAuthorMessageContent(message) : "";
+  const directOrderCandidates = extractOrderCandidates(content, {
     allowShortGeneric: assistantAskedForOrderNumber(historyRows),
   });
+  const referencedOrderCandidates =
+    directOrderCandidates.length || !referencedContent
+      ? []
+      : extractOrderCandidates(referencedContent, { allowShortGeneric: true });
+  const orderCandidates = [...new Set([...directOrderCandidates, ...referencedOrderCandidates])].slice(0, 6);
   const shouldLookup =
     orderCandidates.length > 0 &&
     !isRefundOrOrderIntent(content) &&
     (assistantAskedForOrderNumber(historyRows) ||
-      isOrderInfoIntent(content) ||
+      askedForOrderInfo ||
       previousState.lastPromptKind === "order_info_lookup");
 
   if (!shouldLookup) {
-    if (isOrderInfoIntent(content) && !isRefundOrOrderIntent(content)) {
+    if (askedForOrderInfo && !isRefundOrOrderIntent(content)) {
       await persistRefundState(persist, {
         ...previousState,
         intent: false,
@@ -3417,9 +3541,15 @@ async function handleOrderInfoLookupMessage({ message, ticket, historyRows, cont
     console.warn("[ticket-refund] falha na consulta segura de pedido:", error.message);
     return [];
   });
+  const visibleOrders = ownedOrders.filter((order) =>
+    isOrderOwnedByTicketContext(order, {
+      authUserId: authUser?.id || null,
+      discordUserId: ticket.user_id,
+    }),
+  );
 
-  if (ownedOrders.length) {
-    const order = ownedOrders[0];
+  if (visibleOrders.length) {
+    const order = visibleOrders[0];
     await persistRefundState(persist, {
       ...previousState,
       intent: false,
