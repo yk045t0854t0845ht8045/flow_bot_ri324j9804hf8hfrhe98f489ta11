@@ -220,17 +220,55 @@ function isRefundOrOrderIntent(text) {
     "devolver dinheiro",
     "cancelar compra",
     "cancelamento da compra",
-    "verificar compra",
-    "verificacao de compra",
-    "validar pedido",
-    "consultar pedido",
-    "numero do pedido",
-    "n do pedido",
-    "meu pedido",
-    "minha compra",
-    "comprei",
+    "cancelar meu pedido",
+    "cancelar meu produto",
+    "devolver o valor",
+    "dinheiro de volta",
+    "quero meu dinheiro",
+  ]);
+}
+
+function isRefundProceedIntent(text) {
+  const normalized = normalizeIntentText(text);
+  return includesAny(normalized, [
+    "quero reembolso",
+    "quero o reembolso",
+    "preciso de reembolso",
+    "preciso do reembolso",
+    "prefiro reembolso",
+    "prefiro o reembolso",
+    "so quero reembolso",
+    "so o reembolso",
+    "pode seguir com reembolso",
+    "pode fazer o reembolso",
+    "faz o reembolso",
+    "fazer reembolso",
+    "seguir com estorno",
+    "pode estornar",
+    "estorna",
+    "nao quero ajuda",
+    "nao da",
+    "nao deu",
+    "nao resolveu",
+    "sem solucao",
+    "nao tem como resolver",
+  ]);
+}
+
+function isRefundSupportConversationIntent(text) {
+  const normalized = normalizeIntentText(text);
+  return includesAny(normalized, [
+    "qual problema",
+    "posso explicar",
+    "vou explicar",
+    "me ajuda",
+    "preciso de ajuda",
+    "problema",
+    "erro",
     "nao recebi",
-    "pedido",
+    "nao chegou",
+    "nao funciona",
+    "duvida",
   ]);
 }
 
@@ -473,6 +511,7 @@ function sanitizeRefundState(state) {
 
 function isActiveRefundState(state) {
   return [
+    "refund_intake",
     "awaiting_auth",
     "awaiting_order",
     "lookup_failed",
@@ -552,7 +591,7 @@ function buildRefundMemoryPatch(content, historyRows) {
   return sanitizeRefundState({
     ...previousState,
     intent,
-    stage: previousState.stage || (intent ? "awaiting_auth" : null),
+    stage: previousState.stage || (intent ? "refund_intake" : null),
     orderCandidates: nextOrderCandidates,
     orderNumber: nextOrderCandidates[0] || null,
     currentIntent,
@@ -1894,6 +1933,24 @@ async function answerContextualMessage({ message, persist, state, kind, content,
     return true;
   }
 
+  if (kind === "refund_intake") {
+    const nextState = markPrompt(
+      sanitizeRefundState({
+        ...state,
+        intent: true,
+        stage: "refund_intake",
+      }),
+      "refund_intake",
+    );
+    await persistRefundState(persist, nextState);
+    await message.reply({
+      content:
+        "Vamos com calma: antes de abrir um reembolso, me conta rapidinho o que aconteceu com o pedido? Se for algo como entrega, acesso, produto errado ou erro, talvez eu consiga te ajudar por aqui.\n\nSe voce ja decidiu que quer reembolso mesmo, responda **quero seguir com o reembolso**.",
+      allowedMentions: { parse: [] },
+    });
+    return true;
+  }
+
   if (kind === "manipulation") {
     const nextState = markPrompt(state, "security");
     await persistRefundState(persist, nextState);
@@ -2040,8 +2097,9 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
     return await handleRefundProtocolQuery({ message, client, ticket, protocolCode, persist });
   }
 
+  const previousState = readRefundMemory(historyRows);
   let state = buildRefundMemoryPatch(content, historyRows);
-  const active = isActiveRefundState(readRefundMemory(historyRows));
+  const active = isActiveRefundState(previousState);
   const currentIntent = state.currentIntent === true;
   const cancelIntent = state.cancelIntent === true;
   const orderCandidates = extractOrderCandidates(content, {
@@ -2085,6 +2143,39 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
   }
 
   if (!state.intent && !currentIntent && !(active && orderCandidates.length)) return false;
+
+  if (state.stage === "refund_intake") {
+    const alreadyPromptedIntake = previousState.stage === "refund_intake";
+    const proceedRefund = alreadyPromptedIntake && isRefundProceedIntent(content);
+
+    if (!proceedRefund) {
+      if (!alreadyPromptedIntake || shouldPrompt(state, "refund_intake", REFUND_PROMPT_COOLDOWN_MS)) {
+        return answerContextualMessage({
+          message,
+          persist,
+          state,
+          kind: "refund_intake",
+          content,
+          ticket,
+        });
+      }
+
+      if (isRefundSupportConversationIntent(content) || !currentIntent) {
+        await persistRefundState(persist, state);
+        return false;
+      }
+
+      return true;
+    }
+
+    state = sanitizeRefundState({
+      ...state,
+      intent: true,
+      stage: "awaiting_auth",
+      lastActionAt: nowIso(),
+    });
+    await persistRefundState(persist, state);
+  }
 
   if (["manual_review", "completed"].includes(state.stage)) {
     const wantsAnother = currentIntent || isListOrdersIntent(content);
