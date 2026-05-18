@@ -12,6 +12,7 @@ const { canClaimTicket, canCloseTicket } = require("../utils/staff");
 const { requestFlowAiChat } = require("./flowAiClient");
 const {
   buildRefundMemoryPatch,
+  handleOrderInfoLookupMessage,
   handleRefundOrVerificationMessage,
 } = require("./ticketRefundService");
 
@@ -98,6 +99,7 @@ const TICKET_AI_CORE_BEHAVIOR = [
   "Nao pergunte de novo o motivo principal se ele ja estiver informado no contexto do ticket; use esse motivo para aprofundar o atendimento.",
   "Se o ticket for sobre painel, logs, staff, cargo, categoria ou transcript, use o contexto real do servidor para orientar com precisao.",
   "Nao invente configuracoes, cargos, canais ou promessas inexistentes.",
+  "Nao diga que vai verificar, consultar ou puxar dados internos se voce ainda nao recebeu uma resposta de ferramenta/sistema no historico. Se precisar do numero do pedido, peca o numero; quando o usuario enviar, o runtime fara a consulta real antes de voce responder.",
 ].join(" ");
 
 function buildDynamicSystemPrompt(runtime) {
@@ -120,6 +122,7 @@ function buildDynamicSystemPrompt(runtime) {
     "Quando o problema for de configuracao do Flowdesk ou do Discord, use o contexto salvo do servidor antes de responder.",
     "Se faltar uma informacao critica, faca no maximo uma pergunta complementar e ela deve ser especifica.",
     "Quando o assunto envolver reembolso, estorno, verificacao de compra, validacao de pedido ou consulta financeira, converse naturalmente, mas nunca conclua nada sem login seguro da conta e numero do pedido.",
+    "Para ajuda comum com pedido, voce pode pedir o numero do pedido, mas nao prometa que ja vai consultar; a consulta real sera feita por ferramenta interna e respondera com um resumo seguro quando houver permissao.",
     "Nao solicite email ou senha no chat para reembolso. Se o usuario enviar email, explique que a verificacao usa login seguro e continue pedindo apenas o numero do pedido depois do vinculo.",
     "Depois que a conta estiver vinculada e o numero do pedido estiver disponivel, avise que a consulta sera feita no sistema integrado e aguarde o fluxo interno retornar as compras reais.",
   ];
@@ -1704,6 +1707,28 @@ async function handleTicketAiMessage(message, client) {
       persist: (input) => persistTicketAiMessage(ticket, input),
     });
     if (refundHandled) {
+      await safeUpsertTicketAiSession({
+        ticketId: ticket.id,
+        protocol: ticket.protocol,
+        guildId: ticket.guild_id,
+        channelId: ticket.channel_id,
+        userId: ticket.user_id,
+        status: "active",
+        lastAiReplyAt: nowIso(),
+        lastUserMessageAt: currentIso,
+        lastStaffMessageAt: session?.last_staff_message_at || null,
+      });
+      return true;
+    }
+
+    const orderInfoHandled = await handleOrderInfoLookupMessage({
+      message,
+      ticket,
+      historyRows: historyRowsBeforeUserMessage,
+      content,
+      persist: (input) => persistTicketAiMessage(ticket, input),
+    });
+    if (orderInfoHandled) {
       await safeUpsertTicketAiSession({
         ticketId: ticket.id,
         protocol: ticket.protocol,

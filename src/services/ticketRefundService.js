@@ -272,6 +272,44 @@ function isRefundSupportConversationIntent(text) {
   ]);
 }
 
+function isOrderInfoIntent(text) {
+  const normalized = normalizeIntentText(text);
+  return includesAny(normalized, [
+    "ajuda com meu pedido",
+    "ajuda com pedido",
+    "meu pedido",
+    "me ajuda com a compra",
+    "me ajuda com minha compra",
+    "consultar pedido",
+    "ver pedido",
+    "verificar pedido",
+    "status do pedido",
+    "informacoes do pedido",
+    "info do pedido",
+    "nao recebi",
+    "nao chegou",
+  ]);
+}
+
+function assistantAskedForOrderNumber(historyRows) {
+  const lastAssistant = [...(historyRows || [])]
+    .reverse()
+    .find((row) => row?.author_type === "assistant" || row?.author_type === "system");
+  const normalized = normalizeIntentText(lastAssistant?.content || "");
+  return Boolean(
+    normalized &&
+      includesAny(normalized, [
+        "numero do pedido",
+        "informe o numero",
+        "me informe o numero",
+        "envie o numero",
+        "mande o numero",
+        "pedido para verificar",
+        "vou verificar",
+      ]),
+  );
+}
+
 function isCancelRefundIntent(text) {
   const normalized = normalizeIntentText(text);
   return includesAny(normalized, [
@@ -1355,6 +1393,107 @@ async function findMatchingOrders({ guildId, authUserId, discordUserId, orderCan
       return parseTimestampMs(resolvePurchaseDate(right)) - parseTimestampMs(resolvePurchaseDate(left));
     })
     .slice(0, 10);
+}
+
+async function findAnyMatchingSalesOrders({ guildId, orderCandidates }) {
+  const cartResult = await supabase
+    .from("guild_sales_carts")
+    .select("*")
+    .eq("guild_id", guildId)
+    .order("created_at", { ascending: false })
+    .limit(200);
+
+  if (cartResult.error) {
+    console.warn("[ticket-refund] falha ao consultar pedidos globais da guild:", cartResult.error.message);
+    return [];
+  }
+
+  const carts = cartResult.data || [];
+  const cartIds = carts.map((cart) => cart.id);
+  const [itemsByCart, deliveriesByCart, eventsByCart] = await Promise.all([
+    fetchSalesCartItems(cartIds),
+    fetchSalesDeliveries(cartIds),
+    fetchSalesEvents(cartIds),
+  ]);
+
+  return carts
+    .map((cart) =>
+      toUnifiedSalesOrder(
+        cart,
+        itemsByCart.get(cart.id) || [],
+        deliveriesByCart.get(cart.id) || [],
+        eventsByCart.get(cart.id) || [],
+      ),
+    )
+    .map((order) => ({
+      ...order,
+      matchScore: scoreOrderMatch(order, orderCandidates),
+    }))
+    .filter((order) => order.matchScore >= 48)
+    .sort((left, right) => right.matchScore - left.matchScore)
+    .slice(0, 3);
+}
+
+function resolveOrderPublicId(order) {
+  return (
+    order.raw?.order_number ||
+    order.raw?.order_public_id ||
+    order.raw?.cart_public_id ||
+    String(order.id || "").slice(0, 8)
+  );
+}
+
+function formatOrderSafeStatus(order) {
+  const status = String(order.status || "").toLowerCase();
+  const providerStatus = String(order.providerStatus || "").toLowerCase();
+  if (status === "refunded" || providerStatus === "refunded") return "Reembolsado";
+  if (status === "paid" || status === "approved" || providerStatus === "approved") return "Pagamento confirmado";
+  if (status === "delivered") return "Entregue";
+  if (status === "pending") return "Pendente";
+  if (status === "cancelled" || status === "canceled") return "Cancelado";
+  if (status === "expired") return "Expirado";
+  if (status === "rejected" || status === "failed") return "Nao aprovado";
+  return order.status ? normalizeText(order.status, 60) : "Status indisponivel";
+}
+
+function buildSafeOrderInfoEmbed(order) {
+  return new EmbedBuilder()
+    .setTitle("Informacoes do pedido")
+    .setColor(0x5865f2)
+    .addFields(
+      {
+        name: "Pedido",
+        value: `\`${resolveOrderPublicId(order)}\``,
+        inline: true,
+      },
+      {
+        name: "Status",
+        value: formatOrderSafeStatus(order),
+        inline: true,
+      },
+      {
+        name: "Data da compra",
+        value: formatDate(resolvePurchaseDate(order)),
+        inline: true,
+      },
+      {
+        name: "Valor",
+        value: formatMoney(order.amount, order.currency),
+        inline: true,
+      },
+      {
+        name: "Origem",
+        value: order.source === "sales" ? "Loja do servidor" : "Financeiro Flowdesk",
+        inline: true,
+      },
+      {
+        name: "Privacidade",
+        value: "Nao exibo email, dados internos, credenciais, dados de pagamento ou detalhes sensiveis do produto neste ticket.",
+        inline: false,
+      },
+    )
+    .setFooter({ text: "Consulta feita apenas para o Discord vinculado a este ticket." })
+    .setTimestamp(new Date());
 }
 
 async function listUserRecentOrders({ guildId, authUserId, discordUserId }) {
@@ -3159,6 +3298,118 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
   return false;
 }
 
+async function handleOrderInfoLookupMessage({ message, ticket, historyRows, content, persist }) {
+  const previousState = readRefundMemory(historyRows);
+  const orderCandidates = extractOrderCandidates(content, {
+    allowShortGeneric: assistantAskedForOrderNumber(historyRows),
+  });
+  const shouldLookup =
+    orderCandidates.length > 0 &&
+    !isRefundOrOrderIntent(content) &&
+    (assistantAskedForOrderNumber(historyRows) ||
+      isOrderInfoIntent(content) ||
+      previousState.lastPromptKind === "order_info_lookup");
+
+  if (!shouldLookup) {
+    if (isOrderInfoIntent(content) && !isRefundOrOrderIntent(content)) {
+      await persistRefundState(persist, {
+        ...previousState,
+        intent: false,
+        stage: null,
+        lastPromptKind: "order_info_lookup",
+        lastPromptAt: nowIso(),
+        lastActionAt: nowIso(),
+      });
+    }
+    return false;
+  }
+
+  const authUser = await getAuthUserByDiscordUserId(ticket.user_id);
+  const ownedOrders = await findMatchingOrders({
+    guildId: ticket.guild_id,
+    authUserId: authUser?.id || null,
+    discordUserId: ticket.user_id,
+    orderCandidates,
+  }).catch((error) => {
+    console.warn("[ticket-refund] falha na consulta segura de pedido:", error.message);
+    return [];
+  });
+
+  if (ownedOrders.length) {
+    const order = ownedOrders[0];
+    await persistRefundState(persist, {
+      ...previousState,
+      intent: false,
+      stage: null,
+      lastPromptKind: "order_info_found",
+      lastPromptAt: nowIso(),
+      lastActionAt: nowIso(),
+    });
+    await message.reply({
+      content: "Consultei esse pedido para o Discord deste ticket. Aqui esta um resumo seguro:",
+      embeds: [buildSafeOrderInfoEmbed(order)],
+      allowedMentions: { parse: [] },
+    });
+    await logRefundAuditEvent({
+      ticket,
+      authUserId: authUser?.id,
+      orderKey: order.key,
+      eventType: "order_info_lookup",
+      outcome: "found_for_ticket_owner",
+      metadata: {
+        orderCandidates,
+        source: order.source,
+        exposedFields: ["order_id", "status", "purchase_date", "amount", "source"],
+      },
+    });
+    return true;
+  }
+
+  const anyOrders = await findAnyMatchingSalesOrders({
+    guildId: ticket.guild_id,
+    orderCandidates,
+  }).catch(() => []);
+
+  await persistRefundState(persist, {
+    ...previousState,
+    intent: false,
+    stage: null,
+    lastPromptKind: "order_info_not_owned",
+    lastPromptAt: nowIso(),
+    lastActionAt: nowIso(),
+  });
+
+  if (anyOrders.length) {
+    await message.reply({
+      content:
+        "Eu encontrei uma referencia parecida, mas ela nao esta vinculada ao Discord que abriu este ticket. Por seguranca, nao posso exibir informacoes desse pedido por aqui.\n\nConfira se voce abriu o ticket com a conta correta ou chame a equipe para validar a titularidade.",
+      allowedMentions: { parse: [] },
+    });
+    await logRefundAuditEvent({
+      ticket,
+      authUserId: authUser?.id,
+      eventType: "order_info_lookup",
+      outcome: "ownership_mismatch",
+      metadata: { orderCandidates },
+    });
+    return true;
+  }
+
+  await message.reply({
+    content:
+      "Nao encontrei esse pedido vinculado ao Discord deste ticket. Confere se o codigo esta completo e se voce abriu o ticket com a conta correta?",
+    allowedMentions: { parse: [] },
+  });
+  await logRefundAuditEvent({
+    ticket,
+    authUserId: authUser?.id,
+    eventType: "order_info_lookup",
+    outcome: "not_found",
+    metadata: { orderCandidates },
+  });
+  return true;
+}
+
 function isTicketRefundInteraction(interaction) {
   return (
     (interaction.isButton?.() || interaction.isStringSelectMenu?.()) &&
@@ -3168,6 +3419,7 @@ function isTicketRefundInteraction(interaction) {
 
 module.exports = {
   buildRefundMemoryPatch,
+  handleOrderInfoLookupMessage,
   handleRefundOrVerificationMessage,
   handleTicketRefundInteraction,
   isTicketRefundInteraction,
