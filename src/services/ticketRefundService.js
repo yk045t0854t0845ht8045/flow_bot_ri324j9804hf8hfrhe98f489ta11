@@ -2694,16 +2694,6 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
 
       const refundProtocol = generateRefundProtocol(ticket.id, order.key);
 
-      await sendManualApprovalRequest({
-        client,
-        ticket,
-        order,
-        settings,
-        reason: "Solicitacao confirmada pelo comprador via FlowAI.",
-        allowedMentions: { parse: [] },
-        eligibility,
-        protocol: refundProtocol,
-      });
       await interaction.update(
         v2Message([
           {
@@ -2717,6 +2707,19 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
           },
         ]),
       );
+
+      await sendManualApprovalRequest({
+        client,
+        ticket,
+        order,
+        settings,
+        reason: "Solicitacao confirmada pelo comprador via FlowAI.",
+        allowedMentions: { parse: [] },
+        eligibility,
+        protocol: refundProtocol,
+      }).catch(err => {
+        console.error("[ticketRefundService] Falha ao enviar aprovacao manual para a equipe:", err);
+      });
 
       const historyRows = await fetchRecentAiMessages(ticket.id);
       const previousState = readRefundMemory(historyRows);
