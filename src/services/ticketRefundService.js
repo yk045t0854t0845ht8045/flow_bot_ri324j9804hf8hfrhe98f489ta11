@@ -685,7 +685,79 @@ function isMissingTableError(error, tableName) {
   );
 }
 
+function createCorrelationId(prefix = "refund") {
+  return `${prefix}_${Date.now().toString(36)}_${crypto.randomBytes(6).toString("hex")}`;
+}
+
+function serializeDiscordError(error) {
+  return {
+    message: normalizeText(error?.message || String(error || "Erro desconhecido."), 500),
+    code: error?.code || error?.rawError?.code || null,
+    status: error?.status || null,
+    method: error?.method || null,
+    url: error?.url || null,
+  };
+}
+
+async function acknowledgeComponent(interaction, correlationId) {
+  if (interaction.deferred || interaction.replied) return true;
+  try {
+    await interaction.deferUpdate();
+    return true;
+  } catch (error) {
+    console.warn("[ticket-refund] interaction ack failed", {
+      correlationId,
+      interactionId: interaction?.id || null,
+      customId: interaction?.customId || null,
+      error: serializeDiscordError(error),
+    });
+    return false;
+  }
+}
+
+async function updateComponentMessage(interaction, payload, correlationId) {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply(payload);
+    } else {
+      await interaction.update(payload);
+    }
+    return { ok: true };
+  } catch (error) {
+    console.warn("[ticket-refund] discord message update failed", {
+      correlationId,
+      interactionId: interaction?.id || null,
+      customId: interaction?.customId || null,
+      error: serializeDiscordError(error),
+    });
+    return { ok: false, error };
+  }
+}
+
+async function sendInteractionNotice(interaction, payload, correlationId) {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      await interaction.followUp(payload);
+    } else {
+      await interaction.reply(payload);
+    }
+    return { ok: true };
+  } catch (error) {
+    console.warn("[ticket-refund] interaction notice failed", {
+      correlationId,
+      interactionId: interaction?.id || null,
+      customId: interaction?.customId || null,
+      error: serializeDiscordError(error),
+    });
+    return { ok: false, error };
+  }
+}
+
 async function logRefundAuditEvent(input) {
+  const metadata = {
+    ...(input.metadata || {}),
+    correlation_id: input.correlationId || input.metadata?.correlation_id || createCorrelationId("audit"),
+  };
   const payload = {
     ticket_id: input.ticket?.id || null,
     guild_id: input.ticket?.guild_id || input.guildId || null,
@@ -696,7 +768,7 @@ async function logRefundAuditEvent(input) {
     outcome: input.outcome || "recorded",
     order_key: input.orderKey || null,
     risk_score: Number.isFinite(Number(input.riskScore)) ? Number(input.riskScore) : null,
-    metadata: input.metadata || {},
+    metadata,
   };
 
   const result = await supabase.from("ticket_refund_audit_events").insert(payload);
@@ -777,14 +849,15 @@ async function getTicketRefundSettings(guildId, runtime) {
   }
 
   const row = result.data || {};
+  const autoProcessEnabled = row.auto_process_enabled === true;
   return {
     enabled: row.enabled !== false,
     refundLimitDays: Number.isFinite(Number(row.refund_limit_days))
       ? Number(row.refund_limit_days)
       : fallback.refundLimitDays,
     rules: normalizeText(row.refund_rules || "", 1200),
-    autoProcessEnabled: row.auto_process_enabled === true,
-    manualApprovalRequired: row.manual_approval_required !== false,
+    autoProcessEnabled,
+    manualApprovalRequired: autoProcessEnabled ? false : row.manual_approval_required !== false,
     approvalChannelId: row.approval_channel_id || fallback.approvalChannelId,
     approverRoleIds: Array.isArray(row.approver_role_ids)
       ? row.approver_role_ids.filter(Boolean)
@@ -1447,16 +1520,18 @@ function evaluateRefundEligibility(order, settings, context = {}) {
     hasProviderPayment &&
     insideWindow &&
     !alreadyRefunded &&
-    riskScore < 35;
+    riskScore < 80 &&
+    !deliveredOrConsumed &&
+    previousRefundEvents === 0 &&
+    order.source === "sales";
 
   const canAutoRefund =
     eligible &&
     settings.autoProcessEnabled &&
-    !deliveredOrConsumed &&
-    order.source === "sales" &&
-    riskScore < 20;
+    !settings.manualApprovalRequired &&
+    riskScore < 80;
 
-  const manualRequired = !canAutoRefund;
+  const manualRequired = settings.manualApprovalRequired || !canAutoRefund;
 
   return {
     eligible,
@@ -1703,17 +1778,53 @@ async function sendAutoRefundInfoLog({ client, ticket, order, settings, protocol
 
   await channel.send({
     embeds: [embed],
-    components: [
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`${REFUND_PREFIX}auto_info_button_noop`)
-          .setLabel("Processado automaticamente")
-          .setStyle(ButtonStyle.Secondary)
-          .setDisabled(true)
-      ),
-    ],
+    components: [],
     allowedMentions: { parse: [] },
   });
+}
+
+async function enqueueRefundDirectMessage({ ticket, order, protocol, kind, content }) {
+  const notificationKey = `ticket:${ticket.id}:refund:${kind}:${protocol}`;
+  const result = await supabase
+    .from("ticket_dm_queue")
+    .upsert(
+      {
+        notification_key: notificationKey,
+        kind: kind === "denied" ? "ticket_refund_denied_dm" : "ticket_refund_processed_dm",
+        ticket_id: ticket.id,
+        protocol: ticket.protocol,
+        guild_id: ticket.guild_id,
+        user_id: ticket.user_id,
+        payload: {
+          content,
+          allowedMentions: { parse: [] },
+        },
+        status: "pending",
+        attempt_count: 0,
+        max_attempts: 12,
+        next_attempt_at: new Date().toISOString(),
+        last_error: null,
+        dm_channel_id: null,
+        delivered_message_id: null,
+        sent_at: null,
+      },
+      { onConflict: "notification_key" },
+    )
+    .select("id")
+    .maybeSingle();
+
+  if (result.error && !isMissingTableError(result.error, "ticket_dm_queue")) {
+    console.warn("[ticket-refund] falha ao enfileirar DM de reembolso:", result.error.message);
+  }
+
+  return {
+    notificationKey,
+    queued: !result.error,
+  };
+}
+
+function buildRefundSuccessContent({ settings, order, protocol }) {
+  return `${settings.successMessage || "Reembolso concluido com sucesso."}\n\nCompra: ${order.productTitle}\nValor: ${formatMoney(order.amount, order.currency)}\nProtocolo: **${protocol}**\nO estorno segue o prazo do provedor de pagamento e do banco emissor.`;
 }
 
 function registerLookupAttempt(ticket) {
@@ -1976,7 +2087,7 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
   if (!state.intent && !currentIntent && !(active && orderCandidates.length)) return false;
 
   if (["manual_review", "completed"].includes(state.stage)) {
-    const wantsAnother = isListOrdersIntent(content) || isCasualGreetingIntent(content) || orderCandidates.length > 0;
+    const wantsAnother = currentIntent || isListOrdersIntent(content);
     if (!currentIntent && !wantsAnother) return false;
     state = createDefaultRefundState();
     state.intent = true;
@@ -2502,6 +2613,7 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
   }
 
   if (action === "select") {
+    const correlationId = createCorrelationId("refund_select");
     if (interaction.user.id !== ticket.user_id) {
       await interaction.reply({
         content: "Somente o comprador deste ticket pode selecionar a compra.",
@@ -2509,13 +2621,14 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
       });
       return true;
     }
+    await acknowledgeComponent(interaction, correlationId);
 
     const authUser = await getAuthUserByDiscordUserId(ticket.user_id);
     if (!authUser) {
-      await interaction.reply({
+      await sendInteractionNotice(interaction, {
         content: "A conta Discord ainda nao esta vinculada. Use o botao de Login antes de confirmar a compra.",
         ephemeral: true,
-      });
+      }, correlationId);
       return true;
     }
 
@@ -2525,19 +2638,19 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
       discordUserId: ticket.user_id,
     });
     if (!order) {
-      await interaction.reply({
+      await sendInteractionNotice(interaction, {
         content: "Nao encontrei essa compra na conta vinculada.",
         ephemeral: true,
-      });
+      }, correlationId);
       return true;
     }
 
     const lockKey = `${ticket.id}:${order.key}`;
     if (pendingRefundActions.has(lockKey)) {
-      await interaction.reply({
+      await sendInteractionNotice(interaction, {
         content: "Ja existe uma solicitacao em andamento para essa compra.",
         ephemeral: true,
-      });
+      }, correlationId);
       return true;
     }
     pendingRefundActions.add(lockKey);
@@ -2565,7 +2678,7 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
 
       if (eligibility.canAutoRefund) {
         const autoProtocol = generateRefundProtocol(ticket.id, order.key);
-        await interaction.update(
+        await updateComponentMessage(interaction,
           v2Message([
             {
               type: COMPONENT_TYPE.CONTAINER,
@@ -2575,6 +2688,7 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
               ],
             },
           ]),
+          correlationId,
         );
         let refundResult = null;
         try {
@@ -2617,14 +2731,22 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
           return true;
         }
         if (refundResult?.alreadyRefunded) {
-          await interaction.followUp({
+          await sendInteractionNotice(interaction, {
             content: "Este pedido ja consta como reembolsado no sistema do provedor de pagamento.",
             allowedMentions: { parse: [] },
-          });
+          }, correlationId);
         } else {
-          await interaction.followUp({
-            content: `${settings.successMessage || "Reembolso concluido com sucesso."}\n\nCompra: ${order.productTitle}\nValor: ${formatMoney(order.amount, order.currency)}\nProtocolo: **${autoProtocol}**\nO estorno segue o prazo do provedor de pagamento e do banco emissor.`,
+          const successContent = buildRefundSuccessContent({ settings, order, protocol: autoProtocol });
+          await sendInteractionNotice(interaction, {
+            content: successContent,
             allowedMentions: { parse: [] },
+          }, correlationId);
+          await enqueueRefundDirectMessage({
+            ticket,
+            order,
+            protocol: autoProtocol,
+            kind: "processed",
+            content: successContent,
           });
         }
 
@@ -2649,6 +2771,7 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
           riskScore: eligibility.riskScore,
           eventType: "refund_processed",
           outcome: refundResult?.alreadyRefunded ? "already_refunded" : "success",
+          correlationId,
           metadata: {
             protocol: autoProtocol,
             responsible_user: "system",
@@ -2664,7 +2787,7 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
 
       // Warn user if outside refund window and ask for confirmation
       if (!eligibility.insideWindow) {
-        await interaction.update(
+        await updateComponentMessage(interaction,
           v2Message([
             {
               type: COMPONENT_TYPE.CONTAINER,
@@ -2687,14 +2810,15 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
                 style: ButtonStyle.Secondary,
               }),
             ]),
-          ])
+          ]),
+          correlationId,
         );
         return true;
       }
 
       const refundProtocol = generateRefundProtocol(ticket.id, order.key);
 
-      await interaction.update(
+      await updateComponentMessage(interaction,
         v2Message([
           {
             type: COMPONENT_TYPE.CONTAINER,
@@ -2706,6 +2830,7 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
             ],
           },
         ]),
+        correlationId,
       );
 
       await sendManualApprovalRequest({
@@ -2741,6 +2866,7 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
   }
 
   if (action === "approve" || action === "deny") {
+    const correlationId = createCorrelationId(`refund_${action}`);
     // 1. Validação de permissões rígida
     if (!hasRefundApprovalPermission(interaction.member, settings, runtime)) {
       await logRefundAuditEvent({
@@ -2844,54 +2970,91 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
     }
     pendingRefundActions.add(lockKey);
     try {
-      await interaction.deferUpdate();
+      await acknowledgeComponent(interaction, correlationId);
       const manualProtocol = generateRefundProtocol(ticket.id, order.key);
-      await callInternalSalesRefund(order.id, ticket.guild_id, `Aprovado manualmente por ${interaction.user.id} — protocolo ${manualProtocol}.`);
-      await interaction.editReply({
+      let refundResult = null;
+      try {
+        refundResult = await callInternalSalesRefund(order.id, ticket.guild_id, `Aprovado manualmente por ${interaction.user.id} — protocolo ${manualProtocol}.`);
+      } catch (financialError) {
+        await sendInteractionNotice(interaction, {
+          content: `Nao consegui processar o estorno financeiro: ${normalizeText(financialError.message, 300)}`,
+          ephemeral: true,
+        }, correlationId);
+        await logRefundAuditEvent({
+          ticket,
+          orderKey: order.key,
+          eventType: "manual_refund_financial_failed",
+          outcome: "financial_error",
+          correlationId,
+          metadata: {
+            responsible_user: interaction.user.id,
+            action_time: new Date().toISOString(),
+            method: "manual",
+            transaction_id: order.providerPaymentId || null,
+            final_status: "financial_error",
+            decidedBy: interaction.user.id,
+            message: normalizeText(financialError.message, 300),
+          },
+        });
+        return true;
+      }
+      const approvalUpdate = await updateComponentMessage(interaction, {
         content: `Reembolso aprovado e processado por <@${interaction.user.id}> para a compra **${order.productTitle}** — Protocolo: \`${manualProtocol}\``,
         embeds: interaction.message.embeds,
         components: [],
         allowedMentions: { parse: [] },
-      });
+      }, correlationId);
       const channel = await client.channels.fetch(ticket.channel_id).catch(() => null);
-      await channel?.send?.({
-        content: `${settings.successMessage || "Reembolso concluido com sucesso."}\n\nCompra: ${order.productTitle}\nValor: ${formatMoney(order.amount, order.currency)}\nProtocolo: **${manualProtocol}**\nO estorno segue o prazo do provedor de pagamento e do banco emissor.`,
+      const successContent = buildRefundSuccessContent({ settings, order, protocol: manualProtocol });
+      const ticketNotice = await channel?.send?.({
+        content: successContent,
         allowedMentions: { parse: [] },
+      }).then(() => ({ ok: true })).catch((discordError) => ({ ok: false, error: discordError }));
+      await enqueueRefundDirectMessage({
+        ticket,
+        order,
+        protocol: manualProtocol,
+        kind: "processed",
+        content: successContent,
       });
       await logRefundAuditEvent({
         ticket,
         orderKey: order.key,
         eventType: "manual_refund_approved",
-        outcome: "processed",
+        outcome: refundResult?.alreadyRefunded ? "already_refunded" : "processed",
+        correlationId,
         metadata: {
           responsible_user: interaction.user.id,
           action_time: new Date().toISOString(),
           method: "manual",
           decision_reason: "Reembolso aprovado manualmente pela equipe de moderacao.",
           transaction_id: order.providerPaymentId || null,
-          final_status: "refunded",
+          final_status: refundResult?.alreadyRefunded ? "already_refunded" : "refunded",
           decidedBy: interaction.user.id,
           protocol: manualProtocol,
+          discord_approval_message_updated: approvalUpdate.ok,
+          discord_ticket_confirmation_sent: ticketNotice?.ok === true,
+          discord_ticket_confirmation_error: ticketNotice?.ok === false ? serializeDiscordError(ticketNotice.error) : null,
         },
       });
       return true;
     } catch (error) {
-      await interaction.followUp({
-        content: `Nao consegui processar automaticamente: ${normalizeText(error.message, 300)}`,
+      await sendInteractionNotice(interaction, {
+        content: "O reembolso financeiro foi tratado, mas houve falha em uma etapa de notificacao. O evento foi registrado para retry/auditoria.",
         ephemeral: true,
-      });
+      }, correlationId);
       await logRefundAuditEvent({
         ticket,
         orderKey: order.key,
-        eventType: "manual_refund_process_failed",
-        outcome: "error",
+        eventType: "manual_refund_post_process_partial_failure",
+        outcome: "partial_failure",
+        correlationId,
         metadata: {
           responsible_user: interaction.user.id,
           action_time: new Date().toISOString(),
           method: "manual",
-          decision_reason: `Falha no processamento automatico do estorno aprovado: ${normalizeText(error.message, 300)}`,
           transaction_id: order.providerPaymentId || null,
-          final_status: "error",
+          final_status: "discord_or_audit_partial_failure",
           decidedBy: interaction.user.id,
           message: normalizeText(error.message, 300),
         },
