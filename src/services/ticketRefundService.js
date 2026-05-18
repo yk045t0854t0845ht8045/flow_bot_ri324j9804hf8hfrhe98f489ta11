@@ -233,6 +233,7 @@ function isRefundProceedIntent(text) {
   return includesAny(normalized, [
     "quero reembolso",
     "quero o reembolso",
+    "quero meu reembolso",
     "preciso de reembolso",
     "preciso do reembolso",
     "prefiro reembolso",
@@ -240,10 +241,36 @@ function isRefundProceedIntent(text) {
     "so quero reembolso",
     "so o reembolso",
     "pode seguir com reembolso",
+    "pode seguir com o reembolso",
     "pode fazer o reembolso",
     "faz o reembolso",
     "fazer reembolso",
+    "reembolso mesmo",
+    "o reembolso mesmo",
+    "quero reembolso mesmo",
+    "quero o reembolso mesmo",
+    "quero seguir com reembolso",
+    "quero seguir com o reembolso",
+    "seguir com reembolso",
+    "seguir com o reembolso",
+    "continuar com reembolso",
+    "continuar com o reembolso",
+    "quero continuar com reembolso",
+    "quero continuar com o reembolso",
+    "prosseguir com reembolso",
+    "prosseguir com o reembolso",
+    "prosseguir reembolso",
+    "sim quero reembolso",
+    "sim quero o reembolso",
+    "sim pode seguir",
+    "sim pode fazer",
+    "ja decidi",
+    "decidi pelo reembolso",
+    "quero mesmo",
     "seguir com estorno",
+    "seguir com o estorno",
+    "quero estorno mesmo",
+    "estorno mesmo",
     "pode estornar",
     "estorna",
     "nao quero ajuda",
@@ -253,6 +280,54 @@ function isRefundProceedIntent(text) {
     "sem solucao",
     "nao tem como resolver",
   ]);
+}
+
+function isRefundIntakeConfirmation(text) {
+  const normalized = normalizeIntentText(text);
+  if (!normalized) return false;
+  const mentionsRefund = /\b(reembolso|estorno|refund)\b/.test(normalized);
+  if (!mentionsRefund) return false;
+  const confirmationSignals = [
+    "mesmo",
+    "seguir",
+    "continuar",
+    "prosseguir",
+    "pode",
+    "quero",
+    "sim",
+    "decidi",
+    "fazer",
+  ];
+  return confirmationSignals.some((signal) => normalized.includes(signal));
+}
+
+function isRefundHardProceedIntent(text) {
+  const normalized = normalizeIntentText(text);
+  if (!normalized) return false;
+  if (
+    includesAny(normalized, [
+      "reembolso mesmo",
+      "o reembolso mesmo",
+      "estorno mesmo",
+      "quero seguir com reembolso",
+      "quero seguir com o reembolso",
+      "seguir com reembolso",
+      "seguir com o reembolso",
+      "quero continuar com reembolso",
+      "quero continuar com o reembolso",
+      "continuar com reembolso",
+      "continuar com o reembolso",
+      "prosseguir com reembolso",
+      "prosseguir com o reembolso",
+      "decidi pelo reembolso",
+      "ja decidi",
+      "nao quero ajuda",
+    ])
+  ) {
+    return true;
+  }
+
+  return /\b(reembolso|estorno|refund)\b/.test(normalized) && /\b(mesmo|seguir|continuar|prosseguir|decidi)\b/.test(normalized);
 }
 
 function isRefundSupportConversationIntent(text) {
@@ -2283,9 +2358,16 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
 
   if (!state.intent && !currentIntent && !(active && orderCandidates.length)) return false;
 
-  if (state.stage === "refund_intake") {
-    const alreadyPromptedIntake = previousState.stage === "refund_intake";
-    const proceedRefund = alreadyPromptedIntake && isRefundProceedIntent(content);
+  const alreadyPromptedIntake =
+    previousState.stage === "refund_intake" ||
+    previousState.lastPromptKind === "refund_intake" ||
+    state.lastPromptKind === "refund_intake";
+
+  if (state.stage === "refund_intake" || alreadyPromptedIntake) {
+    const proceedRefund =
+      (alreadyPromptedIntake &&
+        (isRefundProceedIntent(content) || isRefundIntakeConfirmation(content))) ||
+      isRefundHardProceedIntent(content);
 
     if (!proceedRefund) {
       if (!alreadyPromptedIntake || shouldPrompt(state, "refund_intake", REFUND_PROMPT_COOLDOWN_MS)) {
@@ -2304,6 +2386,7 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
         return false;
       }
 
+      await persistRefundState(persist, state);
       return true;
     }
 
