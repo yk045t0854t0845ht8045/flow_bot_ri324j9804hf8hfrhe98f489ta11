@@ -1,8 +1,5 @@
 const {
-  ActionRowBuilder,
-  ButtonBuilder,
   ButtonStyle,
-  EmbedBuilder,
   MessageFlags,
 } = require("discord.js");
 const crypto = require("node:crypto");
@@ -124,12 +121,58 @@ function selectMenu({ customId, placeholder, options }) {
 }
 
 function v2Message(components, extra = {}) {
+  const extraFlags = Number(extra.flags || 0);
   return {
-    flags: COMPONENTS_V2_FLAG,
-    allowedMentions: { parse: [] },
-    components,
     ...extra,
+    flags: extraFlags | COMPONENTS_V2_FLAG,
+    allowedMentions: extra.allowedMentions || { parse: [] },
+    components,
   };
+}
+
+function resolveRefundToneColor(tone) {
+  switch (tone) {
+    case "success":
+      return 0x2ecc71;
+    case "warning":
+      return 0xf1c40f;
+    case "error":
+      return 0xe74c3c;
+    case "processing":
+      return 0x3498db;
+    default:
+      return 0x2b2d31;
+  }
+}
+
+function buildRefundV2Payload({ title, message, tone = "neutral", footer = "", actions = [] }) {
+  const containerComponents = [
+    textDisplay(
+      [
+        title ? `### ${title}` : "",
+        normalizeText(message || "", 3600),
+      ].filter(Boolean).join("\n\n"),
+    ),
+  ];
+
+  if (footer) {
+    containerComponents.push(separator());
+    containerComponents.push(textDisplay(`-# ${normalizeText(footer, 700)}`));
+  }
+
+  const components = [
+    {
+      type: COMPONENT_TYPE.CONTAINER,
+      accent_color: resolveRefundToneColor(tone),
+      components: containerComponents,
+    },
+  ];
+
+  if (actions.length) {
+    components.push(actionRow(actions));
+  }
+
+  return v2Message(components);
 }
 
 function buildAppUrl(path) {
@@ -1008,56 +1051,103 @@ async function persistRefundStateDirectly(ticket, state, extra = {}) {
   }
 }
 
+function coercePersistedBoolean(value, fallback) {
+  if (value === true || value === false) return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") return true;
+    if (normalized === "false") return false;
+  }
+  return fallback;
+}
+
+function coerceRefundLimitDays(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed)) return fallback;
+  return Math.min(365, Math.max(0, parsed));
+}
+
+function normalizeDiscordSnowflake(value) {
+  const normalized = String(value || "").trim();
+  return /^[0-9]{10,25}$/.test(normalized) ? normalized : null;
+}
+
 async function getTicketRefundSettings(guildId, runtime) {
-  const fallbackRoles = [
-    runtime?.staffSettings?.admin_role_id,
-    ...(runtime?.staffSettings?.close_role_ids || []),
-    ...(runtime?.staffSettings?.claim_role_ids || []),
-  ].filter(Boolean);
-  const fallback = {
+  const defaultSettings = {
     enabled: true,
     refundLimitDays: DEFAULT_REFUND_DAYS,
     rules: "",
     autoProcessEnabled: false,
     manualApprovalRequired: true,
-    approvalChannelId: runtime?.settings?.logs_closed_channel_id || null,
-    approverRoleIds: [...new Set(fallbackRoles)],
+    approvalChannelId: null,
+    approverRoleIds: [],
     successMessage:
       "Reembolso concluido. O prazo de estorno ou compensacao depende do provedor de pagamento e do banco emissor.",
     errorMessage:
       "Nao consegui concluir o reembolso automaticamente. Encaminhei o caso para a equipe responsavel analisar.",
+    source: "schema_defaults",
+    loadedAt: nowIso(),
+    persisted: false,
+    updatedAt: null,
+    modeConflict: false,
   };
 
   const result = await supabase
     .from("guild_ticket_refund_settings")
-    .select("*")
+    .select(
+      "guild_id, enabled, refund_limit_days, refund_rules, auto_process_enabled, manual_approval_required, approval_channel_id, approver_role_ids, success_message, error_message, updated_at",
+    )
     .eq("guild_id", guildId)
     .maybeSingle();
 
   if (result.error) {
     if (isMissingTableError(result.error, "guild_ticket_refund_settings")) {
-      return fallback;
+      return {
+        ...defaultSettings,
+        source: "missing_guild_ticket_refund_settings_table",
+      };
     }
     console.warn("[ticket-refund] falha ao ler configuracao:", result.error.message);
-    return fallback;
+    return {
+      ...defaultSettings,
+      source: "read_error",
+      readError: result.error.message,
+    };
   }
 
-  const row = result.data || {};
-  const autoProcessEnabled = row.auto_process_enabled === true;
+  if (!result.data) {
+    return {
+      ...defaultSettings,
+      source: "missing_guild_ticket_refund_settings_row",
+    };
+  }
+
+  const row = result.data;
+  const enabled = coercePersistedBoolean(row.enabled, true);
+  const autoProcessEnabled = coercePersistedBoolean(row.auto_process_enabled, false);
+  const manualApprovalRequired = coercePersistedBoolean(row.manual_approval_required, true);
+  const modeConflict =
+    (autoProcessEnabled && manualApprovalRequired) ||
+    (!autoProcessEnabled && !manualApprovalRequired);
+
   return {
-    enabled: row.enabled !== false,
-    refundLimitDays: Number.isFinite(Number(row.refund_limit_days))
-      ? Number(row.refund_limit_days)
-      : fallback.refundLimitDays,
+    enabled,
+    refundLimitDays: coerceRefundLimitDays(row.refund_limit_days, defaultSettings.refundLimitDays),
     rules: normalizeText(row.refund_rules || "", 1200),
     autoProcessEnabled,
-    manualApprovalRequired: autoProcessEnabled ? false : row.manual_approval_required !== false,
-    approvalChannelId: row.approval_channel_id || fallback.approvalChannelId,
+    manualApprovalRequired,
+    approvalChannelId: normalizeDiscordSnowflake(row.approval_channel_id),
     approverRoleIds: Array.isArray(row.approver_role_ids)
-      ? row.approver_role_ids.filter(Boolean)
-      : fallback.approverRoleIds,
-    successMessage: normalizeText(row.success_message || "", 500) || fallback.successMessage,
-    errorMessage: normalizeText(row.error_message || "", 500) || fallback.errorMessage,
+      ? [...new Set(row.approver_role_ids.map(normalizeDiscordSnowflake).filter(Boolean))]
+      : [],
+    successMessage: normalizeText(row.success_message || "", 500) || defaultSettings.successMessage,
+    errorMessage: normalizeText(row.error_message || "", 500) || defaultSettings.errorMessage,
+    source: "guild_ticket_refund_settings",
+    loadedAt: nowIso(),
+    persisted: true,
+    updatedAt: parseTimestampMs(row.updated_at) ? row.updated_at : null,
+    modeConflict,
+    conservativeManualMode: modeConflict ? true : manualApprovalRequired,
   };
 }
 
@@ -1597,46 +1687,6 @@ function formatOrderSafeStatus(order) {
   return order.status ? normalizeText(order.status, 60) : "Status indisponivel";
 }
 
-function buildSafeOrderInfoEmbed(order) {
-  return new EmbedBuilder()
-    .setTitle("Informacoes do pedido")
-    .setColor(0x5865f2)
-    .addFields(
-      {
-        name: "Pedido",
-        value: `\`${resolveOrderPublicId(order)}\``,
-        inline: true,
-      },
-      {
-        name: "Status",
-        value: formatOrderSafeStatus(order),
-        inline: true,
-      },
-      {
-        name: "Data da compra",
-        value: formatDate(resolvePurchaseDate(order)),
-        inline: true,
-      },
-      {
-        name: "Valor",
-        value: formatMoney(order.amount, order.currency),
-        inline: true,
-      },
-      {
-        name: "Origem",
-        value: order.source === "sales" ? "Loja do servidor" : "Financeiro Flowdesk",
-        inline: true,
-      },
-      {
-        name: "Privacidade",
-        value: "Nao exibo email, dados internos, credenciais, dados de pagamento ou detalhes sensiveis do produto neste ticket.",
-        inline: false,
-      },
-    )
-    .setFooter({ text: "Consulta feita apenas para o Discord vinculado a este ticket." })
-    .setTimestamp(new Date());
-}
-
 function isOrderOwnedByTicketContext(order, context = {}) {
   const orderAuthUserId = coerceNumberOrNull(order?.authUserId);
   const contextAuthUserId = coerceNumberOrNull(context.authUserId);
@@ -1751,18 +1801,8 @@ function evaluateRefundEligibility(order, settings, context = {}) {
   let deadlineMs = Number.NaN;
 
   if (Number.isFinite(purchaseMs)) {
-    const buyDate = new Date(purchaseMs);
-    const currentDate = new Date();
-
-    // Normalizando ambas para 00:00:00 UTC do respectivo dia para calcular dias corridos inteiros
-    const buyZero = Date.UTC(buyDate.getUTCFullYear(), buyDate.getUTCMonth(), buyDate.getUTCDate());
-    const currentZero = Date.UTC(currentDate.getUTCFullYear(), currentDate.getUTCMonth(), currentDate.getUTCDate());
-
-    const diffMs = currentZero - buyZero;
-    const diffDays = Math.floor(diffMs / (24 * 60 * 60 * 1000));
-    
-    insideWindow = diffDays <= refundDays;
     deadlineMs = purchaseMs + refundDays * 24 * 60 * 60 * 1000;
+    insideWindow = Date.now() <= deadlineMs;
   }
   const status = String(order.status || "").toLowerCase();
   const providerStatus = String(order.providerStatus || "").toLowerCase();
@@ -1842,27 +1882,37 @@ function evaluateRefundEligibility(order, settings, context = {}) {
     Boolean(purchaseDate) &&
     Boolean(order.status) &&
     hasProviderPayment;
-  const eligible =
+
+  const financiallyRefundable =
     validationsComplete &&
     paid &&
     hasProviderPayment &&
-    insideWindow &&
     !alreadyRefunded &&
-    riskScore < 80 &&
-    !deliveredOrConsumed &&
     previousRefundEvents === 0 &&
     order.source === "sales";
 
+  const eligible = financiallyRefundable && insideWindow;
+  const persistedManualRequired = settings.manualApprovalRequired === true;
+  const persistedAutoEnabled = settings.autoProcessEnabled === true;
+  const configurationAllowsAutomatic =
+    settings.enabled !== false &&
+    persistedAutoEnabled &&
+    !persistedManualRequired &&
+    settings.modeConflict !== true;
   const canAutoRefund =
-    eligible &&
-    settings.autoProcessEnabled &&
-    !settings.manualApprovalRequired &&
-    riskScore < 80;
+    financiallyRefundable &&
+    insideWindow &&
+    configurationAllowsAutomatic;
 
-  const manualRequired = settings.manualApprovalRequired || !canAutoRefund;
+  const manualRequired =
+    !canAutoRefund &&
+    financiallyRefundable &&
+    (persistedManualRequired || !insideWindow || settings.modeConflict === true || !persistedAutoEnabled);
 
   return {
     eligible,
+    financiallyRefundable,
+    configurationAllowsAutomatic,
     canAutoRefund,
     manualRequired,
     paid,
@@ -1915,6 +1965,72 @@ function buildOrderSelectionMessage(ticket, orders) {
       }),
     ]),
   ]);
+}
+
+function resolveRefundRoute(eligibility, settings) {
+  if (!eligibility.financiallyRefundable) {
+    return {
+      route: "blocked",
+      reason: eligibility.reasons[0] || "not_refundable",
+    };
+  }
+
+  if (!eligibility.insideWindow) {
+    return {
+      route: "manual",
+      reason: "outside_refund_window",
+    };
+  }
+
+  if (settings.enabled === false) {
+    return {
+      route: "manual",
+      reason: "refund_module_disabled",
+    };
+  }
+
+  if (settings.modeConflict === true) {
+    return {
+      route: "manual",
+      reason: "refund_settings_mode_conflict",
+    };
+  }
+
+  if (settings.manualApprovalRequired === true) {
+    return {
+      route: "manual",
+      reason: "manual_approval_required",
+    };
+  }
+
+  if (settings.autoProcessEnabled === true) {
+    return {
+      route: "automatic",
+      reason: "inside_window_auto_enabled",
+    };
+  }
+
+  return {
+    route: "manual",
+    reason: "auto_process_disabled",
+  };
+}
+
+function describeRefundRouteReason(reason) {
+  switch (reason) {
+    case "manual_approval_required":
+      return "Aprovacao manual esta ativada no painel.";
+    case "auto_process_disabled":
+      return "Processamento automatico esta desativado no painel.";
+    case "refund_settings_mode_conflict":
+      return "As regras financeiras persistidas estao em modo conflitante; a rota conservadora e analise manual.";
+    case "refund_module_disabled":
+      return "O modulo de reembolso esta desativado no painel.";
+    case "outside_refund_window":
+      return "Pedido fora do prazo configurado pelo vendedor.";
+    default:
+      return "Analise manual exigida pelas regras financeiras.";
+  }
 }
 
 function hasRefundApprovalPermission(member, settings, runtime) {
@@ -2030,6 +2146,209 @@ function summarizeEligibilityForStaff(eligibility) {
   return lines.join("\n");
 }
 
+function buildRefundStaffReviewPayload({
+  ticket,
+  order,
+  reason,
+  eligibility,
+  protocol,
+  state = "pending",
+  decidedBy = null,
+  errorMessage = "",
+}) {
+  const stateConfig = {
+    pending: {
+      title: "Solicitacao de reembolso",
+      tone: eligibility?.eligible ? "warning" : "error",
+      status: "Aguardando analise manual",
+      buttonsDisabled: false,
+    },
+    processing: {
+      title: "Reembolso em processamento",
+      tone: "processing",
+      status: "Aguarde, estamos processando este reembolso...",
+      buttonsDisabled: true,
+    },
+    approved: {
+      title: "Reembolso aprovado",
+      tone: "success",
+      status: `Processado${decidedBy ? ` por <@${decidedBy}>` : ""}`,
+      buttonsDisabled: true,
+    },
+    denied: {
+      title: "Reembolso negado",
+      tone: "error",
+      status: `Negado${decidedBy ? ` por <@${decidedBy}>` : ""}`,
+      buttonsDisabled: true,
+    },
+    failed: {
+      title: "Falha ao processar reembolso",
+      tone: "error",
+      status: errorMessage || "A operacao nao foi concluida.",
+      buttonsDisabled: true,
+    },
+    partial: {
+      title: "Reembolso financeiro confirmado",
+      tone: "warning",
+      status: errorMessage || "O estorno foi confirmado, mas uma etapa posterior falhou.",
+      buttonsDisabled: true,
+    },
+  };
+  const config = stateConfig[state] || stateConfig.pending;
+  const orderLine = `${order.productTitle}\n${formatMoney(order.amount, order.currency)} | ${formatDate(resolvePurchaseDate(order))}`;
+  const details = [
+    `**Status:** ${config.status}`,
+    `**Protocolo:** \`${protocol}\``,
+    `**Ticket:** ${ticket.protocol || ticket.id} | <#${ticket.channel_id}>`,
+    `**Usuario:** <@${ticket.user_id}>`,
+    `**Compra:** ${orderLine}`,
+    `**Pedido:** \`${resolveOrderPublicId(order)}\``,
+    `**Pagamento:** ${order.providerPaymentId ? `\`${order.providerPaymentId}\`` : "Nao informado"}`,
+    "",
+    "**Validacao**",
+    summarizeEligibilityForStaff(eligibility),
+    "",
+    "**Motivo**",
+    normalizeText(reason || "Solicitado pelo comprador no ticket.", 900),
+  ].join("\n");
+
+  const containerComponents = [textDisplay(details)];
+  if (state === "pending" || state === "processing") {
+    containerComponents.push(separator());
+    containerComponents.push(
+      actionRow([
+        button({
+          customId: `${REFUND_PREFIX}approve:${ticket.id}:${order.key}`,
+          label: state === "processing" ? "Processando..." : "Aprovar Reembolso",
+          style: ButtonStyle.Success,
+          disabled: config.buttonsDisabled,
+        }),
+        button({
+          customId: `${REFUND_PREFIX}deny:${ticket.id}:${order.key}`,
+          label: "Negar Reembolso",
+          style: ButtonStyle.Danger,
+          disabled: config.buttonsDisabled,
+        }),
+      ]),
+    );
+  }
+
+  return v2Message([
+    {
+      type: COMPONENT_TYPE.CONTAINER,
+      accent_color: resolveRefundToneColor(config.tone),
+      components: containerComponents,
+    },
+  ]);
+}
+
+function buildRefundOrderInfoPayload(order) {
+  return buildRefundV2Payload({
+    title: "Informacoes do pedido",
+    tone: "processing",
+    message: [
+      `**Pedido:** \`${resolveOrderPublicId(order)}\``,
+      `**Status:** ${formatOrderSafeStatus(order)}`,
+      `**Data da compra:** ${formatDate(resolvePurchaseDate(order))}`,
+      `**Valor:** ${formatMoney(order.amount, order.currency)}`,
+      `**Origem:** ${order.source === "sales" ? "Loja do servidor" : "Financeiro Flowdesk"}`,
+      "",
+      "Nao exibo email, dados internos, credenciais, dados de pagamento ou detalhes sensiveis do produto neste ticket.",
+    ].join("\n"),
+    footer: "Consulta feita apenas para o Discord vinculado a este ticket.",
+  });
+}
+
+function buildRefundProcessingPayload({ protocol, order, mode }) {
+  return buildRefundV2Payload({
+    title: "Processando reembolso",
+    tone: "processing",
+    message: [
+      "Aguarde, estamos processando este reembolso...",
+      "",
+      `**Protocolo:** \`${protocol}\``,
+      order ? `**Compra:** ${order.productTitle}` : "",
+      mode ? `**Modo:** ${mode}` : "",
+    ].filter(Boolean).join("\n"),
+    footer: "Os botoes ficam bloqueados enquanto o estorno financeiro e confirmado.",
+  });
+}
+
+function buildRefundSuccessPayload({ settings, order, protocol, title = "Reembolso aprovado" }) {
+  return buildRefundV2Payload({
+    title,
+    tone: "success",
+    message: [
+      settings.successMessage || "Reembolso concluido com sucesso.",
+      "",
+      `**Compra:** ${order.productTitle}`,
+      `**Valor:** ${formatMoney(order.amount, order.currency)}`,
+      `**Protocolo:** \`${protocol}\``,
+      "",
+      "O estorno segue o prazo do provedor de pagamento e do banco emissor.",
+    ].join("\n"),
+  });
+}
+
+function buildRefundFailurePayload({ protocol, order, message, title = "Falha no reembolso" }) {
+  return buildRefundV2Payload({
+    title,
+    tone: "error",
+    message: [
+      normalizeText(message || "Nao foi possivel concluir esta etapa.", 900),
+      "",
+      protocol ? `**Protocolo:** \`${protocol}\`` : "",
+      order ? `**Compra:** ${order.productTitle}` : "",
+    ].filter(Boolean).join("\n"),
+  });
+}
+
+function buildRefundManualQueuedPayload({ protocol, order, eligibility, reason }) {
+  return buildRefundV2Payload({
+    title: "Solicitacao enviada para analise",
+    tone: "warning",
+    message: [
+      `A compra **${order.productTitle}** foi encaminhada para analise manual da equipe responsavel.`,
+      "",
+      `**Protocolo:** \`${protocol}\``,
+      `**Prazo configurado:** ${eligibility.refundDays} dia(s)`,
+      reason ? `**Motivo:** ${reason}` : "",
+    ].filter(Boolean).join("\n"),
+    footer: "Guarde o protocolo para acompanhar esta solicitacao.",
+  });
+}
+
+function buildRefundExpiredConfirmationPayload({ ticket, order, eligibility }) {
+  return v2Message([
+    {
+      type: COMPONENT_TYPE.CONTAINER,
+      accent_color: resolveRefundToneColor("warning"),
+      components: [
+        textDisplay(
+          [
+            "### Prazo de reembolso expirado",
+            `Identifiquei que a compra **${order.productTitle}** foi realizada em **${formatDate(resolvePurchaseDate(order))}**.`,
+            `O prazo configurado pelo vendedor e de **${eligibility.refundDays} dia(s)** e expirou em **${formatDate(eligibility.deadline)}**.`,
+            "",
+            "Se quiser prosseguir, a equipe fara uma analise manual excepcional.",
+          ].join("\n"),
+        ),
+      ],
+    },
+    actionRow([
+      button({
+        customId: `${REFUND_PREFIX}confirm_expired:${ticket.id}:${order.key}`,
+        label: "Enviar para analise",
+        style: ButtonStyle.Danger,
+      }),
+      button({
+        customId: `${REFUND_PREFIX}cancel_expired:${ticket.id}:${order.key}`,
+        label: "Cancelar",
+        style: ButtonStyle.Secondary,
+      }),
+    ]),
+  ]);
+}
 
 function generateRefundProtocol(ticketId, orderKey) {
   const datePart = new Date().toISOString().slice(0,10).replace(/-/g,'');
@@ -2047,135 +2366,29 @@ async function sendManualApprovalRequest({ client, ticket, order, settings, reas
     throw new Error("Canal de aprovacao de reembolso nao configurado ou inacessivel.");
   }
 
-  const embed = new EmbedBuilder()
-    .setTitle("Solicitacao de Reembolso")
-    .setColor(eligibility.eligible ? 0xf1c40f : 0xdb4646)
-    .addFields(
-      {
-        name: "Protocolo",
-        value: `\`${protocol}\``,
-        inline: true,
-      },
-      {
-        name: "Ticket",
-        value: `${ticket.protocol || ticket.id}\n<#${ticket.channel_id}>`,
-        inline: true,
-      },
-      { name: "Usuario", value: `<@${ticket.user_id}>`, inline: true },
-      {
-        name: "Compra",
-        value: `${order.productTitle}\n${formatMoney(order.amount, order.currency)} | ${formatDate(resolvePurchaseDate(order))}`,
-        inline: false,
-      },
-      {
-        name: "Pedido",
-        value:
-          order.source === "payment"
-            ? `#${order.raw?.order_number || order.id} (${order.key})`
-            : `\`${order.id}\``,
-        inline: true,
-      },
-      {
-        name: "Pagamento",
-        value: order.providerPaymentId ? `\`${order.providerPaymentId}\`` : "Nao informado",
-        inline: true,
-      },
-      {
-        name: "Validacao",
-        value: summarizeEligibilityForStaff(eligibility),
-        inline: false,
-      },
-      {
-        name: "Motivo",
-        value: normalizeText(reason || "Solicitado pelo comprador no ticket.", 900),
-        inline: false,
-      },
-    )
-    .setTimestamp(new Date());
-
-  await channel.send({
-    embeds: [embed],
-    components: [
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`${REFUND_PREFIX}approve:${ticket.id}:${order.key}`)
-          .setLabel("Aprovar")
-          .setStyle(ButtonStyle.Success),
-        new ButtonBuilder()
-          .setCustomId(`${REFUND_PREFIX}deny:${ticket.id}:${order.key}`)
-          .setLabel("Negar")
-          .setStyle(ButtonStyle.Danger),
-      ),
-    ],
-    allowedMentions: { parse: [], users: [ticket.user_id], roles: [] },
-  });
-}
-
-async function sendAutoRefundInfoLog({ client, ticket, order, settings, protocol, eligibility }) {
-  const guild = await client.guilds.fetch(ticket.guild_id).catch(() => null);
-  const channel = settings.approvalChannelId
-    ? await guild?.channels.fetch(settings.approvalChannelId).catch(() => null)
-    : null;
-  if (!channel || typeof channel.send !== "function") {
-    console.warn("[ticket-refund] Canal de log de auto-reembolso nao configurado ou inacessivel.");
-    return;
-  }
-
-  const embed = new EmbedBuilder()
-    .setTitle("Reembolso Processado Automaticamente")
-    .setColor(0x2ecc71) // Verde esmeralda premium
-    .setDescription("Este reembolso foi aprovado e processado automaticamente pelo sistema de Regras Financeiras da IA, sem necessidade de intervencao humana.")
-    .addFields(
-      {
-        name: "Protocolo",
-        value: `\`${protocol}\``,
-        inline: true,
-      },
-      {
-        name: "Ticket",
-        value: `${ticket.protocol || ticket.id}\n<#${ticket.channel_id}>`,
-        inline: true,
-      },
-      { name: "Usuario", value: `<@${ticket.user_id}>`, inline: true },
-      {
-        name: "Compra",
-        value: `${order.productTitle}\n${formatMoney(order.amount, order.currency)} | ${formatDate(resolvePurchaseDate(order))}`,
-        inline: false,
-      },
-      {
-        name: "Pedido",
-        value: order.source === "payment"
-          ? `#${order.raw?.order_number || order.id} (${order.key})`
-          : `\`${order.id}\``,
-        inline: true,
-      },
-      {
-        name: "Pagamento",
-        value: order.providerPaymentId ? `\`${order.providerPaymentId}\`` : "Nao informado",
-        inline: true,
-      },
-      {
-        name: "Metodo",
-        value: "Processamento automatico por IA",
-        inline: true,
-      },
-      {
-        name: "Validacao",
-        value: summarizeEligibilityForStaff(eligibility),
-        inline: false,
-      }
-    )
-    .setTimestamp(new Date());
-
-  await channel.send({
-    embeds: [embed],
-    components: [],
-    allowedMentions: { parse: [] },
-  });
+  return await channel.send(
+    buildRefundStaffReviewPayload({
+      ticket,
+      order,
+      settings,
+      reason,
+      eligibility,
+      protocol,
+      state: "pending",
+    }),
+  );
 }
 
 async function enqueueRefundDirectMessage({ ticket, order, protocol, kind, content }) {
   const notificationKey = `ticket:${ticket.id}:refund:${kind}:${protocol}`;
+  const payload =
+    content && typeof content === "object"
+      ? content
+      : buildRefundV2Payload({
+          title: kind === "denied" ? "Reembolso negado" : "Reembolso aprovado",
+          tone: kind === "denied" ? "error" : "success",
+          message: String(content || "").trim(),
+        });
   try {
     const result = await supabase
       .from("ticket_dm_queue")
@@ -2187,10 +2400,7 @@ async function enqueueRefundDirectMessage({ ticket, order, protocol, kind, conte
           protocol: ticket.protocol,
           guild_id: ticket.guild_id,
           user_id: ticket.user_id,
-          payload: {
-            content,
-            allowedMentions: { parse: [] },
-          },
+          payload,
           status: "pending",
           attempt_count: 0,
           max_attempts: 12,
@@ -2220,10 +2430,6 @@ async function enqueueRefundDirectMessage({ ticket, order, protocol, kind, conte
   }
 }
 
-function buildRefundSuccessContent({ settings, order, protocol }) {
-  return `${settings.successMessage || "Reembolso concluido com sucesso."}\n\nCompra: ${order.productTitle}\nValor: ${formatMoney(order.amount, order.currency)}\nProtocolo: **${protocol}**\nO estorno segue o prazo do provedor de pagamento e do banco emissor.`;
-}
-
 async function sendRefundTicketConfirmation({ client, interaction, ticket, content }) {
   const channel =
     (await client.channels.fetch(ticket.channel_id).catch(() => null)) ||
@@ -2235,14 +2441,577 @@ async function sendRefundTicketConfirmation({ client, interaction, ticket, conte
   }
 
   try {
-    await channel.send({
-      content,
-      allowedMentions: { parse: [] },
-    });
+    await channel.send(
+      content && typeof content === "object"
+        ? content
+        : buildRefundV2Payload({
+            title: "Reembolso aprovado",
+            tone: "success",
+            message: String(content || "").trim(),
+          }),
+    );
     return { ok: true };
   } catch (error) {
     console.warn("[ticket-refund] falha ao enviar confirmacao no ticket:", error?.message || error);
     return { ok: false, error };
+  }
+}
+
+async function executeRefundProcessing({
+  client,
+  interaction = null,
+  ticket,
+  order,
+  settings,
+  protocol,
+  actorUserId,
+  authUserId = null,
+  method,
+  reason,
+  eligibility,
+  correlationId,
+  updateMode = "request",
+}) {
+  let refundResult = null;
+  let finalOrder = order;
+  let recoveredFromUncertainError = false;
+
+  await logRefundAuditEvent({
+    ticket,
+    authUserId,
+    orderKey: order.key,
+    riskScore: eligibility?.riskScore,
+    eventType: "refund_processing_started",
+    outcome: "started",
+    correlationId,
+    metadata: {
+      protocol,
+      method,
+      actor_user_id: actorUserId || "system",
+      reason: normalizeText(reason, 500),
+      settings_source: settings?.source || null,
+      settings_updated_at: settings?.updatedAt || null,
+      settings_mode_conflict: settings?.modeConflict === true,
+    },
+  });
+
+  try {
+    refundResult = await callInternalSalesRefund(order.id, ticket.guild_id, reason);
+  } catch (financialError) {
+    const reconciliation = await confirmRefundAfterUncertainError({
+      ticket,
+      order,
+      authUserId,
+      error: financialError,
+    });
+
+    if (!reconciliation.confirmed) {
+      await logRefundAuditEvent({
+        ticket,
+        authUserId,
+        orderKey: order.key,
+        riskScore: eligibility?.riskScore,
+        eventType: "refund_financial_failed",
+        outcome: reconciliation.reason === "not_confirmed_after_reconciliation"
+          ? "provider_result_uncertain"
+          : "failed",
+        correlationId,
+        metadata: {
+          protocol,
+          method,
+          actor_user_id: actorUserId || "system",
+          provider_error: normalizeText(financialError.message, 500),
+          reconciliation_reason: reconciliation.reason,
+        },
+      });
+
+      if (interaction) {
+        const failurePayload =
+          updateMode === "staff"
+            ? buildRefundStaffReviewPayload({
+                ticket,
+                order,
+                settings,
+                reason,
+                eligibility,
+                protocol,
+                state: "failed",
+                decidedBy: actorUserId,
+                errorMessage: `Nao consegui confirmar o estorno financeiro: ${normalizeText(financialError.message, 300)}`,
+              })
+            : buildRefundFailurePayload({
+                protocol,
+                order,
+                message:
+                  settings.errorMessage ||
+                  `Nao consegui confirmar o estorno financeiro: ${normalizeText(financialError.message, 300)}`,
+              });
+        await updateComponentMessage(interaction, failurePayload, correlationId);
+      }
+
+      await persistRefundStateDirectly(ticket, {}, {
+        stage: "refund_failed",
+        selectedOrderKey: order.key,
+      });
+
+      return {
+        ok: false,
+        financialCompleted: false,
+        error: financialError,
+        reconciliation,
+      };
+    }
+
+    finalOrder = reconciliation.order || order;
+    refundResult = {
+      ok: true,
+      alreadyRefunded: true,
+      reconciledAfterError: true,
+      reconciliationReason: reconciliation.reason,
+    };
+    recoveredFromUncertainError = true;
+  }
+
+  finalOrder =
+    (await getOrderByKey(ticket.guild_id, order.key, {
+      authUserId,
+      discordUserId: ticket.user_id,
+    }).catch(() => null)) ||
+    finalOrder ||
+    order;
+
+  const successPayload = buildRefundSuccessPayload({
+    settings,
+    order: finalOrder,
+    protocol,
+    title: method === "automatic" ? "Reembolso processado automaticamente" : "Reembolso aprovado",
+  });
+
+  const postFailures = [];
+  const ticketNotice = await sendRefundTicketConfirmation({
+    client,
+    interaction,
+    ticket,
+    content: successPayload,
+  });
+  if (ticketNotice?.ok !== true) {
+    postFailures.push({
+      step: "ticket_notification",
+      error: serializeDiscordError(ticketNotice?.error),
+    });
+  }
+
+  const dmQueue = await enqueueRefundDirectMessage({
+    ticket,
+    order: finalOrder,
+    protocol,
+    kind: "processed",
+    content: successPayload,
+  });
+  if (dmQueue.queued) {
+    void processDirectMessageQueue(client, { notificationKey: dmQueue.notificationKey }).catch((error) => {
+      console.warn("[ticket-refund] falha ao processar DM imediata de reembolso:", error?.message || error);
+    });
+  } else {
+    postFailures.push({
+      step: "dm_queue",
+      error: normalizeText(dmQueue.error?.message || "Falha ao enfileirar DM.", 300),
+    });
+  }
+
+  const emailNotice = await sendRefundProcessedEmail({
+    discordUserId: ticket.user_id,
+    refundProtocol: protocol,
+    productTitle: finalOrder.productTitle,
+    amountLabel: formatMoney(finalOrder.amount, finalOrder.currency),
+  });
+  if (emailNotice?.sent !== true) {
+    postFailures.push({
+      step: "email_notification",
+      error: normalizeText(emailNotice?.reason || emailNotice?.error?.message || "Email nao enviado.", 300),
+    });
+  }
+
+  const requestFinalPayload = postFailures.length
+    ? buildRefundV2Payload({
+        title: "Reembolso financeiro confirmado",
+        tone: "warning",
+        message: [
+          "O estorno financeiro foi confirmado, mas uma ou mais etapas de comunicacao precisam de reconciliacao.",
+          "",
+          `**Protocolo:** \`${protocol}\``,
+          `**Compra:** ${finalOrder.productTitle}`,
+          "",
+          "O evento foi registrado para auditoria e retry operacional.",
+        ].join("\n"),
+      })
+    : successPayload;
+
+  const finalPayload =
+    updateMode === "staff"
+      ? buildRefundStaffReviewPayload({
+          ticket,
+          order: finalOrder,
+          settings,
+          reason,
+          eligibility,
+          protocol,
+          state: postFailures.length ? "partial" : "approved",
+          decidedBy: actorUserId,
+          errorMessage: postFailures.length
+            ? "O estorno foi confirmado, mas uma ou mais notificacoes precisam de reconciliacao."
+            : "",
+        })
+      : requestFinalPayload;
+
+  let finalUpdate = { ok: true };
+  if (interaction) {
+    finalUpdate = await updateComponentMessage(interaction, finalPayload, correlationId);
+    if (!finalUpdate.ok) {
+      postFailures.push({
+        step: "discord_component_update",
+        error: serializeDiscordError(finalUpdate.error),
+      });
+    }
+  }
+
+  const completed = postFailures.length === 0;
+  await persistRefundStateDirectly(ticket, {}, {
+    stage: completed ? "completed" : "post_process_failed",
+    selectedOrderKey: order.key,
+  });
+
+  await logRefundAuditEvent({
+    ticket,
+    authUserId,
+    orderKey: order.key,
+    riskScore: eligibility?.riskScore,
+    eventType: method === "automatic" ? "auto_refund_processed" : "manual_refund_approved",
+    outcome: refundResult?.alreadyRefunded
+      ? "already_refunded"
+      : completed
+        ? "processed"
+        : "post_process_partial_failure",
+    correlationId,
+    metadata: {
+      protocol,
+      method,
+      actor_user_id: actorUserId || "system",
+      decision_reason: normalizeText(reason, 500),
+      transaction_id: finalOrder.providerPaymentId || order.providerPaymentId || null,
+      final_status: refundResult?.alreadyRefunded ? "already_refunded" : "refunded",
+      recovered_from_uncertain_provider_error: recoveredFromUncertainError,
+      discord_ticket_confirmation_sent: ticketNotice?.ok === true,
+      dm_notification_queued: dmQueue.queued === true,
+      email_confirmation_sent: emailNotice?.sent === true,
+      discord_component_updated: finalUpdate.ok === true,
+      post_failures: postFailures,
+    },
+  });
+
+  return {
+    ok: completed,
+    financialCompleted: true,
+    refundResult,
+    finalOrder,
+    postFailures,
+  };
+}
+
+async function routeSelectedRefundRequest({
+  client,
+  interaction,
+  ticket,
+  order,
+  settings,
+  authUser,
+  eligibility,
+  correlationId,
+}) {
+  const route = resolveRefundRoute(eligibility, settings);
+
+  await logRefundAuditEvent({
+    ticket,
+    authUserId: authUser.id,
+    orderKey: order.key,
+    riskScore: eligibility.riskScore,
+    eventType: "refund_route_resolved",
+    outcome: route.route,
+    correlationId,
+    metadata: {
+      route_reason: route.reason,
+      inside_window: eligibility.insideWindow,
+      refund_limit_days: eligibility.refundDays,
+      auto_process_enabled: settings.autoProcessEnabled,
+      manual_approval_required: settings.manualApprovalRequired,
+      settings_source: settings.source,
+      settings_updated_at: settings.updatedAt,
+      settings_mode_conflict: settings.modeConflict === true,
+    },
+  });
+
+  if (route.route === "blocked") {
+    await updateComponentMessage(interaction,
+      buildRefundFailurePayload({
+        protocol: null,
+        order,
+        title: "Reembolso nao disponivel",
+        message:
+          "Esta compra nao possui os requisitos financeiros minimos para estorno pelo ticket. A equipe pode orientar os proximos passos por aqui.",
+      }),
+      correlationId,
+    );
+    return true;
+  }
+
+  if (route.route === "automatic") {
+    const autoProtocol = generateRefundProtocol(ticket.id, order.key);
+    await updateComponentMessage(interaction,
+      buildRefundProcessingPayload({
+        protocol: autoProtocol,
+        order,
+        mode: "Automatico pelas regras financeiras",
+      }),
+      correlationId,
+    );
+
+    await executeRefundProcessing({
+      client,
+      interaction,
+      ticket,
+      order,
+      settings,
+      protocol: autoProtocol,
+      actorUserId: "system",
+      authUserId: authUser.id,
+      method: "automatic",
+      reason: `Reembolso automatico dentro do prazo configurado (${settings.refundLimitDays} dia(s)); aprovacao manual desativada.`,
+      eligibility,
+      correlationId,
+      updateMode: "request",
+    });
+    return true;
+  }
+
+  if (route.reason === "outside_refund_window") {
+    await updateComponentMessage(interaction,
+      buildRefundExpiredConfirmationPayload({ ticket, order, eligibility }),
+      correlationId,
+    );
+    return true;
+  }
+
+  const refundProtocol = generateRefundProtocol(ticket.id, order.key);
+  await updateComponentMessage(interaction,
+    buildRefundManualQueuedPayload({
+      protocol: refundProtocol,
+      order,
+      eligibility,
+      reason: describeRefundRouteReason(route.reason),
+    }),
+    correlationId,
+  );
+
+  try {
+    await sendManualApprovalRequest({
+      client,
+      ticket,
+      order,
+      settings,
+      reason: `Solicitacao confirmada pelo comprador via FlowAI. Rota: ${route.reason}.`,
+      eligibility,
+      protocol: refundProtocol,
+    });
+  } catch (error) {
+    await updateComponentMessage(interaction,
+      buildRefundFailurePayload({
+        protocol: refundProtocol,
+        order,
+        message:
+          "A solicitacao precisa de analise manual, mas o canal de aprovacao nao esta configurado ou esta inacessivel. O evento foi registrado para a administracao.",
+      }),
+      correlationId,
+    );
+    await logRefundAuditEvent({
+      ticket,
+      authUserId: authUser.id,
+      orderKey: order.key,
+      riskScore: eligibility.riskScore,
+      eventType: "manual_review_dispatch_failed",
+      outcome: "approval_channel_unavailable",
+      correlationId,
+      metadata: {
+        protocol: refundProtocol,
+        route_reason: route.reason,
+        error: normalizeText(error.message, 500),
+        approval_channel_id: settings.approvalChannelId || null,
+      },
+    });
+    return true;
+  }
+
+  const historyRows = await fetchRecentAiMessages(ticket.id);
+  const previousState = readRefundMemory(historyRows);
+  await persistRefundStateDirectly(ticket, previousState, { stage: "manual_review" });
+
+  await logRefundAuditEvent({
+    ticket,
+    authUserId: authUser.id,
+    orderKey: order.key,
+    riskScore: eligibility.riskScore,
+    eventType: "manual_review_opened",
+    outcome: "awaiting_staff",
+    correlationId,
+    metadata: {
+      protocol: refundProtocol,
+      insideWindow: eligibility.insideWindow,
+      reasons: eligibility.reasons,
+      route_reason: route.reason,
+      settings_source: settings.source,
+      settings_updated_at: settings.updatedAt,
+      settings_mode_conflict: settings.modeConflict === true,
+    },
+  });
+
+  return true;
+}
+
+async function handleRefundStaffDecision({
+  client,
+  interaction,
+  ticket,
+  order,
+  settings,
+  runtime,
+  action,
+  correlationId,
+}) {
+  const eligibility = evaluateRefundEligibility(order, settings, {
+    authUserId: order.authUserId || null,
+    discordUserId: ticket.user_id,
+  });
+  const protocol = generateRefundProtocol(ticket.id, order.key);
+  const lockKey = `${ticket.id}:${order.key}`;
+
+  if (action === "deny") {
+    await updateComponentMessage(interaction,
+      buildRefundStaffReviewPayload({
+        ticket,
+        order,
+        settings,
+        reason: "Reembolso recusado manualmente pela equipe.",
+        eligibility,
+        protocol,
+        state: "denied",
+        decidedBy: interaction.user.id,
+      }),
+      correlationId,
+    );
+
+    const channel = await client.channels.fetch(ticket.channel_id).catch(() => null);
+    await channel?.send?.(
+      buildRefundV2Payload({
+        title: "Reembolso negado",
+        tone: "error",
+        message:
+          "A equipe analisou a solicitacao de reembolso e ela foi negada neste momento. Caso precise de mais detalhes, responda neste ticket.",
+      }),
+    );
+
+    const denialPayload = buildRefundV2Payload({
+      title: "Reembolso negado",
+      tone: "error",
+      message:
+        "A equipe analisou sua solicitacao de reembolso e ela foi negada neste momento. Acompanhe o ticket para mais detalhes.",
+    });
+    const dmQueue = await enqueueRefundDirectMessage({
+      ticket,
+      order,
+      protocol,
+      kind: "denied",
+      content: denialPayload,
+    });
+    if (dmQueue.queued) {
+      void processDirectMessageQueue(client, { notificationKey: dmQueue.notificationKey }).catch((error) => {
+        console.warn("[ticket-refund] falha ao processar DM imediata de reembolso negado:", error?.message || error);
+      });
+    }
+
+    await persistRefundStateDirectly(ticket, {}, {
+      stage: "completed",
+      selectedOrderKey: order.key,
+    });
+    await logRefundAuditEvent({
+      ticket,
+      orderKey: order.key,
+      riskScore: eligibility.riskScore,
+      eventType: "manual_refund_denied",
+      outcome: "denied",
+      correlationId,
+      metadata: {
+        responsible_user: interaction.user.id,
+        action_time: new Date().toISOString(),
+        method: "manual",
+        final_status: "denied",
+        decidedBy: interaction.user.id,
+        protocol,
+        dm_notification_queued: dmQueue.queued === true,
+      },
+    });
+    return true;
+  }
+
+  if (order.source !== "sales") {
+    await interaction.reply({
+      content:
+        "Este pedido pertence ao financeiro da plataforma e precisa ser reembolsado pelo painel administrativo de pagamentos.",
+      ephemeral: true,
+    });
+    return true;
+  }
+
+  if (pendingRefundActions.has(lockKey)) {
+    await interaction.reply({
+      content: "Este reembolso ja esta sendo processado.",
+      ephemeral: true,
+    });
+    return true;
+  }
+
+  pendingRefundActions.add(lockKey);
+  try {
+    await updateComponentMessage(interaction,
+      buildRefundStaffReviewPayload({
+        ticket,
+        order,
+        settings,
+        reason: `Aprovado manualmente por ${interaction.user.id}.`,
+        eligibility,
+        protocol,
+        state: "processing",
+        decidedBy: interaction.user.id,
+      }),
+      correlationId,
+    );
+
+    await executeRefundProcessing({
+      client,
+      interaction,
+      ticket,
+      order,
+      settings,
+      protocol,
+      actorUserId: interaction.user.id,
+      authUserId: order.authUserId || null,
+      method: "manual",
+      reason: `Aprovado manualmente por ${interaction.user.id}; protocolo ${protocol}.`,
+      eligibility,
+      correlationId,
+      updateMode: "staff",
+    });
+    return true;
+  } finally {
+    pendingRefundActions.delete(lockKey);
   }
 }
 
@@ -2268,7 +3037,7 @@ async function answerContextualMessage({ message, persist, state, kind, content,
     await persistRefundState(persist, nextState);
     if (!shouldPrompt(state, "waiting_review", 20_000)) return true;
     await message.reply({
-      content: state.stage === "completed" 
+      content: state.stage === "completed"
         ? "O seu pedido ja foi finalizado. Se precisar de mais alguma coisa, a equipe esta a disposicao."
         : "Sim! O seu pedido de reembolso ja esta em analise pela equipe. E so aguardar a resposta por aqui.",
       allowedMentions: { parse: [] },
@@ -2427,28 +3196,28 @@ async function handleRefundProtocolQuery({ message, client, ticket, protocolCode
       }
     }
 
-    const responseEmbed = new EmbedBuilder()
-      .setTitle("Status da Solicitação de Reembolso")
-      .setColor(colorAccent)
-      .setDescription(
-        [
-          `Encontrei as informações sobre a sua solicitação com o protocolo **\`${searchProtocol}\`**:`,
+    await searchingMsg.delete().catch(() => null);
+    await message.reply(
+      buildRefundV2Payload({
+        title: "Status da solicitacao de reembolso",
+        tone:
+          colorAccent === 0x2ecc71
+            ? "success"
+            : colorAccent === 0xe74c3c
+              ? "error"
+              : "warning",
+        message: [
+          `Encontrei as informacoes sobre a solicitacao com o protocolo **\`${searchProtocol}\`**:`,
           "",
-          `📌 **Status:** \`${statusText}\``,
-          `📅 **Data de Abertura:** ${formattedDate}`,
+          `**Status:** \`${statusText}\``,
+          `**Data de abertura:** ${formattedDate}`,
           orderInfoLine,
           "",
-          `ℹ️ **Informações:**`,
+          "**Informacoes**",
           description,
-        ].join("\n")
-      )
-      .setTimestamp(createdDate);
-
-    await searchingMsg.delete().catch(() => null);
-    await message.reply({
-      embeds: [responseEmbed],
-      allowedMentions: { parse: [] },
-    });
+        ].join("\n"),
+      }),
+    );
 
     let newStage = "manual_review";
     if (statusText.includes("Aprovado")) {
@@ -3069,8 +3838,18 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
       });
 
       const refundProtocol = generateRefundProtocol(ticket.id, order.key);
+      const expiredCorrelationId = createCorrelationId("refund_expired");
 
-      await sendManualApprovalRequest({
+      await updateComponentMessage(interaction,
+        buildRefundProcessingPayload({
+          protocol: refundProtocol,
+          order,
+          mode: "Enviando para analise manual",
+        }),
+        expiredCorrelationId,
+      );
+
+      const manualRequest = await sendManualApprovalRequest({
         client,
         ticket,
         order,
@@ -3079,20 +3858,41 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
         allowedMentions: { parse: [] },
         eligibility,
         protocol: refundProtocol,
-      });
-
-      await interaction.update(
-        v2Message([
-          {
-            type: COMPONENT_TYPE.CONTAINER,
-            accent_color: 0xf1c40f,
-            components: [
-              textDisplay(
-                `Compra confirmada. A solicitacao foi enviada para analise da equipe responsavel.\n\n**Protocolo: ${refundProtocol}**\nGuarde este numero — ele identifica sua solicitacao e sera usado na comunicacao com a equipe.\n\n> ⚠️ *Pedido fora do prazo limite de reembolso (${eligibility.refundDays} dias). Enviado para analise excepcional da staff.*`
-              ),
-            ],
+      }).catch(async (error) => {
+        await updateComponentMessage(interaction,
+          buildRefundFailurePayload({
+            protocol: refundProtocol,
+            order,
+            message:
+              "Nao consegui encaminhar a analise manual porque o canal de aprovacao nao esta configurado ou esta inacessivel.",
+          }),
+          expiredCorrelationId,
+        );
+        await logRefundAuditEvent({
+          ticket,
+          authUserId: authUser?.id,
+          orderKey: order.key,
+          riskScore: eligibility.riskScore,
+          eventType: "manual_review_dispatch_failed",
+          outcome: "approval_channel_unavailable",
+          metadata: {
+            protocol: refundProtocol,
+            userConfirmedExpired: true,
+            error: normalizeText(error.message, 500),
           },
-        ])
+        });
+        return null;
+      });
+      if (!manualRequest) return true;
+
+      await updateComponentMessage(interaction,
+        buildRefundManualQueuedPayload({
+          protocol: refundProtocol,
+          order,
+          eligibility,
+          reason: describeRefundRouteReason("outside_refund_window"),
+        }),
+        expiredCorrelationId,
       );
 
       const historyRows = await fetchRecentAiMessages(ticket.id);
@@ -3196,215 +3996,32 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
         discordUserId: ticket.user_id,
         accountViolations,
       });
+      const selectedRoute = resolveRefundRoute(eligibility, settings);
       await logRefundAuditEvent({
         ticket,
         authUserId: authUser.id,
         orderKey: order.key,
         riskScore: eligibility.riskScore,
         eventType: "order_selected",
-        outcome: eligibility.canAutoRefund ? "auto_candidate" : "manual_review",
+        outcome: selectedRoute.route,
         metadata: {
           source: order.source,
           reasons: eligibility.reasons,
+          route_reason: selectedRoute.reason,
           activeViolationCount: accountViolations.length,
         },
       });
 
-      if (eligibility.canAutoRefund) {
-        const autoProtocol = generateRefundProtocol(ticket.id, order.key);
-        await updateComponentMessage(interaction,
-          v2Message([
-            {
-              type: COMPONENT_TYPE.CONTAINER,
-              accent_color: 0x2ecc71,
-              components: [
-                textDisplay(`Compra confirmada. O reembolso esta sendo processado automaticamente.\n\n**Protocolo: ${autoProtocol}**`),
-              ],
-            },
-          ]),
-          correlationId,
-        );
-        let refundResult = null;
-        try {
-          refundResult = await callInternalSalesRefund(
-            order.id,
-            ticket.guild_id,
-            `Reembolso automatico FlowAI — protocolo ${autoProtocol}`,
-          );
-        } catch (refundError) {
-          // Auto-process falhou — escalar para revisao manual em vez de deixar sem resposta
-          const fallbackProtocol = generateRefundProtocol(ticket.id, order.key);
-          await sendManualApprovalRequest({
-            client,
-            ticket,
-            order,
-            settings,
-            reason: `Auto-reembolso falhou: ${String(refundError?.message || refundError).slice(0, 300)}`,
-            allowedMentions: { parse: [] },
-            eligibility,
-            protocol: fallbackProtocol,
-          });
-          await interaction.followUp({
-            content: `Nao consegui processar automaticamente agora. Escalei para a equipe com o protocolo **${fallbackProtocol}**. Em breve voce recebera uma resposta aqui.`,
-            allowedMentions: { parse: [] },
-          });
-
-          const historyRows = await fetchRecentAiMessages(ticket.id);
-          const previousState = readRefundMemory(historyRows);
-          await persistRefundStateDirectly(ticket, previousState, { stage: "manual_review" });
-
-          await logRefundAuditEvent({
-            ticket,
-            authUserId: authUser.id,
-            orderKey: order.key,
-            riskScore: eligibility.riskScore,
-            eventType: "auto_refund_fallback_to_manual",
-            outcome: "manual_review",
-            metadata: { protocol: fallbackProtocol, error: String(refundError?.message || refundError).slice(0, 300) },
-          });
-          return true;
-        }
-        if (refundResult?.alreadyRefunded) {
-          await sendInteractionNotice(interaction, {
-            content: "Este pedido ja consta como reembolsado no sistema do provedor de pagamento.",
-            allowedMentions: { parse: [] },
-          }, correlationId);
-        } else {
-          const successContent = buildRefundSuccessContent({ settings, order, protocol: autoProtocol });
-          await sendInteractionNotice(interaction, {
-            content: successContent,
-            allowedMentions: { parse: [] },
-          }, correlationId);
-          const dmQueue = await enqueueRefundDirectMessage({
-            ticket,
-            order,
-            protocol: autoProtocol,
-            kind: "processed",
-            content: successContent,
-          });
-          if (dmQueue.queued) {
-            void processDirectMessageQueue(client, { notificationKey: dmQueue.notificationKey }).catch((error) => {
-              console.warn("[ticket-refund] falha ao processar DM imediata de auto-reembolso:", error?.message || error);
-            });
-          }
-          await sendRefundProcessedEmail({
-            discordUserId: ticket.user_id,
-            refundProtocol: autoProtocol,
-            productTitle: order.productTitle,
-            amountLabel: formatMoney(order.amount, order.currency),
-          });
-        }
-
-        // Enviar log informativo no canal de aprovação manual configurado
-        await sendAutoRefundInfoLog({
-          client,
-          ticket,
-          order,
-          settings,
-          protocol: autoProtocol,
-          eligibility,
-        }).catch((err) => console.error("[ticket-refund] Erro ao enviar log informativo do auto-reembolso:", err));
-
-        const historyRows = await fetchRecentAiMessages(ticket.id);
-        const previousState = readRefundMemory(historyRows);
-        await persistRefundStateDirectly(ticket, previousState, { stage: refundResult?.alreadyRefunded ? "completed" : "completed" });
-
-        await logRefundAuditEvent({
-          ticket,
-          authUserId: authUser.id,
-          orderKey: order.key,
-          riskScore: eligibility.riskScore,
-          eventType: "refund_processed",
-          outcome: refundResult?.alreadyRefunded ? "already_refunded" : "success",
-          correlationId,
-          metadata: {
-            protocol: autoProtocol,
-            responsible_user: "system",
-            action_time: new Date().toISOString(),
-            method: "automatic",
-            decision_reason: "Aprovado e processado automaticamente pelo FlowAI (dentro do prazo limite).",
-            transaction_id: order.providerPaymentId || null,
-            final_status: refundResult?.alreadyRefunded ? "already_refunded" : "refunded",
-          },
-        });
-        return true;
-      }
-
-      // Warn user if outside refund window and ask for confirmation
-      if (!eligibility.insideWindow) {
-        await updateComponentMessage(interaction,
-          v2Message([
-            {
-              type: COMPONENT_TYPE.CONTAINER,
-              accent_color: 0xe67e22,
-              components: [
-                textDisplay(
-                  `⚠️ **Aviso de Prazo Expirado**\n\nIdentifiquei que esta compra (${order.productTitle}) foi realizada em **${formatDate(resolvePurchaseDate(order))}**.\nO prazo limite para reembolso configurado no servidor e de **${eligibility.refundDays} dias** (expirou em **${formatDate(eligibility.deadline)}**).\n\nMesmo assim, voce deseja prosseguir e abrir um chamado para a equipe analisar o seu caso manualmente?`
-                ),
-              ],
-            },
-            actionRow([
-              button({
-                customId: `${REFUND_PREFIX}confirm_expired:${ticket.id}:${order.key}`,
-                label: "Sim, abrir chamado",
-                style: ButtonStyle.Danger,
-              }),
-              button({
-                customId: `${REFUND_PREFIX}cancel_expired:${ticket.id}:${order.key}`,
-                label: "Nao, cancelar",
-                style: ButtonStyle.Secondary,
-              }),
-            ]),
-          ]),
-          correlationId,
-        );
-        return true;
-      }
-
-      const refundProtocol = generateRefundProtocol(ticket.id, order.key);
-
-      await updateComponentMessage(interaction,
-        v2Message([
-          {
-            type: COMPONENT_TYPE.CONTAINER,
-            accent_color: 0xf1c40f,
-            components: [
-              textDisplay(
-                `Compra confirmada. A solicitacao foi enviada para analise da equipe responsavel.\n\n**Protocolo: ${refundProtocol}**\nGuarde este numero — ele identifica sua solicitacao e sera usado na comunicacao com a equipe.`
-              ),
-            ],
-          },
-        ]),
-        correlationId,
-      );
-
-      await sendManualApprovalRequest({
+      return await routeSelectedRefundRequest({
         client,
+        interaction,
         ticket,
         order,
         settings,
-        reason: "Solicitacao confirmada pelo comprador via FlowAI.",
-        allowedMentions: { parse: [] },
+        authUser,
         eligibility,
-        protocol: refundProtocol,
-      }).catch(err => {
-        console.error("[ticketRefundService] Falha ao enviar aprovacao manual para a equipe:", err);
+        correlationId,
       });
-
-      const historyRows = await fetchRecentAiMessages(ticket.id);
-      const previousState = readRefundMemory(historyRows);
-      await persistRefundStateDirectly(ticket, previousState, { stage: "manual_review" });
-
-      await logRefundAuditEvent({
-        ticket,
-        authUserId: authUser.id,
-        orderKey: order.key,
-        riskScore: eligibility.riskScore,
-        eventType: "manual_review_opened",
-        outcome: "awaiting_staff",
-        metadata: { protocol: refundProtocol, insideWindow: eligibility.insideWindow, reasons: eligibility.reasons },
-      });
-      return true;
     } finally {
       pendingRefundActions.delete(lockKey);
     }
@@ -3457,264 +4074,16 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
       return true;
     }
 
-    if (action === "deny") {
-      await interaction.update({
-        content: `Reembolso negado por <@${interaction.user.id}> para a compra **${order.productTitle}**.`,
-        embeds: interaction.message.embeds,
-        components: [
-          new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-              .setCustomId(`${REFUND_PREFIX}approve:${ticket.id}:${order.key}`)
-              .setLabel("Aprovar mesmo assim (Reverter negação)")
-              .setStyle(ButtonStyle.Success)
-          ),
-        ],
-        allowedMentions: { parse: [] },
-      });
-      const channel = await client.channels.fetch(ticket.channel_id).catch(() => null);
-      await channel?.send?.({
-        content:
-          "A equipe analisou a solicitacao de reembolso e ela foi negada neste momento. Caso precise de mais detalhes, responda neste ticket.",
-        allowedMentions: { parse: [] },
-      });
-      await logRefundAuditEvent({
-        ticket,
-        orderKey: order.key,
-        eventType: "manual_refund_denied",
-        outcome: "denied",
-        metadata: {
-          responsible_user: interaction.user.id,
-          action_time: new Date().toISOString(),
-          method: "manual",
-          decision_reason: "Reembolso recusado manualmente pela equipe de moderacao.",
-          transaction_id: order.providerPaymentId || null,
-          final_status: "denied",
-          decidedBy: interaction.user.id,
-        },
-      });
-      return true;
-    }
-
-    if (order.source !== "sales") {
-      await interaction.reply({
-        content:
-          "Este pedido pertence ao financeiro da plataforma e precisa ser reembolsado pelo painel administrativo de pagamentos.",
-        ephemeral: true,
-      });
-      return true;
-    }
-
-    // Lock de concorrência local
-    const lockKey = `${ticket.id}:${order.key}`;
-    if (pendingRefundActions.has(lockKey)) {
-      await interaction.reply({
-        content: "Este reembolso ja esta sendo processado.",
-        ephemeral: true,
-      });
-      return true;
-    }
-    pendingRefundActions.add(lockKey);
-    let manualProtocol = null;
-    let finalOrderForFallback = order;
-    let successContentForFallback = null;
-    let financialCompleted = false;
-    try {
-      await acknowledgeComponent(interaction, correlationId);
-      manualProtocol = generateRefundProtocol(ticket.id, order.key);
-      let refundResult = null;
-      let finalOrder = order;
-      let recoveredFromUncertainError = false;
-      try {
-        refundResult = await callInternalSalesRefund(order.id, ticket.guild_id, `Aprovado manualmente por ${interaction.user.id} — protocolo ${manualProtocol}.`);
-        financialCompleted = true;
-      } catch (financialError) {
-        const reconciliation = await confirmRefundAfterUncertainError({
-          ticket,
-          order,
-          authUserId: authUser?.id,
-          error: financialError,
-        });
-        if (reconciliation.confirmed) {
-          finalOrder = reconciliation.order || order;
-          refundResult = {
-            ok: true,
-            alreadyRefunded: true,
-            reconciledAfterError: true,
-            reconciliationReason: reconciliation.reason,
-          };
-          recoveredFromUncertainError = true;
-          financialCompleted = true;
-          await logRefundAuditEvent({
-            ticket,
-            orderKey: order.key,
-            eventType: "manual_refund_financial_reconciled",
-            outcome: "processed_after_uncertain_provider_error",
-            correlationId,
-            metadata: {
-              responsible_user: interaction.user.id,
-              action_time: new Date().toISOString(),
-              method: "manual",
-              transaction_id: order.providerPaymentId || null,
-              final_status: "refunded",
-              decidedBy: interaction.user.id,
-              provider_error: normalizeText(financialError.message, 300),
-              reconciliation_reason: reconciliation.reason,
-            },
-          });
-        } else {
-        await sendInteractionNotice(interaction, {
-          content: `Ainda nao consegui confirmar o estorno financeiro: ${normalizeText(financialError.message, 300)}. Nao aprove novamente agora; deixei registrado para reconciliacao e auditoria.`,
-          ephemeral: true,
-        }, correlationId);
-        await logRefundAuditEvent({
-          ticket,
-          orderKey: order.key,
-          eventType: "manual_refund_financial_uncertain",
-          outcome: "needs_reconciliation",
-          correlationId,
-          metadata: {
-            responsible_user: interaction.user.id,
-            action_time: new Date().toISOString(),
-            method: "manual",
-            transaction_id: order.providerPaymentId || null,
-            final_status: "provider_result_uncertain",
-            decidedBy: interaction.user.id,
-            message: normalizeText(financialError.message, 300),
-            reconciliation_reason: reconciliation.reason,
-          },
-        });
-        return true;
-        }
-      }
-      finalOrderForFallback = finalOrder;
-      const approvalUpdate = await updateComponentMessage(interaction, {
-        content: `Reembolso aprovado e processado por <@${interaction.user.id}> para a compra **${order.productTitle}** — Protocolo: \`${manualProtocol}\``,
-        embeds: interaction.message.embeds,
-        components: [],
-        allowedMentions: { parse: [] },
-      }, correlationId);
-      const successContent = buildRefundSuccessContent({ settings, order: finalOrder, protocol: manualProtocol });
-      successContentForFallback = successContent;
-      const ticketNotice = await sendRefundTicketConfirmation({
-        client,
-        interaction,
-        ticket,
-        content: successContent,
-      });
-      const dmQueue = await enqueueRefundDirectMessage({
-        ticket,
-        order: finalOrder,
-        protocol: manualProtocol,
-        kind: "processed",
-        content: successContent,
-      });
-      if (dmQueue.queued) {
-        void processDirectMessageQueue(client, { notificationKey: dmQueue.notificationKey }).catch((error) => {
-          console.warn("[ticket-refund] falha ao processar DM imediata de reembolso manual:", error?.message || error);
-        });
-      }
-      const emailNotice = await sendRefundProcessedEmail({
-        discordUserId: ticket.user_id,
-        refundProtocol: manualProtocol,
-        productTitle: finalOrder.productTitle,
-        amountLabel: formatMoney(finalOrder.amount, finalOrder.currency),
-      });
-      await logRefundAuditEvent({
-        ticket,
-        orderKey: order.key,
-        eventType: "manual_refund_approved",
-        outcome: refundResult?.alreadyRefunded ? "already_refunded" : "processed",
-        correlationId,
-        metadata: {
-          responsible_user: interaction.user.id,
-          action_time: new Date().toISOString(),
-          method: "manual",
-          decision_reason: "Reembolso aprovado manualmente pela equipe de moderacao.",
-          transaction_id: order.providerPaymentId || null,
-          final_status: refundResult?.alreadyRefunded ? "already_refunded" : "refunded",
-          decidedBy: interaction.user.id,
-          recovered_from_uncertain_provider_error: recoveredFromUncertainError,
-          protocol: manualProtocol,
-          discord_approval_message_updated: approvalUpdate.ok,
-          discord_ticket_confirmation_sent: ticketNotice?.ok === true,
-          discord_ticket_confirmation_error: ticketNotice?.ok === false ? serializeDiscordError(ticketNotice.error) : null,
-          email_confirmation_sent: emailNotice?.sent === true,
-          email_confirmation_error: emailNotice?.sent === false ? normalizeText(emailNotice.reason || emailNotice.error?.message || "", 180) : null,
-        },
-      });
-      return true;
-    } catch (error) {
-      if (financialCompleted) {
-        const fallbackContent =
-          successContentForFallback ||
-          buildRefundSuccessContent({
-            settings,
-            order: finalOrderForFallback,
-            protocol: manualProtocol || generateRefundProtocol(ticket.id, order.key),
-          });
-        const fallbackTicketNotice = await sendRefundTicketConfirmation({
-          client,
-          interaction,
-          ticket,
-          content: fallbackContent,
-        });
-        const fallbackEmailNotice = await sendRefundProcessedEmail({
-          discordUserId: ticket.user_id,
-          refundProtocol: manualProtocol || "reembolso-aprovado",
-          productTitle: finalOrderForFallback.productTitle,
-          amountLabel: formatMoney(finalOrderForFallback.amount, finalOrderForFallback.currency),
-        });
-        await logRefundAuditEvent({
-          ticket,
-          orderKey: order.key,
-          eventType: "manual_refund_notification_recovered",
-          outcome: "financial_success_notification_retried",
-          correlationId,
-          metadata: {
-            responsible_user: interaction.user.id,
-            action_time: new Date().toISOString(),
-            method: "manual",
-            transaction_id: order.providerPaymentId || null,
-            final_status: "refunded",
-            decidedBy: interaction.user.id,
-            original_error: normalizeText(error.message, 300),
-            fallback_ticket_confirmation_sent: fallbackTicketNotice.ok,
-            fallback_email_confirmation_sent: fallbackEmailNotice?.sent === true,
-          },
-        });
-        await sendInteractionNotice(interaction, {
-          content:
-            fallbackTicketNotice.ok || fallbackEmailNotice?.sent === true
-              ? "Reembolso financeiro confirmado. Reenviei a confirmacao no ticket/email."
-              : "Reembolso financeiro confirmado. Nao consegui reenviar a confirmacao agora, mas o evento ficou registrado para auditoria.",
-          ephemeral: true,
-        }, correlationId);
-        return true;
-      }
-      await sendInteractionNotice(interaction, {
-        content: "O reembolso financeiro foi tratado, mas houve falha em uma etapa de notificacao. O evento foi registrado para retry/auditoria.",
-        ephemeral: true,
-      }, correlationId);
-      await logRefundAuditEvent({
-        ticket,
-        orderKey: order.key,
-        eventType: "manual_refund_post_process_partial_failure",
-        outcome: "partial_failure",
-        correlationId,
-        metadata: {
-          responsible_user: interaction.user.id,
-          action_time: new Date().toISOString(),
-          method: "manual",
-          transaction_id: order.providerPaymentId || null,
-          final_status: "discord_or_audit_partial_failure",
-          decidedBy: interaction.user.id,
-          message: normalizeText(error.message, 300),
-        },
-      });
-      return true;
-    } finally {
-      pendingRefundActions.delete(lockKey);
-    }
+    return await handleRefundStaffDecision({
+      client,
+      interaction,
+      ticket,
+      order,
+      settings,
+      runtime,
+      action,
+      correlationId,
+    });
   }
 
   return false;
@@ -3780,11 +4149,7 @@ async function handleOrderInfoLookupMessage({ message, ticket, historyRows, cont
       lastPromptAt: nowIso(),
       lastActionAt: nowIso(),
     });
-    await message.reply({
-      content: "Consultei esse pedido para o Discord deste ticket. Aqui esta um resumo seguro:",
-      embeds: [buildSafeOrderInfoEmbed(order)],
-      allowedMentions: { parse: [] },
-    });
+    await message.reply(buildRefundOrderInfoPayload(order));
     await logRefundAuditEvent({
       ticket,
       authUserId: authUser?.id,
