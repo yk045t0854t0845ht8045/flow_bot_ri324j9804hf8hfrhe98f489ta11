@@ -1355,12 +1355,12 @@ async function startLoginPolling({ client, ticket, linkId, authMessage, persist,
 
       const link = await readTicketRefundAuthLink(linkId);
       let authUser = null;
-      
+
       // O login so e considerado confirmado se o link seguro gerado para esta sessao foi expressamente logado e confirmado!
       if (link?.status === "confirmed" && link.auth_user_id) {
         authUser = await getAuthUserById(link.auth_user_id);
       }
-      
+
       if (!authUser) return;
 
       clearInterval(interval);
@@ -2061,6 +2061,13 @@ async function callInternalSalesRefund(cartId, guildId, reason) {
     signal: AbortSignal.timeout?.(45_000),
   });
   const payload = await response.json().catch(() => null);
+  if (payload?.financialRefunded === true || payload?.alreadyRefunded === true) {
+    return {
+      ...payload,
+      ok: true,
+      recoveredFromHttpError: !response.ok || payload?.ok === false,
+    };
+  }
   if (!response.ok || payload?.ok === false) {
     const error = new Error(payload?.message || `Falha HTTP ${response.status} ao reembolsar.`);
     error.status = response.status;
@@ -2071,10 +2078,14 @@ async function callInternalSalesRefund(cartId, guildId, reason) {
 }
 
 function isProviderCommunicationUncertainty(error) {
+  if (Number(error?.status || 0) >= 500) return true;
   const message = normalizeIntentText(
     `${error?.message || ""} ${error?.payload?.message || ""} ${error?.payload?.error || ""}`,
   );
   return includesAny(message, [
+    "erro interno ao processar reembolso",
+    "erro interno",
+    "internal server error",
     "communication error",
     "communication_error",
     "timeout",
@@ -2107,13 +2118,13 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function confirmRefundAfterUncertainError({ ticket, order, authUserId, error, attempts = 4 }) {
+async function confirmRefundAfterUncertainError({ ticket, order, authUserId, error, attempts = 12 }) {
   if (!isProviderCommunicationUncertainty(error)) {
     return { confirmed: false, order: null, reason: "not_recoverable_error" };
   }
 
   for (let index = 0; index < attempts; index += 1) {
-    if (index > 0) await delay(1200 * index);
+    if (index > 0) await delay(Math.min(5000, 900 * index));
     const refreshedOrder = await getOrderByKey(ticket.guild_id, order.key, {
       authUserId,
       discordUserId: ticket.user_id,
@@ -2588,6 +2599,19 @@ async function executeRefundProcessing({
   });
 
   const postFailures = [];
+  const postWarnings = [];
+  if (refundResult?.persistenceCompleted === false) {
+    postWarnings.push({
+      step: "cart_persistence",
+      error: normalizeText(refundResult.persistenceError || "Estorno confirmado, mas persistencia local incompleta.", 500),
+    });
+  }
+  if (refundResult?.eventLogged === false) {
+    postWarnings.push({
+      step: "sales_order_event",
+      error: normalizeText(refundResult.eventError || "Estorno confirmado, mas auditoria da venda nao foi gravada.", 500),
+    });
+  }
   const ticketNotice = await sendRefundTicketConfirmation({
     client,
     interaction,
@@ -2621,6 +2645,8 @@ async function executeRefundProcessing({
 
   const emailNotice = await sendRefundProcessedEmail({
     discordUserId: ticket.user_id,
+    authUserId: finalOrder.authUserId || authUserId,
+    toEmail: finalOrder.raw?.customer_email || null,
     refundProtocol: protocol,
     productTitle: finalOrder.productTitle,
     amountLabel: formatMoney(finalOrder.amount, finalOrder.currency),
@@ -2632,21 +2658,6 @@ async function executeRefundProcessing({
     });
   }
 
-  const requestFinalPayload = postFailures.length
-    ? buildRefundV2Payload({
-        title: "Reembolso financeiro confirmado",
-        tone: "warning",
-        message: [
-          "O estorno financeiro foi confirmado, mas uma ou mais etapas de comunicacao precisam de reconciliacao.",
-          "",
-          `**Protocolo:** \`${protocol}\``,
-          `**Compra:** ${finalOrder.productTitle}`,
-          "",
-          "O evento foi registrado para auditoria e retry operacional.",
-        ].join("\n"),
-      })
-    : successPayload;
-
   const finalPayload =
     updateMode === "staff"
       ? buildRefundStaffReviewPayload({
@@ -2656,13 +2667,11 @@ async function executeRefundProcessing({
           reason,
           eligibility,
           protocol,
-          state: postFailures.length ? "partial" : "approved",
+          state: "approved",
           decidedBy: actorUserId,
-          errorMessage: postFailures.length
-            ? "O estorno foi confirmado, mas uma ou mais notificacoes precisam de reconciliacao."
-            : "",
+          errorMessage: "",
         })
-      : requestFinalPayload;
+      : successPayload;
 
   let finalUpdate = { ok: true };
   if (interaction) {
@@ -2675,9 +2684,8 @@ async function executeRefundProcessing({
     }
   }
 
-  const completed = postFailures.length === 0;
   await persistRefundStateDirectly(ticket, {}, {
-    stage: completed ? "completed" : "post_process_failed",
+    stage: "completed",
     selectedOrderKey: order.key,
   });
 
@@ -2689,9 +2697,9 @@ async function executeRefundProcessing({
     eventType: method === "automatic" ? "auto_refund_processed" : "manual_refund_approved",
     outcome: refundResult?.alreadyRefunded
       ? "already_refunded"
-      : completed
+      : postFailures.length === 0 && postWarnings.length === 0
         ? "processed"
-        : "post_process_partial_failure",
+        : "processed_with_postprocess_warnings",
     correlationId,
     metadata: {
       protocol,
@@ -2706,15 +2714,17 @@ async function executeRefundProcessing({
       email_confirmation_sent: emailNotice?.sent === true,
       discord_component_updated: finalUpdate.ok === true,
       post_failures: postFailures,
+      post_warnings: postWarnings,
     },
   });
 
   return {
-    ok: completed,
+    ok: true,
     financialCompleted: true,
     refundResult,
     finalOrder,
     postFailures,
+    postWarnings,
   };
 }
 
@@ -3122,7 +3132,7 @@ async function answerContextualMessage({ message, persist, state, kind, content,
 
 async function handleRefundProtocolQuery({ message, client, ticket, protocolCode, persist }) {
   const searchProtocol = String(protocolCode || "").trim().toUpperCase();
-  
+
   const searchingMsg = await message.reply({
     content: `Certo! Identifiquei o protocolo **\`${searchProtocol}\`**. Vou consultar os detalhes da solicitação de reembolso no nosso banco de dados, só um instante... 🔍`,
     allowedMentions: { parse: [] },
@@ -3170,9 +3180,9 @@ async function handleRefundProtocolQuery({ message, client, ticket, protocolCode
     const outcome = String(latestEvent.outcome || "").toLowerCase();
 
     if (
-      eventType.includes("approved") || 
-      eventType.includes("processed") || 
-      outcome === "success" || 
+      eventType.includes("approved") ||
+      eventType.includes("processed") ||
+      outcome === "success" ||
       outcome === "processed"
     ) {
       statusText = "Aprovado e Processado com Sucesso";
@@ -3223,7 +3233,7 @@ async function handleRefundProtocolQuery({ message, client, ticket, protocolCode
     if (statusText.includes("Aprovado")) {
       newStage = "completed";
     }
-    
+
     const historyRows = await fetchRecentAiMessages(ticket.id);
     const previousState = readRefundMemory(historyRows);
     await persistRefundStateDirectly(ticket, previousState, { stage: newStage });

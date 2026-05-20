@@ -1412,6 +1412,19 @@ async function getAuthUserContactByDiscordUserId(discordUserId) {
   return unwrap(result, "getAuthUserContactByDiscordUserId") || null;
 }
 
+async function getAuthUserContactById(authUserId) {
+  const normalizedAuthUserId = Number(authUserId);
+  if (!Number.isFinite(normalizedAuthUserId) || normalizedAuthUserId <= 0) return null;
+
+  const result = await supabase
+    .from("auth_users")
+    .select("id, discord_user_id, email, display_name, username")
+    .eq("id", normalizedAuthUserId)
+    .maybeSingle();
+
+  return unwrap(result, "getAuthUserContactById") || null;
+}
+
 async function getApprovedPaymentOrdersForGuildIds(guildIds) {
   const uniqueGuildIds = [...new Set((guildIds || []).filter(Boolean))];
   if (!uniqueGuildIds.length) {
@@ -1684,6 +1697,7 @@ module.exports = {
   getAllOpenTickets,
   getTicketTranscriptByProtocol,
   getGuildWelcomeSettings,
+  getAuthUserContactById,
   getAuthUserContactByDiscordUserId,
   claimTicket,
   closeTicket,

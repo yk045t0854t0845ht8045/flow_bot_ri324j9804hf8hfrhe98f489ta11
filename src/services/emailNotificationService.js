@@ -1,5 +1,8 @@
 const nodemailer = require("nodemailer");
-const { getAuthUserContactByDiscordUserId } = require("./supabaseService");
+const {
+  getAuthUserContactByDiscordUserId,
+  getAuthUserContactById,
+} = require("./supabaseService");
 
 let cachedTransporter = null;
 let cachedTransporterKey = null;
@@ -215,7 +218,20 @@ async function sendSupportTicketOpenedEmail(input) {
 
 async function sendRefundProcessedEmail(input) {
   try {
-    const contact = await getAuthUserContactByDiscordUserId(input.discordUserId);
+    let contact = null;
+    const directEmail = String(input.toEmail || "").trim().toLowerCase();
+    if (isValidEmail(directEmail)) {
+      contact = {
+        id: input.authUserId || null,
+        email: directEmail,
+      };
+    }
+    if (!contact && input.authUserId) {
+      contact = await getAuthUserContactById(input.authUserId);
+    }
+    if (!contact && input.discordUserId) {
+      contact = await getAuthUserContactByDiscordUserId(input.discordUserId);
+    }
     if (!contact || !isValidEmail(contact.email)) return { sent: false, reason: "missing_email" };
 
     const resolved = getTransporter();
