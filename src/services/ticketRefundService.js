@@ -17,6 +17,7 @@ const supabase = createClient(env.supabaseUrl, env.supabaseServiceRoleKey, {
 });
 
 const REFUND_PREFIX = "ticket:refund:";
+const DEFAULT_OFFICIAL_SUPPORT_GUILD_ID = "1353259338759671838";
 const DEFAULT_REFUND_DAYS = 7;
 const ORDER_LOOKUP_TIMEOUT_MS = 12_000;
 const REFUND_CONTEXT_TTL_MS = 1000 * 60 * 60;
@@ -40,6 +41,12 @@ const COMPONENT_TYPE = {
 const pendingRefundActions = new Set();
 const activeLoginPollers = new Map();
 const lookupBuckets = new Map();
+
+function isOfficialSupportGuild(guildId) {
+  const configuredOfficialGuildId =
+    String(env.officialSupportGuildId || "").trim() || DEFAULT_OFFICIAL_SUPPORT_GUILD_ID;
+  return String(guildId || "").trim() === configuredOfficialGuildId;
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -846,6 +853,7 @@ function buildOrderTokens(order) {
     raw.provider_payment_id,
     raw.provider_external_reference,
     raw.checkout_token_hash,
+    raw.plan_code,
     raw.id,
   ]
     .map((value) => normalizeLookupToken(value))
@@ -1568,6 +1576,38 @@ function toUnifiedPaymentOrder(order, events = []) {
 }
 
 async function findMatchingOrders({ guildId, authUserId, discordUserId, orderCandidates }) {
+  if (isOfficialSupportGuild(guildId)) {
+    if (!authUserId) return [];
+
+    const orderResult = await supabase
+      .from("payment_orders")
+      .select("*")
+      .eq("user_id", authUserId)
+      .order("created_at", { ascending: false })
+      .limit(500);
+
+    if (orderResult.error) {
+      console.warn("[ticket-refund] falha ao consultar historico de pagamentos:", orderResult.error.message);
+      return [];
+    }
+
+    const paymentOrders = orderResult.data || [];
+    const eventsByOrder = await fetchPaymentEvents(paymentOrders.map((order) => order.id));
+
+    return paymentOrders
+      .map((order) => toUnifiedPaymentOrder(order, eventsByOrder.get(order.id) || []))
+      .map((order) => ({
+        ...order,
+        matchScore: scoreOrderMatch(order, orderCandidates),
+      }))
+      .filter((order) => order.matchScore > 0)
+      .sort((left, right) => {
+        if (right.matchScore !== left.matchScore) return right.matchScore - left.matchScore;
+        return parseTimestampMs(resolvePurchaseDate(right)) - parseTimestampMs(resolvePurchaseDate(left));
+      })
+      .slice(0, 10);
+  }
+
   const cartRows = new Map();
 
   if (authUserId) {
@@ -1627,6 +1667,31 @@ async function findMatchingOrders({ guildId, authUserId, discordUserId, orderCan
 }
 
 async function findAnyMatchingSalesOrders({ guildId, orderCandidates }) {
+  if (isOfficialSupportGuild(guildId)) {
+    const orderResult = await supabase
+      .from("payment_orders")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(500);
+
+    if (orderResult.error) {
+      console.warn("[ticket-refund] falha ao consultar historico global de pagamentos:", orderResult.error.message);
+      return [];
+    }
+
+    const paymentOrders = orderResult.data || [];
+    const eventsByOrder = await fetchPaymentEvents(paymentOrders.map((order) => order.id));
+    return paymentOrders
+      .map((order) => toUnifiedPaymentOrder(order, eventsByOrder.get(order.id) || []))
+      .map((order) => ({
+        ...order,
+        matchScore: scoreOrderMatch(order, orderCandidates),
+      }))
+      .filter((order) => order.matchScore >= 48)
+      .sort((left, right) => right.matchScore - left.matchScore)
+      .slice(0, 3);
+  }
+
   const cartResult = await supabase
     .from("guild_sales_carts")
     .select("*")
@@ -1697,6 +1762,28 @@ function isOrderOwnedByTicketContext(order, context = {}) {
 }
 
 async function listUserRecentOrders({ guildId, authUserId, discordUserId }) {
+  if (isOfficialSupportGuild(guildId)) {
+    if (!authUserId) return [];
+
+    const orderResult = await supabase
+      .from("payment_orders")
+      .select("*")
+      .eq("user_id", authUserId)
+      .order("created_at", { ascending: false })
+      .limit(500);
+
+    if (orderResult.error) {
+      console.warn("[ticket-refund] falha ao listar historico de pagamentos:", orderResult.error.message);
+      return [];
+    }
+
+    const paymentOrders = orderResult.data || [];
+    const eventsByOrder = await fetchPaymentEvents(paymentOrders.map((order) => order.id));
+    return paymentOrders.map((order) =>
+      toUnifiedPaymentOrder(order, eventsByOrder.get(order.id) || []),
+    );
+  }
+
   const cartRows = new Map();
 
   if (authUserId) {
@@ -1748,6 +1835,27 @@ async function listUserRecentOrders({ guildId, authUserId, discordUserId }) {
 async function getOrderByKey(guildId, orderKey, options = {}) {
   const parsed = decodeOrderKey(orderKey);
   if (!parsed) return null;
+
+  if (parsed.source === "payment") {
+    if (!isOfficialSupportGuild(guildId)) return null;
+
+    const orderResult = await supabase
+      .from("payment_orders")
+      .select("*")
+      .eq("id", parsed.id)
+      .maybeSingle();
+    if (orderResult.error || !orderResult.data) return null;
+    const order = orderResult.data;
+    if (
+      options.authUserId &&
+      order.user_id &&
+      Number(order.user_id) !== Number(options.authUserId)
+    ) {
+      return null;
+    }
+    const eventsByOrder = await fetchPaymentEvents([order.id]);
+    return toUnifiedPaymentOrder(order, eventsByOrder.get(order.id) || []);
+  }
 
   if (parsed.source === "sales") {
     const cartResult = await supabase
@@ -1814,17 +1922,21 @@ function evaluateRefundEligibility(order, settings, context = {}) {
     providerDetail.includes("refund") ||
     providerDetail.includes("chargeback") ||
     providerDetail.includes("reembols");
+  const isSalesOrder = order.source === "sales";
+  const isPaymentOrder = order.source === "payment";
   const paid =
     order.source === "sales"
       ? ["paid", "delivered", "delivery_failed"].includes(status)
-      : ["approved", "settled"].includes(status) || providerStatus === "approved";
+      : ["approved", "settled"].includes(status) ||
+        providerStatus === "approved" ||
+        providerDetail === "accredited";
   const hasProviderPayment = Boolean(order.providerPaymentId);
   const ownershipOk =
     context.authUserId && order.authUserId
       ? Number(context.authUserId) === Number(order.authUserId)
-      : order.source === "sales" && context.discordUserId && order.discordUserId === context.discordUserId;
+      : isSalesOrder && context.discordUserId && order.discordUserId === context.discordUserId;
   const deliveredOrConsumed =
-    order.source === "sales" &&
+    isSalesOrder &&
     (order.deliveries?.length > 0 || ["delivered", "delivery_failed"].includes(status));
   const previousRefundEvents = countRefundEvents(order.events);
   const discountSnapshot = order.raw?.discount_snapshot || order.raw?.provider_payload?.discount || null;
@@ -1859,7 +1971,7 @@ function evaluateRefundEligibility(order, settings, context = {}) {
   if (repeatedLookups) reasons.push("repeated_lookup_attempts");
   if (accountViolations.length > 0) reasons.push("active_account_violations");
   if (financialViolation) reasons.push("financial_risk_violation");
-  if (order.source !== "sales") reasons.push("payment_order_requires_financial_review");
+  if (!isSalesOrder && !isPaymentOrder) reasons.push("unsupported_order_source");
 
   let riskScore = 0;
   if (!ownershipOk) riskScore += 45;
@@ -1873,7 +1985,7 @@ function evaluateRefundEligibility(order, settings, context = {}) {
   if (repeatedLookups) riskScore += 12;
   if (accountViolations.length > 0) riskScore += 20;
   if (financialViolation) riskScore += 35;
-  if (order.source !== "sales") riskScore += 20;
+  if (!isSalesOrder && !isPaymentOrder) riskScore += 20;
   riskScore = Math.min(100, riskScore);
 
   const validationsComplete =
@@ -1889,7 +2001,7 @@ function evaluateRefundEligibility(order, settings, context = {}) {
     hasProviderPayment &&
     !alreadyRefunded &&
     previousRefundEvents === 0 &&
-    order.source === "sales";
+    (isSalesOrder || isPaymentOrder);
 
   const eligible = financiallyRefundable && insideWindow;
   const persistedManualRequired = settings.manualApprovalRequired === true;
@@ -2070,6 +2182,42 @@ async function callInternalSalesRefund(cartId, guildId, reason) {
   }
   if (!response.ok || payload?.ok === false) {
     const error = new Error(payload?.message || `Falha HTTP ${response.status} ao reembolsar.`);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
+  }
+  return payload;
+}
+
+async function callInternalPaymentRefund(orderId, reason) {
+  const endpoint =
+    env.paymentsInternalRefundApiUrl ||
+    `${String(env.appUrl || "").replace(/\/+$/, "")}/api/internal/payments/refund`;
+  if (!endpoint || !env.salesInternalApiToken) {
+    throw new Error("API interna de reembolso de pagamentos nao configurada.");
+  }
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${env.salesInternalApiToken}`,
+      "x-flowdesk-internal-token": env.salesInternalApiToken,
+      "x-payments-internal-token": env.salesInternalApiToken,
+    },
+    body: JSON.stringify({ orderId, reason }),
+    signal: AbortSignal.timeout?.(45_000),
+  });
+  const payload = await response.json().catch(() => null);
+  if (payload?.financialRefunded === true || payload?.alreadyRefunded === true) {
+    return {
+      ...payload,
+      ok: true,
+      recoveredFromHttpError: !response.ok || payload?.ok === false,
+    };
+  }
+  if (!response.ok || payload?.ok === false) {
+    const error = new Error(payload?.message || `Falha HTTP ${response.status} ao reembolsar pagamento.`);
     error.status = response.status;
     error.payload = payload;
     throw error;
@@ -2507,7 +2655,10 @@ async function executeRefundProcessing({
   });
 
   try {
-    refundResult = await callInternalSalesRefund(order.id, ticket.guild_id, reason);
+    refundResult =
+      order.source === "payment"
+        ? await callInternalPaymentRefund(order.id, reason)
+        : await callInternalSalesRefund(order.id, ticket.guild_id, reason);
   } catch (financialError) {
     const reconciliation = await confirmRefundAfterUncertainError({
       ticket,
@@ -2967,15 +3118,6 @@ async function handleRefundStaffDecision({
         protocol,
         dm_notification_queued: dmQueue.queued === true,
       },
-    });
-    return true;
-  }
-
-  if (order.source !== "sales") {
-    await interaction.reply({
-      content:
-        "Este pedido pertence ao financeiro da plataforma e precisa ser reembolsado pelo painel administrativo de pagamentos.",
-      ephemeral: true,
     });
     return true;
   }

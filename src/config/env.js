@@ -209,7 +209,17 @@ const env = {
         DEFAULT_PUBLIC_APP_URL,
       "/api/internal/sales/refund",
     ),
+  paymentsInternalRefundApiUrl:
+    optionalEnv("PAYMENTS_INTERNAL_REFUND_API_URL") ||
+    buildUrl(
+      process.env.NEXT_PUBLIC_APP_URL ||
+        process.env.APP_URL ||
+        process.env.SITE_URL ||
+        DEFAULT_PUBLIC_APP_URL,
+      "/api/internal/payments/refund",
+    ),
   salesInternalApiToken:
+    optionalEnv("PAYMENTS_INTERNAL_API_TOKEN") ||
     optionalEnv("SALES_INTERNAL_API_TOKEN") ||
     optionalEnv("FLOWAI_INTERNAL_API_TOKEN") ||
     optionalEnv("CRON_SECRET") ||
