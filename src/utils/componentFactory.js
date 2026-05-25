@@ -1167,8 +1167,13 @@ function buildTicketClosureDmPayload({
   accessCode,
   closedBy,
   transcriptAvailable = false,
+  transcriptReason = "insufficient_messages",
 }) {
   const formattedAccessCode = String(accessCode || "").trim();
+  const unavailableText =
+    transcriptReason === "generation_failed"
+      ? "por falha ao gerar o historico agora"
+      : "por falta de mensagens suficientes";
   const lines = [
     `### Ticket fechado ${formatTicketNumber(ticket?.id)}`,
     "",
@@ -1177,7 +1182,7 @@ function buildTicketClosureDmPayload({
     closedBy ? `-# Fechado por: <@${closedBy}>` : "",
     transcriptAvailable
       ? "O transcript deste atendimento esta protegido por senha."
-      : "O transcript deste atendimento ficou indisponivel por falta de mensagens suficientes.",
+      : `O transcript deste atendimento ficou indisponivel ${unavailableText}.`,
     transcriptAvailable && formattedAccessCode
       ? `**Codigo de acesso:** \`${formattedAccessCode}\``
       : "",

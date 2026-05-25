@@ -86,6 +86,10 @@ async function sendTicketClosedLog(
     "de fechamento",
   );
 
+  const transcriptUnavailableReason =
+    transcriptAccess?.reason === "generation_failed"
+      ? "indisponivel por falha ao gerar o historico"
+      : "indisponivel por falta de mensagens suficientes";
   const payload = buildLogPayload({
     accentColor: runtime.accentColor,
     title: "Ticket fechado",
@@ -98,7 +102,7 @@ async function sendTicketClosedLog(
       }`,
       `**Fechado por:** <@${closedBy}>`,
       transcriptAccess?.available === false
-        ? "**Transcript:** indisponivel por falta de mensagens suficientes"
+        ? `**Transcript:** ${transcriptUnavailableReason}`
         : `**Transcript:** protegido e disponivel no link abaixo`,
       `**Privado do cliente:** ${resolveDmStatusLabel(transcriptAccess?.dmStatus)}`,
       `**Status:** fechado`,

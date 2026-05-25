@@ -48,6 +48,7 @@ async function enqueueTicketClosureDirectMessage({
   transcriptAvailable,
   transcriptUrl,
   accessCode,
+  transcriptReason,
 }) {
   const notificationKey = buildTicketClosureNotificationKey(ticket.id);
   const formattedAccessCode = transcriptAvailable
@@ -63,6 +64,7 @@ async function enqueueTicketClosureDirectMessage({
     transcriptAvailable,
     transcriptUrl: transcriptAccessUrl,
     accessCode: formattedAccessCode,
+    transcriptReason,
   });
 
   const queueItem = await enqueueTicketDirectMessage({

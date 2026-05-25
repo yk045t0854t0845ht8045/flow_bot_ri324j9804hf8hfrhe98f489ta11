@@ -338,17 +338,24 @@ function resolveTicketClosureDmStatus(queueResults, notificationKey) {
   return matchedResult?.status || "queued";
 }
 
-function buildTicketClosureReplyMessage(transcriptAvailable, dmStatus) {
+function resolveTranscriptUnavailableText(reason) {
+  return reason === "generation_failed"
+    ? "por falha ao gerar o historico agora"
+    : "por falta de mensagens";
+}
+
+function buildTicketClosureReplyMessage(transcriptAvailable, dmStatus, transcriptReason) {
   if (!transcriptAvailable) {
+    const unavailableText = resolveTranscriptUnavailableText(transcriptReason);
     switch (dmStatus) {
       case "sent":
-        return "Ticket fechado. O transcript ficou indisponivel por falta de mensagens, mas o resumo com protocolo foi enviado no privado do solicitante.";
+        return `Ticket fechado. O transcript ficou indisponivel ${unavailableText}, mas o resumo com protocolo foi enviado no privado do solicitante.`;
       case "blocked":
-        return "Ticket fechado. O transcript ficou indisponivel por falta de mensagens, mas o solicitante nao pode receber privado do bot.";
+        return `Ticket fechado. O transcript ficou indisponivel ${unavailableText}, mas o solicitante nao pode receber privado do bot.`;
       case "failed":
-        return "Ticket fechado. O transcript ficou indisponivel por falta de mensagens, e o envio do resumo no privado falhou apos varias tentativas.";
+        return `Ticket fechado. O transcript ficou indisponivel ${unavailableText}, e o envio do resumo no privado falhou apos varias tentativas.`;
       default:
-        return "Ticket fechado. O transcript ficou indisponivel por falta de mensagens, e o resumo com protocolo foi colocado na fila de entrega do privado.";
+        return `Ticket fechado. O transcript ficou indisponivel ${unavailableText}, e o resumo com protocolo foi colocado na fila de entrega do privado.`;
     }
   }
 
@@ -1417,6 +1424,7 @@ async function closeTicketFromInteraction(interaction) {
         message: buildTicketClosureReplyMessage(
           result.transcriptAvailable,
           result.dmDeliveryStatus,
+          result.transcriptReason,
         ),
         tone: resolveTicketClosureReplyTone(
           result.transcriptAvailable,
@@ -1452,6 +1460,7 @@ async function closeOpenTicketChannel({
   let accessCode = "";
   let dmDeliveryStatus = "queued";
   let transcriptAvailable = false;
+  let transcriptReason = "insufficient_messages";
 
   try {
     transcriptAvailable = await shouldGenerateTranscript(channel);
@@ -1475,6 +1484,7 @@ async function closeOpenTicketChannel({
         transcriptHtml,
         accessCodeHash: hashTranscriptAccessCode(ticket.protocol, accessCode),
       });
+      transcriptReason = "available";
     }
   } catch (error) {
     logTicketFlowFailure("prepare-transcript", error, {
@@ -1483,7 +1493,11 @@ async function closeOpenTicketChannel({
       protocol: ticket.protocol,
       actorId,
     });
-    throw error;
+    transcriptHtml = "";
+    transcriptUrl = "";
+    accessCode = "";
+    transcriptAvailable = false;
+    transcriptReason = "generation_failed";
   }
 
   const updated = await closeTicket(
@@ -1513,6 +1527,7 @@ async function closeOpenTicketChannel({
       transcriptAvailable,
       transcriptUrl,
       accessCode,
+      transcriptReason,
     });
     const queueResults = await processDirectMessageQueue(client, {
       limit: 10,
@@ -1545,7 +1560,7 @@ async function closeOpenTicketChannel({
       transcript_available: transcriptAvailable,
       transcript_dm_delivered: dmDeliveryStatus === "sent",
       transcript_dm_status: dmDeliveryStatus,
-      transcript_reason: transcriptAvailable ? "available" : "insufficient_messages",
+      transcript_reason: transcriptReason,
     },
   });
 
@@ -1557,6 +1572,7 @@ async function closeOpenTicketChannel({
         available: transcriptAvailable,
         url: transcriptUrl,
         dmStatus: dmDeliveryStatus,
+        reason: transcriptReason,
       },
       actorId,
       runtime,
@@ -1596,6 +1612,7 @@ async function closeOpenTicketChannel({
   return {
     updated,
     transcriptAvailable,
+    transcriptReason,
     dmDeliveryStatus,
     transcriptUrl,
   };
