@@ -4,10 +4,14 @@ const DEFAULT_PUBLIC_APP_ORIGIN = "https://www.flwdesk.com";
 const LEGACY_PUBLIC_APP_HOSTS = new Set(["flwdesk.com"]);
 
 function getTranscriptAccessSecret() {
-  const secret =
-    process.env.TRANSCRIPT_ACCESS_SECRET?.trim() ||
-    process.env.SUPABASE_SERVICE_ROLE_KEY?.trim() ||
-    "";
+  const transcriptSecret = process.env.TRANSCRIPT_ACCESS_SECRET?.trim() || "";
+  if (transcriptSecret) return transcriptSecret;
+
+  if (String(process.env.NODE_ENV || "").toLowerCase() === "production") {
+    throw new Error("Variavel TRANSCRIPT_ACCESS_SECRET ausente.");
+  }
+
+  const secret = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim() || "";
 
   if (!secret) {
     throw new Error("Variavel de segredo do transcript ausente.");
@@ -69,20 +73,43 @@ function buildTranscriptUrl(protocol) {
   )}/`;
 }
 
+function normalizeTranscriptAccessCode(code) {
+  return String(code || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, 32);
+}
+
+function formatTranscriptAccessCode(code) {
+  const normalized = normalizeTranscriptAccessCode(code);
+  if (!normalized) return "";
+  return normalized.match(/.{1,4}/g)?.join("-") || normalized;
+}
+
+function buildTranscriptAccessUrl(protocol, code) {
+  const formattedCode = formatTranscriptAccessCode(code);
+  const baseUrl = buildTranscriptUrl(protocol).replace(/\/+$/, "");
+  return formattedCode ? `${baseUrl}/${encodeURIComponent(formattedCode)}` : `${baseUrl}/`;
+}
+
 function createTranscriptAccessCode() {
-  return crypto.randomBytes(6).toString("base64url").slice(0, 8).toUpperCase();
+  return normalizeTranscriptAccessCode(crypto.randomBytes(6).toString("base64url")).slice(0, 8);
 }
 
 function hashTranscriptAccessCode(protocol, code) {
   return crypto
     .createHmac("sha256", getTranscriptAccessSecret())
-    .update(`${String(protocol || "").trim()}:${String(code || "").trim()}`)
+    .update(`${String(protocol || "").trim()}:${normalizeTranscriptAccessCode(code)}`)
     .digest("hex");
 }
 
 module.exports = {
+  buildTranscriptAccessUrl,
   buildTranscriptUrl,
   createTranscriptAccessCode,
+  formatTranscriptAccessCode,
   hashTranscriptAccessCode,
+  normalizeTranscriptAccessCode,
   resolveAppOrigin,
 };

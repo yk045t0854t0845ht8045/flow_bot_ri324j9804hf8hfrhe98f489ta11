@@ -6,6 +6,10 @@ const {
   rescheduleTicketDirectMessage,
 } = require("./supabaseService");
 const { buildTicketClosureDmPayload } = require("../utils/componentFactory");
+const {
+  buildTranscriptAccessUrl,
+  formatTranscriptAccessCode,
+} = require("../utils/transcriptAccess");
 
 const DM_QUEUE_RETRY_DELAYS_MS = [
   20 * 1000,
@@ -46,12 +50,19 @@ async function enqueueTicketClosureDirectMessage({
   accessCode,
 }) {
   const notificationKey = buildTicketClosureNotificationKey(ticket.id);
+  const formattedAccessCode = transcriptAvailable
+    ? formatTranscriptAccessCode(accessCode)
+    : "";
+  const transcriptAccessUrl =
+    transcriptAvailable && transcriptUrl && accessCode
+      ? buildTranscriptAccessUrl(ticket.protocol, accessCode)
+      : transcriptUrl;
   const payload = buildTicketClosureDmPayload({
     ticket,
     closedBy,
     transcriptAvailable,
-    transcriptUrl,
-    accessCode,
+    transcriptUrl: transcriptAccessUrl,
+    accessCode: formattedAccessCode,
   });
 
   const queueItem = await enqueueTicketDirectMessage({
@@ -74,7 +85,10 @@ async function processDirectMessageQueue(client, options = {}) {
   const { limit = 10, notificationKey = null } = options;
 
   if (processingPromise) {
-    return processingPromise;
+    if (!notificationKey) {
+      return processingPromise;
+    }
+    await processingPromise.catch(() => null);
   }
 
   processingPromise = (async () => {

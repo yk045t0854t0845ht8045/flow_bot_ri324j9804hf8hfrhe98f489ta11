@@ -1,11 +1,21 @@
 const http = require("http");
+const crypto = require("crypto");
 const { env } = require("../config/env");
+
+const JSON_HEADERS = {
+  "Content-Type": "application/json; charset=utf-8",
+  "Cache-Control": "no-store",
+  "X-Content-Type-Options": "nosniff",
+};
+
+function isProduction() {
+  return String(process.env.NODE_ENV || "").toLowerCase() === "production";
+}
 
 function buildHealthPayload(client) {
   const ready = typeof client?.isReady === "function" ? client.isReady() : false;
   const wsStatus = typeof client?.ws?.status === "number" ? client.ws.status : null;
   const guildCount = typeof client?.guilds?.cache?.size === "number" ? client.guilds.cache.size : null;
-  const userTag = client?.user?.tag || null;
   const uptimeMs = Math.round(process.uptime() * 1000);
   const ping = typeof client?.ws?.ping === "number" ? client.ws.ping : null;
 
@@ -26,16 +36,25 @@ function buildHealthPayload(client) {
     wsStatus,
     ping,
     guildCount,
-    userTag,
     uptimeMs,
     timestamp: new Date().toISOString(),
-    pid: process.pid,
   };
+}
+
+function secureTokenEquals(expected, received) {
+  const expectedBuffer = Buffer.from(String(expected || ""));
+  const receivedBuffer = Buffer.from(String(received || ""));
+
+  if (expectedBuffer.length !== receivedBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(expectedBuffer, receivedBuffer);
 }
 
 function isAuthorized(request) {
   if (!env.botHealthToken) {
-    return true;
+    return !isProduction();
   }
 
   const token =
@@ -44,29 +63,33 @@ function isAuthorized(request) {
     request.headers.authorization?.replace(/^Bearer\s+/i, "") ||
     "";
 
-  return token === env.botHealthToken;
+  return secureTokenEquals(env.botHealthToken, token);
+}
+
+function writeJson(response, statusCode, payload) {
+  response.writeHead(statusCode, JSON_HEADERS);
+  response.end(JSON.stringify(payload));
 }
 
 function startHealthServer(client) {
   const server = http.createServer((request, response) => {
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      writeJson(response, 405, { ok: false, error: "method_not_allowed" });
+      return;
+    }
+
     if (request.url !== "/health") {
-      response.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
-      response.end(JSON.stringify({ ok: false, error: "not_found" }));
+      writeJson(response, 404, { ok: false, error: "not_found" });
       return;
     }
 
     if (!isAuthorized(request)) {
-      response.writeHead(401, { "Content-Type": "application/json; charset=utf-8" });
-      response.end(JSON.stringify({ ok: false, error: "unauthorized" }));
+      writeJson(response, 401, { ok: false, error: "unauthorized" });
       return;
     }
 
     const payload = buildHealthPayload(client);
-    response.writeHead(payload.ok ? 200 : 503, {
-      "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "no-store",
-    });
-    response.end(JSON.stringify(payload));
+    writeJson(response, payload.ok ? 200 : 503, payload);
   });
 
   server.listen(env.botHealthPort, env.botHealthHost, () => {

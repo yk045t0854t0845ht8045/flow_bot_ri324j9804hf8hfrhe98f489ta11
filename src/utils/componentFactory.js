@@ -1168,6 +1168,7 @@ function buildTicketClosureDmPayload({
   closedBy,
   transcriptAvailable = false,
 }) {
+  const formattedAccessCode = String(accessCode || "").trim();
   const lines = [
     `### Ticket fechado ${formatTicketNumber(ticket?.id)}`,
     "",
@@ -1177,11 +1178,11 @@ function buildTicketClosureDmPayload({
     transcriptAvailable
       ? "O transcript deste atendimento esta protegido por senha."
       : "O transcript deste atendimento ficou indisponivel por falta de mensagens suficientes.",
-    transcriptAvailable && trimText(accessCode)
-      ? `-# Codigo de acesso: \`${String(accessCode || "").trim()}\``
+    transcriptAvailable && formattedAccessCode
+      ? `**Codigo de acesso:** \`${formattedAccessCode}\``
       : "",
     transcriptAvailable
-      ? "-# Depois de validar o codigo, a sessao fica liberada por 10 minutos."
+      ? "-# O botao abaixo ja abre o transcript com o codigo preenchido. Depois da validacao, a sessao fica liberada por 10 minutos."
       : "",
   ].filter(Boolean);
 

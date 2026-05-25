@@ -874,6 +874,11 @@ async function handleDiscountModalSubmit(interaction, cartId) {
     await interaction.reply({ flags: MessageFlags.Ephemeral, content: "Informe um codigo valido." });
     return;
   }
+  const existingCart = await getCart(cartId);
+  if (!existingCart || existingCart.discord_user_id !== interaction.user.id) {
+    await interaction.reply({ flags: MessageFlags.Ephemeral, content: "Carrinho nao encontrado." });
+    return;
+  }
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   try {
     await callSalesInternalApi("apply_discount", cartId, { code });
@@ -1450,6 +1455,12 @@ async function handlePaymentSelect(interaction) {
   const cartId = parts?.[3];
   if (!cartId || interaction.values?.[0] !== "mercado_pago") return false;
 
+  const cart = await getCart(cartId);
+  if (!cart || cart.discord_user_id !== interaction.user.id) {
+    await interaction.reply({ flags: MessageFlags.Ephemeral, content: "Carrinho nao encontrado." });
+    return true;
+  }
+
   await interaction.deferUpdate();
   let payload;
   try {
@@ -1485,6 +1496,12 @@ async function handlePaymentSelect(interaction) {
 }
 
 async function handleCheckPaymentButton(interaction, cartId) {
+  const cart = await getCart(cartId);
+  if (!cart || cart.discord_user_id !== interaction.user.id) {
+    await interaction.reply({ flags: MessageFlags.Ephemeral, content: "Carrinho nao encontrado." });
+    return;
+  }
+
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const payload = await callSalesInternalApi("sync_payment", cartId);
   const status = payload.cart?.status || payload.payment?.status || "payment_pending";
@@ -1537,6 +1554,11 @@ async function handleCartButtonInteraction(interaction) {
     return true;
   }
   if (action === "back") {
+    const cart = await getCart(cartId);
+    if (!cart || cart.discord_user_id !== interaction.user.id) {
+      await interaction.reply({ flags: MessageFlags.Ephemeral, content: "Carrinho nao encontrado." });
+      return true;
+    }
     await interaction.deferUpdate();
     await refreshCartMessage(interaction.message, cartId);
     return true;
