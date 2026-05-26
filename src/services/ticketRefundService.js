@@ -1742,7 +1742,7 @@ function resolveOrderPublicId(order) {
 function formatOrderSafeStatus(order) {
   const status = String(order.status || "").toLowerCase();
   const providerStatus = String(order.providerStatus || "").toLowerCase();
-  if (status === "refunded" || providerStatus === "refunded") return "Reembolsado";
+  if (isRefundTerminalStatus(status) || isRefundTerminalStatus(providerStatus)) return "Reembolsado";
   if (status === "paid" || status === "approved" || providerStatus === "approved") return "Pagamento confirmado";
   if (status === "delivered") return "Entregue";
   if (status === "pending") return "Pendente";
@@ -1900,6 +1900,12 @@ function countRefundEvents(events) {
   }).length;
 }
 
+function isRefundTerminalStatus(value) {
+  return ["refunded", "partially_refunded", "charged_back", "chargeback"].includes(
+    String(value || "").toLowerCase(),
+  );
+}
+
 function evaluateRefundEligibility(order, settings, context = {}) {
   const purchaseDate = resolvePurchaseDate(order);
   const purchaseMs = purchaseDate ? Date.parse(purchaseDate) : Number.NaN;
@@ -1916,9 +1922,8 @@ function evaluateRefundEligibility(order, settings, context = {}) {
   const providerStatus = String(order.providerStatus || "").toLowerCase();
   const providerDetail = String(order.providerStatusDetail || "").toLowerCase();
   const alreadyRefunded =
-    status === "refunded" ||
-    providerStatus === "refunded" ||
-    providerStatus === "charged_back" ||
+    isRefundTerminalStatus(status) ||
+    isRefundTerminalStatus(providerStatus) ||
     providerDetail.includes("refund") ||
     providerDetail.includes("chargeback") ||
     providerDetail.includes("reembols");
@@ -2189,7 +2194,7 @@ async function callInternalSalesRefund(cartId, guildId, reason) {
   return payload;
 }
 
-async function callInternalPaymentRefund(orderId, reason) {
+async function callInternalPaymentRefund(orderId, reason, context = {}) {
   const endpoint =
     env.paymentsInternalRefundApiUrl ||
     `${String(env.appUrl || "").replace(/\/+$/, "")}/api/internal/payments/refund`;
@@ -2205,7 +2210,20 @@ async function callInternalPaymentRefund(orderId, reason) {
       "x-flowdesk-internal-token": env.salesInternalApiToken,
       "x-payments-internal-token": env.salesInternalApiToken,
     },
-    body: JSON.stringify({ orderId, reason }),
+    body: JSON.stringify({
+      orderId,
+      reason,
+      protocol: context.protocol || undefined,
+      actorUserId: context.actorUserId || undefined,
+      actorLabel: context.actorUserId ? `Discord ${context.actorUserId}` : undefined,
+      accessAction: context.accessAction || "revoke_immediately",
+      riskScore: Number.isFinite(Number(context.riskScore))
+        ? Number(context.riskScore)
+        : undefined,
+      riskFlags: Array.isArray(context.riskFlags)
+        ? context.riskFlags.slice(0, 20)
+        : undefined,
+    }),
     signal: AbortSignal.timeout?.(45_000),
   });
   const payload = await response.json().catch(() => null);
@@ -2252,9 +2270,8 @@ function isRefundedOrder(order) {
   const providerStatus = String(order?.providerStatus || "").toLowerCase();
   const providerDetail = String(order?.providerStatusDetail || "").toLowerCase();
   return (
-    status === "refunded" ||
-    providerStatus === "refunded" ||
-    providerStatus === "charged_back" ||
+    isRefundTerminalStatus(status) ||
+    isRefundTerminalStatus(providerStatus) ||
     providerDetail.includes("refund") ||
     providerDetail.includes("chargeback") ||
     providerDetail.includes("reembols") ||
@@ -2657,7 +2674,13 @@ async function executeRefundProcessing({
   try {
     refundResult =
       order.source === "payment"
-        ? await callInternalPaymentRefund(order.id, reason)
+        ? await callInternalPaymentRefund(order.id, reason, {
+            protocol,
+            actorUserId: actorUserId || "system",
+            riskScore: eligibility?.riskScore,
+            riskFlags: eligibility?.reasons,
+            accessAction: "revoke_immediately",
+          })
         : await callInternalSalesRefund(order.id, ticket.guild_id, reason);
   } catch (financialError) {
     const reconciliation = await confirmRefundAfterUncertainError({
@@ -3662,9 +3685,8 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
       const providerStatus = String(order.providerStatus || "").toLowerCase();
       const providerDetail = String(order.providerStatusDetail || "").toLowerCase();
       const alreadyRefunded =
-        status === "refunded" ||
-        providerStatus === "refunded" ||
-        providerStatus === "charged_back" ||
+        isRefundTerminalStatus(status) ||
+        isRefundTerminalStatus(providerStatus) ||
         providerDetail.includes("refund") ||
         providerDetail.includes("chargeback") ||
         providerDetail.includes("reembols");
@@ -3831,9 +3853,8 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
     const providerStatus = String(order.providerStatus || "").toLowerCase();
     const providerDetail = String(order.providerStatusDetail || "").toLowerCase();
     const alreadyRefunded =
-      status === "refunded" ||
-      providerStatus === "refunded" ||
-      providerStatus === "charged_back" ||
+      isRefundTerminalStatus(status) ||
+      isRefundTerminalStatus(providerStatus) ||
       providerDetail.includes("refund") ||
       providerDetail.includes("chargeback") ||
       providerDetail.includes("reembols");
@@ -4215,9 +4236,8 @@ async function handleTicketRefundInteraction(interaction, client, runtimeLoader)
     const orderStatus = String(order.status || "").toLowerCase();
     const orderProviderStatus = String(order.providerStatus || "").toLowerCase();
     if (
-      orderStatus === "refunded" ||
-      orderProviderStatus === "refunded" ||
-      orderProviderStatus === "charged_back"
+      isRefundTerminalStatus(orderStatus) ||
+      isRefundTerminalStatus(orderProviderStatus)
     ) {
       await interaction.reply({
         content: "Esta compra ja consta como reembolsada ou contestada na base de dados.",
