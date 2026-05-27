@@ -2933,12 +2933,43 @@ async function executeRefundProcessing({
       error: normalizeText(refundResult.eventError || "Estorno confirmado, mas auditoria da venda nao foi gravada.", 500),
     });
   }
-  const ticketNotice = await sendRefundTicketConfirmation({
-    client,
-    interaction,
-    ticket,
-    content: successPayload,
-  });
+
+  const finalPayload =
+    updateMode === "staff"
+      ? buildRefundStaffReviewPayload({
+          ticket,
+          order: finalOrder,
+          settings,
+          reason,
+          eligibility,
+          protocol,
+          state: "approved",
+          decidedBy: actorUserId,
+          errorMessage: "",
+        })
+      : successPayload;
+
+  let finalUpdate = { ok: true };
+  if (interaction) {
+    finalUpdate = await updateComponentMessage(interaction, finalPayload, correlationId);
+    if (!finalUpdate.ok) {
+      postFailures.push({
+        step: "discord_component_update",
+        error: serializeDiscordError(finalUpdate.error),
+      });
+    }
+  }
+
+  const shouldSendTicketConfirmation =
+    updateMode === "staff" || !interaction || finalUpdate.ok !== true;
+  const ticketNotice = shouldSendTicketConfirmation
+    ? await sendRefundTicketConfirmation({
+        client,
+        interaction,
+        ticket,
+        content: successPayload,
+      })
+    : { ok: true, skippedBecauseComponentWasUpdated: true };
   if (ticketNotice?.ok !== true) {
     postFailures.push({
       step: "ticket_notification",
@@ -2979,32 +3010,6 @@ async function executeRefundProcessing({
     });
   }
 
-  const finalPayload =
-    updateMode === "staff"
-      ? buildRefundStaffReviewPayload({
-          ticket,
-          order: finalOrder,
-          settings,
-          reason,
-          eligibility,
-          protocol,
-          state: "approved",
-          decidedBy: actorUserId,
-          errorMessage: "",
-        })
-      : successPayload;
-
-  let finalUpdate = { ok: true };
-  if (interaction) {
-    finalUpdate = await updateComponentMessage(interaction, finalPayload, correlationId);
-    if (!finalUpdate.ok) {
-      postFailures.push({
-        step: "discord_component_update",
-        error: serializeDiscordError(finalUpdate.error),
-      });
-    }
-  }
-
   await persistRefundStateDirectly(ticket, {}, {
     stage: "completed",
     selectedOrderKey: order.key,
@@ -3032,6 +3037,8 @@ async function executeRefundProcessing({
       recovered_from_uncertain_provider_error: recoveredFromUncertainError,
       recovered_from_legacy_payment_refund_payload: refundResult?.recoveredFromLegacyPayload === true,
       discord_ticket_confirmation_sent: ticketNotice?.ok === true,
+      discord_ticket_confirmation_skipped_duplicate:
+        ticketNotice?.skippedBecauseComponentWasUpdated === true,
       dm_notification_queued: dmQueue.queued === true,
       email_confirmation_sent: emailNotice?.sent === true,
       discord_component_updated: finalUpdate.ok === true,
