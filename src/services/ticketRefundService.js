@@ -598,6 +598,20 @@ function isThankYouIntent(text) {
   ]) && normalized.length < 25;
 }
 
+function isHumanSupportIntent(text) {
+  const normalized = normalizeIntentText(text);
+  return includesAny(normalized, [
+    "falar com humano",
+    "atendente",
+    "suporte humano",
+    "chamar staff",
+    "chama a equipe",
+    "preciso da equipe",
+    "quero falar com alguem",
+    "moderador",
+  ]);
+}
+
 function isListOrdersIntent(text) {
   const normalized = normalizeIntentText(text);
   if (!normalized) return false;
@@ -1503,6 +1517,91 @@ async function fetchPaymentEvents(orderIds) {
   return byOrder;
 }
 
+async function fetchSalesOrdersForContext({ guildId, authUserId, discordUserId, limit = 80 }) {
+  const cartRows = new Map();
+  const normalizedGuildId = String(guildId || "").trim();
+
+  if (authUserId) {
+    const authCartResult = await supabase
+      .from("guild_sales_carts")
+      .select("*")
+      .eq("guild_id", normalizedGuildId)
+      .eq("auth_user_id", authUserId)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+    if (!authCartResult.error) {
+      for (const cart of authCartResult.data || []) cartRows.set(cart.id, cart);
+    } else if (!isMissingTableError(authCartResult.error, "guild_sales_carts")) {
+      console.warn("[ticket-refund] falha ao consultar vendas por usuario:", authCartResult.error.message);
+    }
+  }
+
+  if (discordUserId) {
+    const discordCartResult = await supabase
+      .from("guild_sales_carts")
+      .select("*")
+      .eq("guild_id", normalizedGuildId)
+      .eq("discord_user_id", discordUserId)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+    if (!discordCartResult.error) {
+      for (const cart of discordCartResult.data || []) cartRows.set(cart.id, cart);
+    } else if (!isMissingTableError(discordCartResult.error, "guild_sales_carts")) {
+      console.warn("[ticket-refund] falha ao consultar vendas por Discord:", discordCartResult.error.message);
+    }
+  }
+
+  const carts = Array.from(cartRows.values());
+  const cartIds = carts.map((cart) => cart.id);
+  const [itemsByCart, deliveriesByCart, eventsByCart] = await Promise.all([
+    fetchSalesCartItems(cartIds),
+    fetchSalesDeliveries(cartIds),
+    fetchSalesEvents(cartIds),
+  ]);
+
+  return carts.map((cart) =>
+    toUnifiedSalesOrder(
+      cart,
+      itemsByCart.get(cart.id) || [],
+      deliveriesByCart.get(cart.id) || [],
+      eventsByCart.get(cart.id) || [],
+    ),
+  );
+}
+
+async function fetchGlobalSalesOrdersForGuild({ guildId, limit = 250 }) {
+  const cartResult = await supabase
+    .from("guild_sales_carts")
+    .select("*")
+    .eq("guild_id", guildId)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (cartResult.error) {
+    if (!isMissingTableError(cartResult.error, "guild_sales_carts")) {
+      console.warn("[ticket-refund] falha ao consultar pedidos globais da loja:", cartResult.error.message);
+    }
+    return [];
+  }
+
+  const carts = cartResult.data || [];
+  const cartIds = carts.map((cart) => cart.id);
+  const [itemsByCart, deliveriesByCart, eventsByCart] = await Promise.all([
+    fetchSalesCartItems(cartIds),
+    fetchSalesDeliveries(cartIds),
+    fetchSalesEvents(cartIds),
+  ]);
+
+  return carts.map((cart) =>
+    toUnifiedSalesOrder(
+      cart,
+      itemsByCart.get(cart.id) || [],
+      deliveriesByCart.get(cart.id) || [],
+      eventsByCart.get(cart.id) || [],
+    ),
+  );
+}
+
 async function fetchActiveAccountViolations(authUserId) {
   if (!Number.isFinite(Number(authUserId))) return [];
   const result = await supabase
@@ -1577,25 +1676,37 @@ function toUnifiedPaymentOrder(order, events = []) {
 
 async function findMatchingOrders({ guildId, authUserId, discordUserId, orderCandidates }) {
   if (isOfficialSupportGuild(guildId)) {
-    if (!authUserId) return [];
+    if (!authUserId && !discordUserId) return [];
 
-    const orderResult = await supabase
-      .from("payment_orders")
-      .select("*")
-      .eq("user_id", authUserId)
-      .order("created_at", { ascending: false })
-      .limit(500);
+    const [paymentOrders, salesOrders] = await Promise.all([
+      authUserId
+        ? supabase
+            .from("payment_orders")
+            .select("*")
+            .eq("user_id", authUserId)
+            .order("created_at", { ascending: false })
+            .limit(500)
+        : Promise.resolve({ data: [], error: null }),
+      fetchSalesOrdersForContext({
+        guildId,
+        authUserId,
+        discordUserId,
+        limit: 120,
+      }),
+    ]);
 
-    if (orderResult.error) {
-      console.warn("[ticket-refund] falha ao consultar historico de pagamentos:", orderResult.error.message);
-      return [];
+    if (paymentOrders.error) {
+      console.warn("[ticket-refund] falha ao consultar historico de pagamentos:", paymentOrders.error.message);
     }
 
-    const paymentOrders = orderResult.data || [];
-    const eventsByOrder = await fetchPaymentEvents(paymentOrders.map((order) => order.id));
+    const paymentRows = paymentOrders.data || [];
+    const eventsByOrder = await fetchPaymentEvents(paymentRows.map((order) => order.id));
+    const officialOrders = [
+      ...paymentRows.map((order) => toUnifiedPaymentOrder(order, eventsByOrder.get(order.id) || [])),
+      ...salesOrders,
+    ];
 
-    return paymentOrders
-      .map((order) => toUnifiedPaymentOrder(order, eventsByOrder.get(order.id) || []))
+    return officialOrders
       .map((order) => ({
         ...order,
         matchScore: scoreOrderMatch(order, orderCandidates),
@@ -1608,50 +1719,12 @@ async function findMatchingOrders({ guildId, authUserId, discordUserId, orderCan
       .slice(0, 10);
   }
 
-  const cartRows = new Map();
-
-  if (authUserId) {
-    const authCartResult = await supabase
-      .from("guild_sales_carts")
-      .select("*")
-      .eq("guild_id", guildId)
-      .eq("auth_user_id", authUserId)
-      .order("created_at", { ascending: false })
-      .limit(60);
-    if (!authCartResult.error) {
-      for (const cart of authCartResult.data || []) cartRows.set(cart.id, cart);
-    }
-  }
-
-  if (discordUserId) {
-    const discordCartResult = await supabase
-      .from("guild_sales_carts")
-      .select("*")
-      .eq("guild_id", guildId)
-      .eq("discord_user_id", discordUserId)
-      .order("created_at", { ascending: false })
-      .limit(60);
-    if (!discordCartResult.error) {
-      for (const cart of discordCartResult.data || []) cartRows.set(cart.id, cart);
-    }
-  }
-
-  const carts = Array.from(cartRows.values());
-  const cartIds = carts.map((cart) => cart.id);
-  const [itemsByCart, deliveriesByCart, eventsByCart] = await Promise.all([
-    fetchSalesCartItems(cartIds),
-    fetchSalesDeliveries(cartIds),
-    fetchSalesEvents(cartIds),
-  ]);
-
-  const salesOrders = carts.map((cart) =>
-    toUnifiedSalesOrder(
-      cart,
-      itemsByCart.get(cart.id) || [],
-      deliveriesByCart.get(cart.id) || [],
-      eventsByCart.get(cart.id) || [],
-    ),
-  );
+  const salesOrders = await fetchSalesOrdersForContext({
+    guildId,
+    authUserId,
+    discordUserId,
+    limit: 80,
+  });
 
   return [...salesOrders]
     .map((order) => ({
@@ -1668,21 +1741,25 @@ async function findMatchingOrders({ guildId, authUserId, discordUserId, orderCan
 
 async function findAnyMatchingSalesOrders({ guildId, orderCandidates }) {
   if (isOfficialSupportGuild(guildId)) {
-    const orderResult = await supabase
-      .from("payment_orders")
-      .select("*")
-      .order("created_at", { ascending: false })
-      .limit(500);
+    const [orderResult, salesOrders] = await Promise.all([
+      supabase
+        .from("payment_orders")
+        .select("*")
+        .order("created_at", { ascending: false })
+        .limit(500),
+      fetchGlobalSalesOrdersForGuild({ guildId, limit: 300 }),
+    ]);
 
     if (orderResult.error) {
       console.warn("[ticket-refund] falha ao consultar historico global de pagamentos:", orderResult.error.message);
-      return [];
     }
 
     const paymentOrders = orderResult.data || [];
     const eventsByOrder = await fetchPaymentEvents(paymentOrders.map((order) => order.id));
-    return paymentOrders
-      .map((order) => toUnifiedPaymentOrder(order, eventsByOrder.get(order.id) || []))
+    return [
+      ...paymentOrders.map((order) => toUnifiedPaymentOrder(order, eventsByOrder.get(order.id) || [])),
+      ...salesOrders,
+    ]
       .map((order) => ({
         ...order,
         matchScore: scoreOrderMatch(order, orderCandidates),
@@ -1692,35 +1769,7 @@ async function findAnyMatchingSalesOrders({ guildId, orderCandidates }) {
       .slice(0, 3);
   }
 
-  const cartResult = await supabase
-    .from("guild_sales_carts")
-    .select("*")
-    .eq("guild_id", guildId)
-    .order("created_at", { ascending: false })
-    .limit(200);
-
-  if (cartResult.error) {
-    console.warn("[ticket-refund] falha ao consultar pedidos globais da guild:", cartResult.error.message);
-    return [];
-  }
-
-  const carts = cartResult.data || [];
-  const cartIds = carts.map((cart) => cart.id);
-  const [itemsByCart, deliveriesByCart, eventsByCart] = await Promise.all([
-    fetchSalesCartItems(cartIds),
-    fetchSalesDeliveries(cartIds),
-    fetchSalesEvents(cartIds),
-  ]);
-
-  return carts
-    .map((cart) =>
-      toUnifiedSalesOrder(
-        cart,
-        itemsByCart.get(cart.id) || [],
-        deliveriesByCart.get(cart.id) || [],
-        eventsByCart.get(cart.id) || [],
-      ),
-    )
+  return (await fetchGlobalSalesOrdersForGuild({ guildId, limit: 200 }))
     .map((order) => ({
       ...order,
       matchScore: scoreOrderMatch(order, orderCandidates),
@@ -1763,73 +1812,43 @@ function isOrderOwnedByTicketContext(order, context = {}) {
 
 async function listUserRecentOrders({ guildId, authUserId, discordUserId }) {
   if (isOfficialSupportGuild(guildId)) {
-    if (!authUserId) return [];
+    if (!authUserId && !discordUserId) return [];
 
-    const orderResult = await supabase
-      .from("payment_orders")
-      .select("*")
-      .eq("user_id", authUserId)
-      .order("created_at", { ascending: false })
-      .limit(500);
+    const [orderResult, salesOrders] = await Promise.all([
+      authUserId
+        ? supabase
+            .from("payment_orders")
+            .select("*")
+            .eq("user_id", authUserId)
+            .order("created_at", { ascending: false })
+            .limit(500)
+        : Promise.resolve({ data: [], error: null }),
+      fetchSalesOrdersForContext({
+        guildId,
+        authUserId,
+        discordUserId,
+        limit: 120,
+      }),
+    ]);
 
     if (orderResult.error) {
       console.warn("[ticket-refund] falha ao listar historico de pagamentos:", orderResult.error.message);
-      return [];
     }
 
     const paymentOrders = orderResult.data || [];
     const eventsByOrder = await fetchPaymentEvents(paymentOrders.map((order) => order.id));
-    return paymentOrders.map((order) =>
-      toUnifiedPaymentOrder(order, eventsByOrder.get(order.id) || []),
+    return [
+      ...paymentOrders.map((order) =>
+        toUnifiedPaymentOrder(order, eventsByOrder.get(order.id) || []),
+      ),
+      ...salesOrders,
+    ].sort(
+      (left, right) =>
+        parseTimestampMs(resolvePurchaseDate(right)) - parseTimestampMs(resolvePurchaseDate(left)),
     );
   }
 
-  const cartRows = new Map();
-
-  if (authUserId) {
-    const authCartResult = await supabase
-      .from("guild_sales_carts")
-      .select("*")
-      .eq("guild_id", guildId)
-      .eq("auth_user_id", authUserId)
-      .order("created_at", { ascending: false })
-      .limit(60);
-    if (!authCartResult.error) {
-      for (const cart of authCartResult.data || []) cartRows.set(cart.id, cart);
-    }
-  }
-
-  if (discordUserId) {
-    const discordCartResult = await supabase
-      .from("guild_sales_carts")
-      .select("*")
-      .eq("guild_id", guildId)
-      .eq("discord_user_id", discordUserId)
-      .order("created_at", { ascending: false })
-      .limit(60);
-    if (!discordCartResult.error) {
-      for (const cart of discordCartResult.data || []) cartRows.set(cart.id, cart);
-    }
-  }
-
-  const carts = Array.from(cartRows.values());
-  const cartIds = carts.map((cart) => cart.id);
-  const [itemsByCart, deliveriesByCart, eventsByCart] = await Promise.all([
-    fetchSalesCartItems(cartIds),
-    fetchSalesDeliveries(cartIds),
-    fetchSalesEvents(cartIds),
-  ]);
-
-  const salesOrders = carts.map((cart) =>
-    toUnifiedSalesOrder(
-      cart,
-      itemsByCart.get(cart.id) || [],
-      deliveriesByCart.get(cart.id) || [],
-      eventsByCart.get(cart.id) || [],
-    ),
-  );
-
-  return salesOrders;
+  return fetchSalesOrdersForContext({ guildId, authUserId, discordUserId, limit: 80 });
 }
 
 async function getOrderByKey(guildId, orderKey, options = {}) {
@@ -2691,6 +2710,7 @@ async function executeRefundProcessing({
     });
 
     if (!reconciliation.confirmed) {
+      const safeProviderError = normalizeText(financialError.message, 300);
       await logRefundAuditEvent({
         ticket,
         authUserId,
@@ -2705,10 +2725,89 @@ async function executeRefundProcessing({
           protocol,
           method,
           actor_user_id: actorUserId || "system",
-          provider_error: normalizeText(financialError.message, 500),
+          provider_error: normalizeText(safeProviderError, 500),
           reconciliation_reason: reconciliation.reason,
         },
       });
+
+      if (updateMode !== "staff") {
+        const fallbackProtocol = protocol || generateRefundProtocol(ticket.id, order.key);
+        const fallbackReason = [
+          "O processamento automatico nao conseguiu confirmar o estorno financeiro.",
+          safeProviderError ? `Erro seguro: ${safeProviderError}` : "",
+          "Encaminhar para analise manual antes de qualquer nova tentativa.",
+        ].filter(Boolean).join(" ");
+
+        const manualRequest = await sendManualApprovalRequest({
+          client,
+          ticket,
+          order,
+          settings,
+          reason: fallbackReason,
+          eligibility,
+          protocol: fallbackProtocol,
+        }).catch(async (manualError) => {
+          await logRefundAuditEvent({
+            ticket,
+            authUserId,
+            orderKey: order.key,
+            riskScore: eligibility?.riskScore,
+            eventType: "manual_review_dispatch_failed",
+            outcome: "approval_channel_unavailable_after_financial_failure",
+            correlationId,
+            metadata: {
+              protocol: fallbackProtocol,
+              provider_error: safeProviderError,
+              approval_error: normalizeText(manualError.message, 500),
+              approval_channel_id: settings?.approvalChannelId || null,
+            },
+          });
+          return null;
+        });
+
+        if (manualRequest) {
+          if (interaction) {
+            await updateComponentMessage(interaction,
+              buildRefundManualQueuedPayload({
+                protocol: fallbackProtocol,
+                order,
+                eligibility,
+                reason:
+                  "Nao consegui confirmar o estorno automatico agora, entao encaminhei para a equipe revisar com seguranca.",
+              }),
+              correlationId,
+            );
+          }
+
+          await persistRefundStateDirectly(ticket, {}, {
+            stage: "manual_review",
+            selectedOrderKey: order.key,
+          });
+
+          await logRefundAuditEvent({
+            ticket,
+            authUserId,
+            orderKey: order.key,
+            riskScore: eligibility?.riskScore,
+            eventType: "manual_review_opened",
+            outcome: "fallback_after_financial_failure",
+            correlationId,
+            metadata: {
+              protocol: fallbackProtocol,
+              provider_error: safeProviderError,
+              reconciliation_reason: reconciliation.reason,
+            },
+          });
+
+          return {
+            ok: false,
+            financialCompleted: false,
+            manualQueued: true,
+            error: financialError,
+            reconciliation,
+          };
+        }
+      }
 
       if (interaction) {
         const failurePayload =
@@ -2728,8 +2827,7 @@ async function executeRefundProcessing({
                 protocol,
                 order,
                 message:
-                  settings.errorMessage ||
-                  `Nao consegui confirmar o estorno financeiro: ${normalizeText(financialError.message, 300)}`,
+                  `Nao consegui confirmar o estorno financeiro agora (${safeProviderError || "erro do provedor"}). A analise manual tambem nao foi aberta automaticamente porque o canal de aprovacao esta ausente ou inacessivel. Chame a equipe neste ticket para revisar o caso.`,
               });
         await updateComponentMessage(interaction, failurePayload, correlationId);
       }
@@ -3275,6 +3373,34 @@ async function answerContextualMessage({ message, persist, state, kind, content,
     return true;
   }
 
+  if (kind === "side_support") {
+    const nextState = markPrompt(state, "side_support");
+    await persistRefundState(persist, nextState);
+    await message.reply({
+      content:
+        "Claro, eu acompanho por aqui. Antes de partir direto para reembolso, me conta o que aconteceu com a compra: nao recebeu, veio errado, acesso falhou ou quer cancelar mesmo? Se voce ja tiver o numero do pedido, pode mandar junto que eu consulto sem expor dados sensiveis.",
+      allowedMentions: { parse: [] },
+    });
+    return true;
+  }
+
+  if (kind === "human_support") {
+    const nextState = markPrompt({ ...state, stage: "manual_review" }, "human_support");
+    await persistRefundState(persist, nextState);
+    await message.reply({
+      content:
+        "Tudo bem, vou deixar o caso aberto para a equipe acompanhar. Enquanto isso, se puder, envie o numero do pedido e um resumo curto do que aconteceu; isso ajuda o atendimento humano a chegar ja com contexto.",
+      allowedMentions: { parse: [] },
+    });
+    await logRefundAuditEvent({
+      ticket,
+      eventType: "human_support_requested_during_refund",
+      outcome: "manual_review",
+      metadata: { content: normalizeText(content, 300) },
+    });
+    return true;
+  }
+
   if (kind === "manipulation") {
     const nextState = markPrompt(state, "security");
     await persistRefundState(persist, nextState);
@@ -3659,6 +3785,14 @@ async function handleRefundOrVerificationMessage({ message, client, ticket, runt
 
   if (isTimingQuestion(content) && !orderCandidates.length) {
     return answerContextualMessage({ message, persist, state, kind: "timing", content, ticket });
+  }
+
+  if (isHumanSupportIntent(content) && !orderCandidates.length) {
+    return answerContextualMessage({ message, persist, state, kind: "human_support", content, ticket });
+  }
+
+  if (isRefundSupportConversationIntent(content) && !orderCandidates.length) {
+    return answerContextualMessage({ message, persist, state, kind: "side_support", content, ticket });
   }
 
   if (isCasualGreetingIntent(content) && !orderCandidates.length) {
