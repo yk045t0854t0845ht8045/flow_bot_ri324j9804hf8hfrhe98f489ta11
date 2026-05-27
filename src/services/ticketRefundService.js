@@ -1788,6 +1788,27 @@ function resolveOrderPublicId(order) {
   );
 }
 
+function isOfficialPaymentOrder(order) {
+  return order?.source === "payment";
+}
+
+function resolveRefundOrderLabel(order) {
+  if (!order) return "Pedido";
+  if (isOfficialPaymentOrder(order)) {
+    return `Pedido #${resolveOrderPublicId(order)}`;
+  }
+  return order.productTitle || "Compra";
+}
+
+function resolveRefundOrderFieldLabel(order) {
+  return isOfficialPaymentOrder(order) ? "Pedido" : "Compra";
+}
+
+function formatRefundOrderLine(order) {
+  if (!order) return "Pedido nao informado";
+  return `${resolveRefundOrderLabel(order)}\n${formatMoney(order.amount, order.currency)} | ${formatDate(resolvePurchaseDate(order))}`;
+}
+
 function formatOrderSafeStatus(order) {
   const status = String(order.status || "").toLowerCase();
   const providerStatus = String(order.providerStatus || "").toLowerCase();
@@ -2068,7 +2089,7 @@ function evaluateRefundEligibility(order, settings, context = {}) {
 
 function buildOrderSelectionMessage(ticket, orders) {
   const options = orders.slice(0, 10).map((order) => ({
-    label: truncateText(order.productTitle || "Produto", 100),
+    label: truncateText(resolveRefundOrderLabel(order), 100),
     description: `${formatMoney(order.amount, order.currency)} | ${formatDate(resolvePurchaseDate(order))}`.slice(0, 100),
     value: order.key,
   }));
@@ -2279,7 +2300,7 @@ async function callInternalPaymentRefund(orderId, reason, context = {}) {
     protocol: context.protocol || undefined,
     actorUserId: context.actorUserId || undefined,
     actorLabel: context.actorUserId ? `Discord ${context.actorUserId}` : undefined,
-    accessAction: context.accessAction || "revoke_immediately",
+    accessAction: context.accessAction || "keep_until_expiration",
     riskScore: Number.isFinite(Number(context.riskScore))
       ? Number(context.riskScore)
       : undefined,
@@ -2439,13 +2460,14 @@ function buildRefundStaffReviewPayload({
     },
   };
   const config = stateConfig[state] || stateConfig.pending;
-  const orderLine = `${order.productTitle}\n${formatMoney(order.amount, order.currency)} | ${formatDate(resolvePurchaseDate(order))}`;
+  const orderLine = formatRefundOrderLine(order);
+  const orderFieldLabel = resolveRefundOrderFieldLabel(order);
   const details = [
     `**Status:** ${config.status}`,
     `**Protocolo:** \`${protocol}\``,
     `**Ticket:** ${ticket.protocol || ticket.id} | <#${ticket.channel_id}>`,
     `**Usuario:** <@${ticket.user_id}>`,
-    `**Compra:** ${orderLine}`,
+    `**${orderFieldLabel}:** ${orderLine}`,
     `**Pedido:** \`${resolveOrderPublicId(order)}\``,
     `**Pagamento:** ${order.providerPaymentId ? `\`${order.providerPaymentId}\`` : "Nao informado"}`,
     "",
@@ -2487,6 +2509,7 @@ function buildRefundStaffReviewPayload({
 }
 
 function buildRefundOrderInfoPayload(order) {
+  const orderLabel = resolveRefundOrderLabel(order);
   return buildRefundV2Payload({
     title: "Informacoes do pedido",
     tone: "processing",
@@ -2496,6 +2519,7 @@ function buildRefundOrderInfoPayload(order) {
       `**Data da compra:** ${formatDate(resolvePurchaseDate(order))}`,
       `**Valor:** ${formatMoney(order.amount, order.currency)}`,
       `**Origem:** ${order.source === "sales" ? "Loja do servidor" : "Financeiro Flowdesk"}`,
+      isOfficialPaymentOrder(order) ? `**Referencia:** ${orderLabel}` : `**Compra:** ${order.productTitle}`,
       "",
       "Nao exibo email, dados internos, credenciais, dados de pagamento ou detalhes sensiveis do produto neste ticket.",
     ].join("\n"),
@@ -2504,6 +2528,7 @@ function buildRefundOrderInfoPayload(order) {
 }
 
 function buildRefundProcessingPayload({ protocol, order, mode }) {
+  const orderFieldLabel = resolveRefundOrderFieldLabel(order);
   return buildRefundV2Payload({
     title: "Processando reembolso",
     tone: "processing",
@@ -2511,7 +2536,8 @@ function buildRefundProcessingPayload({ protocol, order, mode }) {
       "Aguarde, estamos processando este reembolso...",
       "",
       `**Protocolo:** \`${protocol}\``,
-      order ? `**Compra:** ${order.productTitle}` : "",
+      order ? `**${orderFieldLabel}:** ${resolveRefundOrderLabel(order)}` : "",
+      order ? `**Valor:** ${formatMoney(order.amount, order.currency)}` : "",
       mode ? `**Modo:** ${mode}` : "",
     ].filter(Boolean).join("\n"),
     footer: "Os botoes ficam bloqueados enquanto o estorno financeiro e confirmado.",
@@ -2519,13 +2545,14 @@ function buildRefundProcessingPayload({ protocol, order, mode }) {
 }
 
 function buildRefundSuccessPayload({ settings, order, protocol, title = "Reembolso aprovado" }) {
+  const orderFieldLabel = resolveRefundOrderFieldLabel(order);
   return buildRefundV2Payload({
     title,
     tone: "success",
     message: [
       settings.successMessage || "Reembolso concluido com sucesso.",
       "",
-      `**Compra:** ${order.productTitle}`,
+      `**${orderFieldLabel}:** ${resolveRefundOrderLabel(order)}`,
       `**Valor:** ${formatMoney(order.amount, order.currency)}`,
       `**Protocolo:** \`${protocol}\``,
       "",
@@ -2535,6 +2562,7 @@ function buildRefundSuccessPayload({ settings, order, protocol, title = "Reembol
 }
 
 function buildRefundFailurePayload({ protocol, order, message, title = "Falha no reembolso" }) {
+  const orderFieldLabel = resolveRefundOrderFieldLabel(order);
   return buildRefundV2Payload({
     title,
     tone: "error",
@@ -2542,7 +2570,7 @@ function buildRefundFailurePayload({ protocol, order, message, title = "Falha no
       normalizeText(message || "Nao foi possivel concluir esta etapa.", 900),
       "",
       protocol ? `**Protocolo:** \`${protocol}\`` : "",
-      order ? `**Compra:** ${order.productTitle}` : "",
+      order ? `**${orderFieldLabel}:** ${resolveRefundOrderLabel(order)}` : "",
     ].filter(Boolean).join("\n"),
   });
 }
@@ -2552,7 +2580,7 @@ function buildRefundManualQueuedPayload({ protocol, order, eligibility, reason }
     title: "Solicitacao enviada para analise",
     tone: "warning",
     message: [
-      `A compra **${order.productTitle}** foi encaminhada para analise manual da equipe responsavel.`,
+      `O ${isOfficialPaymentOrder(order) ? "pedido" : "item"} **${resolveRefundOrderLabel(order)}** foi encaminhado para analise manual da equipe responsavel.`,
       "",
       `**Protocolo:** \`${protocol}\``,
       `**Prazo configurado:** ${eligibility.refundDays} dia(s)`,
@@ -2571,7 +2599,7 @@ function buildRefundExpiredConfirmationPayload({ ticket, order, eligibility }) {
         textDisplay(
           [
             "### Prazo de reembolso expirado",
-            `Identifiquei que a compra **${order.productTitle}** foi realizada em **${formatDate(resolvePurchaseDate(order))}**.`,
+            `Identifiquei que o ${isOfficialPaymentOrder(order) ? "pedido" : "item"} **${resolveRefundOrderLabel(order)}** foi realizado em **${formatDate(resolvePurchaseDate(order))}**.`,
             `O prazo configurado pelo vendedor e de **${eligibility.refundDays} dia(s)** e expirou em **${formatDate(eligibility.deadline)}**.`,
             "",
             "Se quiser prosseguir, a equipe fara uma analise manual excepcional.",
@@ -2747,7 +2775,7 @@ async function executeRefundProcessing({
             actorUserId: actorUserId || "system",
             riskScore: eligibility?.riskScore,
             riskFlags: eligibility?.reasons,
-            accessAction: "revoke_immediately",
+            accessAction: "keep_until_expiration",
           })
         : await callInternalSalesRefund(order.id, ticket.guild_id, reason);
   } catch (financialError) {
@@ -3550,7 +3578,7 @@ async function handleRefundProtocolQuery({ message, client, ticket, protocolCode
     if (latestEvent.order_key) {
       const order = await getOrderByKey(ticket.guild_id, latestEvent.order_key).catch(() => null);
       if (order) {
-        orderInfoLine = `\n**Compra:** ${order.productTitle || "Produto"}\n**Valor:** ${formatMoney(order.amount, order.currency)}`;
+        orderInfoLine = `\n**${resolveRefundOrderFieldLabel(order)}:** ${resolveRefundOrderLabel(order)}\n**Valor:** ${formatMoney(order.amount, order.currency)}`;
       }
     }
 
