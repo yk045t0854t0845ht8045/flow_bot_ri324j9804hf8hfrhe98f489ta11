@@ -2213,14 +2213,22 @@ async function callInternalSalesRefund(cartId, guildId, reason) {
   return payload;
 }
 
-async function callInternalPaymentRefund(orderId, reason, context = {}) {
-  const endpoint =
-    env.paymentsInternalRefundApiUrl ||
-    `${String(env.appUrl || "").replace(/\/+$/, "")}/api/internal/payments/refund`;
-  if (!endpoint || !env.salesInternalApiToken) {
-    throw new Error("API interna de reembolso de pagamentos nao configurada.");
-  }
+function isInternalRefundPayloadContractError(payload) {
+  const message = normalizeIntentText(
+    `${payload?.message || ""} ${payload?.error || ""} ${Array.isArray(payload?.issues) ? payload.issues.join(" ") : ""}`,
+  );
+  return (
+    message.includes("campo protocol nao permitido") ||
+    message.includes("campo actoruserid nao permitido") ||
+    message.includes("campo actorlabel nao permitido") ||
+    message.includes("campo accessaction nao permitido") ||
+    message.includes("campo riskscore nao permitido") ||
+    message.includes("campo riskflags nao permitido") ||
+    message.includes("nao permitido nesta requisicao")
+  );
+}
 
+async function postInternalPaymentRefundRequest(endpoint, body, input = {}) {
   const response = await fetch(endpoint, {
     method: "POST",
     headers: {
@@ -2229,37 +2237,78 @@ async function callInternalPaymentRefund(orderId, reason, context = {}) {
       "x-flowdesk-internal-token": env.salesInternalApiToken,
       "x-payments-internal-token": env.salesInternalApiToken,
     },
-    body: JSON.stringify({
-      orderId,
-      reason,
-      protocol: context.protocol || undefined,
-      actorUserId: context.actorUserId || undefined,
-      actorLabel: context.actorUserId ? `Discord ${context.actorUserId}` : undefined,
-      accessAction: context.accessAction || "revoke_immediately",
-      riskScore: Number.isFinite(Number(context.riskScore))
-        ? Number(context.riskScore)
-        : undefined,
-      riskFlags: Array.isArray(context.riskFlags)
-        ? context.riskFlags.slice(0, 20)
-        : undefined,
-    }),
+    body: JSON.stringify(body),
     signal: AbortSignal.timeout?.(45_000),
   });
   const payload = await response.json().catch(() => null);
+
   if (payload?.financialRefunded === true || payload?.alreadyRefunded === true) {
     return {
       ...payload,
       ok: true,
       recoveredFromHttpError: !response.ok || payload?.ok === false,
+      recoveredFromLegacyPayload: input.legacyPayload === true,
     };
   }
+
   if (!response.ok || payload?.ok === false) {
     const error = new Error(payload?.message || `Falha HTTP ${response.status} ao reembolsar pagamento.`);
     error.status = response.status;
     error.payload = payload;
+    error.legacyPayload = input.legacyPayload === true;
     throw error;
   }
-  return payload;
+
+  return {
+    ...payload,
+    recoveredFromLegacyPayload: input.legacyPayload === true,
+  };
+}
+
+async function callInternalPaymentRefund(orderId, reason, context = {}) {
+  const endpoint =
+    env.paymentsInternalRefundApiUrl ||
+    `${String(env.appUrl || "").replace(/\/+$/, "")}/api/internal/payments/refund`;
+  if (!endpoint || !env.salesInternalApiToken) {
+    throw new Error("API interna de reembolso de pagamentos nao configurada.");
+  }
+
+  const fullPayload = {
+    orderId,
+    reason,
+    protocol: context.protocol || undefined,
+    actorUserId: context.actorUserId || undefined,
+    actorLabel: context.actorUserId ? `Discord ${context.actorUserId}` : undefined,
+    accessAction: context.accessAction || "revoke_immediately",
+    riskScore: Number.isFinite(Number(context.riskScore))
+      ? Number(context.riskScore)
+      : undefined,
+    riskFlags: Array.isArray(context.riskFlags)
+      ? context.riskFlags.slice(0, 20)
+      : undefined,
+  };
+
+  try {
+    return await postInternalPaymentRefundRequest(endpoint, fullPayload);
+  } catch (error) {
+    if (!isInternalRefundPayloadContractError(error.payload)) {
+      throw error;
+    }
+
+    console.warn("[ticket-refund] endpoint de reembolso oficial rejeitou metadados novos; tentando payload legado", {
+      orderId,
+      rejectedMessage: normalizeText(error.payload?.message || error.message, 300),
+    });
+
+    return await postInternalPaymentRefundRequest(
+      endpoint,
+      {
+        orderId,
+        reason,
+      },
+      { legacyPayload: true },
+    );
+  }
 }
 
 function isProviderCommunicationUncertainty(error) {
@@ -2981,6 +3030,7 @@ async function executeRefundProcessing({
       transaction_id: finalOrder.providerPaymentId || order.providerPaymentId || null,
       final_status: refundResult?.alreadyRefunded ? "already_refunded" : "refunded",
       recovered_from_uncertain_provider_error: recoveredFromUncertainError,
+      recovered_from_legacy_payment_refund_payload: refundResult?.recoveredFromLegacyPayload === true,
       discord_ticket_confirmation_sent: ticketNotice?.ok === true,
       dm_notification_queued: dmQueue.queued === true,
       email_confirmation_sent: emailNotice?.sent === true,
