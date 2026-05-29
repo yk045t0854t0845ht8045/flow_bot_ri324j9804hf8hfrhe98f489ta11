@@ -300,7 +300,7 @@ function pushWithProtectedBranchFallback(input) {
 
   if (branchPush.status !== 0) {
     throw new Error(
-      `Falha ao executar em ${path.relative(rootDir, input.targetDir) || "."}: git push -u origin HEAD:refs/heads/${finalPublishBranch}`,
+      `Falha ao executar em ${path.relative(rootDir, input.targetDir) || "."}: git push origin HEAD:refs/heads/${finalPublishBranch}`,
     );
   }
 
