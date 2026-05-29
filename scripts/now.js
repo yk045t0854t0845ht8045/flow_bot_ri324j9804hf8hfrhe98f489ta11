@@ -252,7 +252,7 @@ function isNonFastForwardPushFailure(result) {
 function pushToProtectedPublishBranch(input, publishBranch) {
   return execute(
     "git",
-    ["push", "-u", "origin", `HEAD:refs/heads/${publishBranch}`],
+    ["push", "origin", `HEAD:refs/heads/${publishBranch}`],
     input.targetDir,
   );
 }
