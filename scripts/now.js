@@ -89,6 +89,17 @@ function buildProtectedPublishBranch(repoName, githubAccount) {
   return `pr/${accountSegment}/${repoSegment}`;
 }
 
+function buildUniqueProtectedPublishBranch(repoName, githubAccount, targetDir) {
+  const baseBranch = buildProtectedPublishBranch(repoName, githubAccount);
+  const shortSha = capture("git", ["rev-parse", "--short=8", "HEAD"], targetDir) || Date.now().toString(36);
+  const timestamp = new Date()
+    .toISOString()
+    .replace(/[-:]/g, "")
+    .replace(/\..+$/, "")
+    .toLowerCase();
+  return `${baseBranch}-${timestamp}-${shortSha}`;
+}
+
 function normalizeGitHubRepoWebUrl(remoteUrl) {
   if (!remoteUrl) return null;
 
@@ -163,6 +174,27 @@ function getFetchedBaseBranch(targetDir) {
   return null;
 }
 
+function remoteBranchExists(targetDir, branch) {
+  if (!branch) return false;
+  const result = execute(
+    "git",
+    ["rev-parse", "--verify", `origin/${branch}`],
+    targetDir,
+    {
+      printCommand: false,
+      printOutput: false,
+    },
+  );
+  return result.status === 0;
+}
+
+function resolveSyncBaseBranch(targetDir, currentBranch) {
+  if (remoteBranchExists(targetDir, currentBranch)) {
+    return currentBranch;
+  }
+  return getFetchedBaseBranch(targetDir) || currentBranch || "main";
+}
+
 function ensureGitRepository(targetDir, repoName, remoteUrl) {
   const gitDir = path.join(targetDir, ".git");
   if (fs.existsSync(gitDir)) {
@@ -207,10 +239,28 @@ function isProtectedBranchPushFailure(result) {
   );
 }
 
+function isNonFastForwardPushFailure(result) {
+  const combined = `${result.stdout}\n${result.stderr}`.toLowerCase();
+  return (
+    combined.includes("non-fast-forward") ||
+    combined.includes("fetch first") ||
+    combined.includes("tip is behind its remote counterpart") ||
+    combined.includes("updates were rejected")
+  );
+}
+
+function pushToProtectedPublishBranch(input, publishBranch) {
+  return execute(
+    "git",
+    ["push", "-u", "origin", `HEAD:refs/heads/${publishBranch}`],
+    input.targetDir,
+  );
+}
+
 function pushWithProtectedBranchFallback(input) {
   const directPush = execute(
     "git",
-    ["push", "origin", input.baseBranch],
+    ["push", "origin", `HEAD:refs/heads/${input.baseBranch}`],
     input.targetDir,
   );
 
@@ -233,22 +283,31 @@ function pushWithProtectedBranchFallback(input) {
   console.log(`\n[${input.repoName}] usa branch protegida em '${input.baseBranch}'.`);
   console.log(`Enviando automaticamente para a branch de PR '${publishBranch}'...`);
 
-  const branchPush = execute(
-    "git",
-    ["push", "origin", `HEAD:refs/heads/${publishBranch}`],
-    input.targetDir,
-  );
+  let finalPublishBranch = publishBranch;
+  let branchPush = pushToProtectedPublishBranch(input, finalPublishBranch);
+
+  if (branchPush.status !== 0 && isNonFastForwardPushFailure(branchPush)) {
+    const uniquePublishBranch = buildUniqueProtectedPublishBranch(
+      input.repoName,
+      input.githubAccount,
+      input.targetDir,
+    );
+    console.log(`\n[${input.repoName}] a branch de PR '${publishBranch}' ja existe e esta diferente do seu historico local.`);
+    console.log(`Para nao sobrescrever alteracoes remotas, vou publicar em '${uniquePublishBranch}'.`);
+    finalPublishBranch = uniquePublishBranch;
+    branchPush = pushToProtectedPublishBranch(input, finalPublishBranch);
+  }
 
   if (branchPush.status !== 0) {
     throw new Error(
-      `Falha ao executar em ${path.relative(rootDir, input.targetDir) || "."}: git push -u origin HEAD:refs/heads/${publishBranch}`,
+      `Falha ao executar em ${path.relative(rootDir, input.targetDir) || "."}: git push -u origin HEAD:refs/heads/${finalPublishBranch}`,
     );
   }
 
   const compareUrl = buildPullRequestCompareUrl(
     input.remoteUrl,
     input.baseBranch,
-    publishBranch,
+    finalPublishBranch,
   );
 
   console.log(`\n[${input.repoName}] enviado para a branch de PR com sucesso.`);
@@ -275,7 +334,11 @@ async function syncRepo(targetDir, repoName, rl, options = {}) {
     console.warn(`\nAviso: nao foi possivel conectar ao GitHub para [${repoName}]. Tentando continuar...`);
   }
 
-  const branch = capture("git", ["rev-parse", "--abbrev-ref", "HEAD"], targetDir) || "main";
+  const currentBranch = capture("git", ["rev-parse", "--abbrev-ref", "HEAD"], targetDir) || "main";
+  const branch = resolveSyncBaseBranch(targetDir, currentBranch);
+  if (branch !== currentBranch) {
+    console.log(`\n[${repoName}] branch local '${currentBranch}' nao existe no remoto. Sincronizando contra '${branch}'.`);
+  }
 
   console.log(`\nVerificando mudancas locais em [${repoName}]...`);
   const status = capture("git", ["status", "--porcelain"], targetDir);

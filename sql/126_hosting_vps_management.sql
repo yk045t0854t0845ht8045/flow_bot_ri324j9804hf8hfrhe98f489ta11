@@ -5,7 +5,36 @@ alter table public.hosting_projects
     check (runtime_status in ('online', 'offline', 'restarting', 'deploying', 'crashed', 'suspended', 'unknown')),
   add column if not exists runtime_status_payload jsonb not null default '{}'::jsonb,
   add column if not exists runtime_last_seen_at timestamptz,
-  add column if not exists active_deployment_id bigint;
+  add column if not exists active_deployment_id bigint,
+  add column if not exists billing_status text not null default 'active'
+    check (billing_status in ('active', 'past_due', 'refunded', 'charged_back', 'cancelled', 'expired')),
+  add column if not exists access_expires_at timestamptz,
+  add column if not exists refund_access_until timestamptz,
+  add column if not exists refunded_at timestamptz,
+  add column if not exists suspended_at timestamptz,
+  add column if not exists suspension_reason text;
+
+create index if not exists idx_hosting_projects_user_billing_access
+on public.hosting_projects (user_id, billing_status, access_expires_at desc);
+
+create table if not exists public.hosting_github_connections (
+  id bigint generated always as identity primary key,
+  user_id bigint not null references public.auth_users(id) on delete cascade,
+  github_login text,
+  github_account_type text,
+  github_avatar_url text,
+  encrypted_token text not null,
+  token_status text not null default 'active'
+    check (token_status in ('active', 'invalid', 'revoked')),
+  last_validated_at timestamptz,
+  last_error text,
+  created_at timestamptz not null default timezone('utc', now()),
+  updated_at timestamptz not null default timezone('utc', now()),
+  unique (user_id)
+);
+
+create index if not exists idx_hosting_github_connections_user_status
+on public.hosting_github_connections (user_id, token_status);
 
 create table if not exists public.hosting_vps_action_events (
   id bigint generated always as identity primary key,
@@ -115,6 +144,12 @@ create trigger tr_hosting_vps_env_vars_updated_at
 before update on public.hosting_vps_env_vars
 for each row execute function public.set_updated_at();
 
+drop trigger if exists tr_hosting_github_connections_updated_at on public.hosting_github_connections;
+create trigger tr_hosting_github_connections_updated_at
+before update on public.hosting_github_connections
+for each row execute function public.set_updated_at();
+
+alter table public.hosting_github_connections enable row level security;
 alter table public.hosting_vps_action_events enable row level security;
 alter table public.hosting_vps_metrics enable row level security;
 alter table public.hosting_vps_logs enable row level security;
@@ -124,6 +159,11 @@ alter table public.hosting_vps_env_vars enable row level security;
 do $$
 begin
   if exists (select 1 from pg_roles where rolname = 'service_role') then
+    drop policy if exists hosting_github_connections_service_role_all on public.hosting_github_connections;
+    create policy hosting_github_connections_service_role_all
+      on public.hosting_github_connections for all to service_role
+      using (true) with check (true);
+
     drop policy if exists hosting_vps_action_events_service_role_all on public.hosting_vps_action_events;
     create policy hosting_vps_action_events_service_role_all
       on public.hosting_vps_action_events for all to service_role
